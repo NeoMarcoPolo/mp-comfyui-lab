@@ -5,6 +5,7 @@ from pathlib import Path
 from pydantic import ValidationError
 import pytest
 
+import mp_comfyui_lab.graph.normalize as graph_normalize
 from mp_comfyui_lab.graph.models import (
     AmbiguousRoleError,
     MissingRoleError,
@@ -347,14 +348,26 @@ def test_literal_pair_matching_real_node_id_stays_literal(field_name) -> None:
     assert selector.input_links == {}
 
 
-def test_unknown_pair_matching_real_node_id_is_reported_as_ambiguous() -> None:
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "custom_pair",
+        "control_net",
+        "audio",
+        "detailer_pipe",
+        "frame_rate",
+        "VAE1",
+    ],
+)
+def test_existing_node_pair_is_a_link_for_custom_comfy_fields(field_name) -> None:
     source = {
         "1": _node("PrimitiveNode", value="upstream"),
-        "2": _node("CustomNode", custom_pair=["1", 0]),
+        "2": _node("CustomNode", **{field_name: ["1", 0]}),
     }
 
-    with pytest.raises(GraphValidationError, match="custom_pair.*ambiguous"):
-        normalize_graph(source)
+    consumer = normalize_graph(source).nodes[1]
+
+    assert consumer.input_links[field_name] == ("1", 0)
 
 
 def test_primitive_literal_feeding_text_encoder_is_prompt_source() -> None:
@@ -396,6 +409,67 @@ def test_generic_reference_provider_is_detected_without_save_false_positive() ->
         (binding.node_id, binding.field_name, binding.value)
         for binding in graph.bindings(SemanticRole.REFERENCE_IMAGE)
     ] == [("reference", "image_name", "character.png")]
+
+
+def test_positive_and_negative_prompt_fields_are_prompt_sources() -> None:
+    graph = normalize_graph(
+        {
+            "prompt": _node(
+                "WanVideoPrompt",
+                positive_prompt="Scene: {subject}",
+                negative_prompt="blur, noise",
+            )
+        }
+    )
+
+    assert [
+        (binding.field_name, binding.value)
+        for binding in graph.bindings(SemanticRole.PROMPT_SOURCE)
+    ] == [
+        ("negative_prompt", "blur, noise"),
+        ("positive_prompt", "Scene: {subject}"),
+    ]
+
+
+def test_image_save_class_spellings_are_outputs_without_selector_false_positive() -> None:
+    graph = normalize_graph(
+        {
+            "save": _node("Image Save", images=["source", 0]),
+            "simple": _node("Image Saver Simple", images=["source", 0]),
+            "selector": _node("Sampler Selector (Image Saver)", value="euler"),
+            "source": _node("PrimitiveNode", value="pixels"),
+        }
+    )
+
+    assert [binding.node_id for binding in graph.bindings(SemanticRole.OUTPUT)] == [
+        "save",
+        "simple",
+    ]
+
+
+def test_encoder_loader_resolves_over_low_confidence_text_encode_hint() -> None:
+    graph = normalize_graph(
+        {
+            "loader": _node("CLIPLoader", clip_name="clip.safetensors"),
+            "encode": _node(
+                "CLIPTextEncode",
+                clip=["loader", 0],
+                text="portrait",
+            ),
+        }
+    )
+
+    binding = graph.require_one(SemanticRole.ENCODER)
+    hints = [
+        item
+        for item in graph.bindings(SemanticRole.ENCODER)
+        if item.node_id == "encode"
+    ]
+
+    assert binding.node_id == "loader"
+    assert binding.confidence > 0.8
+    assert hints and all(item.confidence <= 0.8 for item in hints)
+    assert graph.require_one(SemanticRole.CONDITIONING).node_id == "encode"
 
 
 def test_only_meta_keys_are_removed_recursively_from_semantic_projection() -> None:
@@ -515,10 +589,109 @@ def test_lora_chain_requires_final_downstream_model_consumer(mode) -> None:
         normalize_graph(graph)
 
 
+def test_power_lora_loader_slots_bind_in_numeric_order_with_strength_buckets() -> None:
+    graph = normalize_graph(
+        {
+            "loader": _node("UNETLoader", unet_name="base.safetensors"),
+            "power": _node(
+                "Power Lora Loader (rgthree)",
+                model=["loader", 0],
+                lora_10={
+                    "on": True,
+                    "lora": "ten.safetensors",
+                    "strength": 1.5,
+                },
+                lora_2={
+                    "on": True,
+                    "lora": "two.safetensors",
+                    "strength": 0.5,
+                },
+                lora_1={
+                    "on": True,
+                    "lora": "one.safetensors",
+                    "strength": 1.0,
+                },
+            ),
+            "sampler": _node("KSampler", model=["power", 0], seed=1),
+        }
+    )
+
+    assert [
+        (
+            binding.field_name,
+            binding.value["name"],
+            binding.value["strength_bucket"],
+        )
+        for binding in graph.bindings(SemanticRole.LORA)
+    ] == [
+        ("lora_1", "one.safetensors", "positive_standard"),
+        ("lora_2", "two.safetensors", "positive_light"),
+        ("lora_10", "ten.safetensors", "positive_strong"),
+    ]
+
+
+def test_final_lora_fanout_to_multiple_model_consumers_is_valid() -> None:
+    source = _lora_graph()
+    source["second_sampler"] = _node(
+        "SamplerCustom",
+        model=["downstream", 0],
+        seed=8,
+    )
+
+    graph = normalize_graph(source)
+
+    assert [binding.value for binding in graph.bindings(SemanticRole.LORA)] == [
+        "first.safetensors",
+        "second.safetensors",
+    ]
+
+
 @pytest.mark.parametrize("node_id", [" 1", "1 ", "1\x00", "1\ud800"])
 def test_node_ids_are_exact_safe_unicode_identifiers(node_id) -> None:
     with pytest.raises(GraphValidationError, match="node ID"):
         normalize_graph({node_id: _node("PrimitiveNode", value=1)})
+
+
+def test_unicode_format_control_in_node_id_is_a_graph_error() -> None:
+    with pytest.raises(GraphValidationError, match="node ID.*control"):
+        normalize_graph({"node\u200bname": _node("PrimitiveNode", value=1)})
+
+
+def test_very_long_numeric_node_ids_sort_without_integer_conversion() -> None:
+    long_id = "9" * 5_000
+    graph = normalize_graph(
+        {
+            long_id: _node("PrimitiveNode", value="large"),
+            "9": _node("PrimitiveNode", value="small"),
+        }
+    )
+
+    assert [node.node_id for node in graph.nodes] == ["9", long_id]
+
+
+def test_graph_depth_limit_precedes_recursive_model_validation() -> None:
+    value: object = "leaf"
+    for _ in range(601):
+        value = {"nested": value}
+
+    with pytest.raises(GraphValidationError, match="depth limit"):
+        normalize_graph({"1": _node("PrimitiveNode", payload=value)})
+
+
+def test_graph_node_and_value_limits_are_enforced_before_freezing(monkeypatch) -> None:
+    monkeypatch.setattr(graph_normalize, "_MAX_GRAPH_NODES", 2, raising=False)
+    with pytest.raises(GraphValidationError, match="node limit"):
+        normalize_graph(
+            {
+                "1": _node("PrimitiveNode"),
+                "2": _node("PrimitiveNode"),
+                "3": _node("PrimitiveNode"),
+            }
+        )
+
+    monkeypatch.setattr(graph_normalize, "_MAX_JSON_VALUES", 8, raising=False)
+    with pytest.raises(GraphValidationError, match="value limit"):
+        normalize_graph({"1": _node("PrimitiveNode", values=list(range(20)))})
 
 
 @pytest.mark.parametrize("node_id", [" 1", "1 ", "1\x00", "1\ud800"])

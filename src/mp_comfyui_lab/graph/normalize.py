@@ -4,16 +4,20 @@ import unicodedata
 from collections import defaultdict
 from collections.abc import Mapping
 from math import isfinite
+import re
 from typing import Any
 
-from mp_comfyui_lab.json_types import FrozenDict
+from pydantic import ValidationError
+
 from mp_comfyui_lab.graph.models import (
     NormalizedGraph,
     NormalizedNode,
     RoleBinding,
     RoleBindings,
     SemanticRole,
+    strength_bucket,
 )
+from mp_comfyui_lab.json_types import FrozenDict
 
 
 class GraphNormalizationError(ValueError):
@@ -37,39 +41,19 @@ _MODEL_NAME_FIELDS = (
 )
 _LORA_NAME_FIELDS = ("lora_name", "lora_file", "lora")
 _MODEL_LINK_FIELDS = ("model", "unet")
-_PROMPT_FIELDS = ("prompt", "text", "value", "promptLine")
+_PROMPT_FIELDS = (
+    "prompt",
+    "text",
+    "value",
+    "promptLine",
+    "positive_prompt",
+    "negative_prompt",
+)
 _REFERENCE_FIELDS = ("image", "image_name", "filename", "path")
 _SEED_FIELDS = ("noise_seed", "random_seed", "seed")
 _DIMENSION_FIELDS = ("height", "width")
 _VAE_NAME_FIELDS = ("vae_name", "model_name")
 _ENCODER_NAME_FIELDS = ("clip_name", "encoder_name", "text_encoder_name")
-_LINK_LIKELY_FIELDS = frozenset(
-    {
-        "conditioning",
-        "clip",
-        "guider",
-        "image",
-        "images",
-        "latent",
-        "latent_image",
-        "mask",
-        "model",
-        "negative",
-        "noise",
-        "pixels",
-        "positive",
-        "prompt",
-        "ref_image",
-        "samples",
-        "sampler",
-        "sigmas",
-        "source",
-        "text",
-        "unet",
-        "vae",
-    }
-    | {f"image{index}" for index in range(1, 17)}
-)
 _LITERAL_COLLECTION_FIELDS = frozenset(
     {
         "choices",
@@ -80,12 +64,17 @@ _LITERAL_COLLECTION_FIELDS = frozenset(
         "values",
     }
 )
+_POWER_LORA_SLOT = re.compile(r"^lora_(\d+)$", re.IGNORECASE)
+_MAX_GRAPH_NODES = 4_096
+_MAX_JSON_DEPTH = 256
+_MAX_JSON_VALUES = 100_000
 
 
-def _node_sort_key(node_id: str) -> tuple[int, int | str, str]:
+def _node_sort_key(node_id: str) -> tuple[int, int, str, str]:
     if node_id.isdecimal():
-        return (0, int(node_id), node_id)
-    return (1, node_id, node_id)
+        significant = node_id.lstrip("0") or "0"
+        return (0, len(significant), significant, node_id)
+    return (1, 0, node_id, node_id)
 
 
 def _compact_class(class_type: str) -> str:
@@ -105,30 +94,53 @@ def _validate_unicode(value: str, path: str) -> None:
         raise GraphValidationError(f"{path} contains a lone UTF-16 surrogate")
 
 
+def _validate_identifier(value: str, path: str) -> None:
+    _validate_unicode(value, path)
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise GraphValidationError(f"{path} must not contain control characters")
+
+
 def _validate_json(value: Any, path: str, *, allow_frozen: bool) -> None:
-    if value is None or isinstance(value, (bool, int)):
-        return
-    if isinstance(value, str):
-        _validate_unicode(value, path)
-        return
-    if isinstance(value, float):
-        if not isfinite(value):
-            raise GraphValidationError(f"{path} JSON numbers must be finite")
-        return
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise GraphValidationError(f"{path} object keys must be strings")
-            _validate_unicode(key, f"{path} object key")
-            _validate_json(item, f"{path}.{key}", allow_frozen=allow_frozen)
-        return
-    if isinstance(value, list) or (allow_frozen and isinstance(value, tuple)):
-        for index, item in enumerate(value):
-            _validate_json(item, f"{path}[{index}]", allow_frozen=allow_frozen)
-        return
-    raise GraphValidationError(
-        f"{path} has unsupported JSON value type {type(value).__name__}"
-    )
+    stack = [(value, path, 0)]
+    value_count = 0
+    while stack:
+        item, item_path, depth = stack.pop()
+        value_count += 1
+        if value_count > _MAX_JSON_VALUES:
+            raise GraphValidationError(
+                f"graph JSON value limit of {_MAX_JSON_VALUES} exceeded"
+            )
+        if depth > _MAX_JSON_DEPTH:
+            raise GraphValidationError(
+                f"graph JSON depth limit of {_MAX_JSON_DEPTH} exceeded"
+            )
+        if item is None or isinstance(item, (bool, int)):
+            continue
+        if isinstance(item, str):
+            _validate_unicode(item, item_path)
+            continue
+        if isinstance(item, float):
+            if not isfinite(item):
+                raise GraphValidationError(f"{item_path} JSON numbers must be finite")
+            continue
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                if not isinstance(key, str):
+                    raise GraphValidationError(
+                        f"{item_path} object keys must be strings"
+                    )
+                _validate_unicode(key, f"{item_path} object key")
+                stack.append((nested, f"{item_path}.{key}", depth + 1))
+            continue
+        if isinstance(item, list) or (
+            allow_frozen and isinstance(item, tuple)
+        ):
+            for index, nested in enumerate(item):
+                stack.append((nested, f"{item_path}[{index}]", depth + 1))
+            continue
+        raise GraphValidationError(
+            f"{item_path} has unsupported JSON value type {type(item).__name__}"
+        )
 
 
 def _without_meta(value: Any) -> Any:
@@ -157,14 +169,14 @@ def semantic_graph_projection(graph: Any) -> dict[str, Any]:
         if node_id == "_meta":
             continue
         node_count += 1
-        _validate_unicode(node_id, "graph node ID")
+        if node_count > _MAX_GRAPH_NODES:
+            raise GraphValidationError(
+                f"graph node limit of {_MAX_GRAPH_NODES} exceeded"
+            )
+        _validate_identifier(node_id, "graph node ID")
         if node_id != node_id.strip():
             raise GraphValidationError(
                 f"graph node ID {node_id!r} must not have leading or trailing whitespace"
-            )
-        if any(unicodedata.category(character) == "Cc" for character in node_id):
-            raise GraphValidationError(
-                f"graph node ID {node_id!r} must not contain control characters"
             )
         if not node_id.strip():
             raise GraphValidationError("graph node IDs must not be blank")
@@ -175,6 +187,7 @@ def semantic_graph_projection(graph: Any) -> dict[str, Any]:
         class_type = node["class_type"]
         if not isinstance(class_type, str):
             raise GraphValidationError(f"node '{node_id}' class_type must be a string")
+        _validate_identifier(class_type, f"node '{node_id}' class_type")
         if not class_type.strip():
             raise GraphValidationError(f"node '{node_id}' class_type must be nonblank")
         if "inputs" not in node:
@@ -186,6 +199,8 @@ def semantic_graph_projection(graph: Any) -> dict[str, Any]:
             raise GraphValidationError(
                 f"node '{node_id}' input names must be strings"
             )
+        for field_name in inputs:
+            _validate_identifier(field_name, f"node '{node_id}' input name")
     if node_count == 0:
         raise GraphValidationError("API graph must contain a nonempty node object")
 
@@ -212,13 +227,6 @@ def _input_link(
     canonical_field = _canonical_field_name(field_name)
     if canonical_field in _LITERAL_COLLECTION_FIELDS:
         return None
-    known_source = source_id in node_ids
-    recognized_link = field_name.casefold() in _LINK_LIKELY_FIELDS
-    if not recognized_link:
-        raise GraphValidationError(
-            f"node '{node_id}' input '{field_name}' has ambiguous two-item input; "
-            "declare it as a known link or literal collection field"
-        )
     if (
         not isinstance(output_index, int)
         or isinstance(output_index, bool)
@@ -228,7 +236,7 @@ def _input_link(
             f"node '{node_id}' input '{field_name}' link output index "
             "must be a nonnegative integer"
         )
-    if not known_source:
+    if source_id not in node_ids:
         raise GraphValidationError(
             f"node '{node_id}' input '{field_name}' links to unknown node '{source_id}'"
         )
@@ -292,10 +300,28 @@ def _is_unet_loader(node: NormalizedNode) -> bool:
 
 
 def _is_lora_node(node: NormalizedNode) -> bool:
-    return "lora" in _compact_class(node.class_type) and any(
+    if "lora" not in _compact_class(node.class_type):
+        return False
+    if any(
         _is_literal(node, field_name) and _nonblank_string(node.inputs[field_name])
         for field_name in _LORA_NAME_FIELDS
+    ):
+        return True
+    return any(
+        _POWER_LORA_SLOT.fullmatch(field_name)
+        and isinstance(value, Mapping)
+        and value.get("on", True) is not False
+        and _nonblank_string(value.get("lora"))
+        for field_name, value in node.inputs.items()
     )
+
+
+def _lora_binding_sort_key(binding: RoleBinding) -> tuple[int, int, str]:
+    match = _POWER_LORA_SLOT.fullmatch(binding.field_name)
+    if match is not None:
+        slot = match.group(1).lstrip("0") or "0"
+        return (0, len(slot), f"{slot}:{binding.field_name}")
+    return (1, 0, binding.field_name)
 
 
 def _lora_order(
@@ -394,7 +420,7 @@ def _lora_order(
     ordered: list[RoleBinding] = []
     for node_id in ordered_node_ids:
         ordered.extend(
-            sorted(bindings_by_node[node_id], key=lambda binding: binding.field_name)
+            sorted(bindings_by_node[node_id], key=_lora_binding_sort_key)
         )
 
     model_consumers: dict[str, list[str]] = defaultdict(list)
@@ -405,51 +431,51 @@ def _lora_order(
                     consumer.node_id
                 )
 
+    def downstream_outcomes(start: str) -> tuple[set[str], set[str]]:
+        pending = [(start, frozenset({start}))]
+        reached_loras: set[str] = set()
+        terminal_consumers: set[str] = set()
+        while pending:
+            cursor, path = pending.pop()
+            targets = set(model_consumers.get(cursor, []))
+            if not targets:
+                if cursor != start:
+                    terminal_consumers.add(cursor)
+                continue
+            for target in targets:
+                if target in path:
+                    raise GraphTopologyError(
+                        f"LoRA downstream cycle detected after '{start}'"
+                    )
+                if target in lora_ids:
+                    reached_loras.add(target)
+                    continue
+                pending.append((target, path | {target}))
+        return reached_loras, terminal_consumers
+
     for index, node_id in enumerate(ordered_node_ids):
         expected_next = (
             ordered_node_ids[index + 1]
             if index + 1 < len(ordered_node_ids)
             else None
         )
-        cursor = node_id
-        visited = {node_id}
-        while True:
-            targets = sorted(
-                set(model_consumers.get(cursor, [])),
-                key=_node_sort_key,
+        reached_loras, terminals = downstream_outcomes(node_id)
+        if expected_next is None:
+            if reached_loras:
+                raise GraphTopologyError(
+                    f"LoRA '{node_id}' has competing downstream LoRA order: "
+                    f"{sorted(reached_loras, key=_node_sort_key)}"
+                )
+            if not terminals:
+                raise GraphTopologyError(
+                    f"LoRA '{node_id}' has no downstream model consumer"
+                )
+            continue
+        if reached_loras != {expected_next} or terminals:
+            raise GraphTopologyError(
+                f"LoRA '{node_id}' model flow bypasses or branches around "
+                f"'{expected_next}'"
             )
-            if not targets:
-                if expected_next is None:
-                    raise GraphTopologyError(
-                        f"LoRA '{node_id}' has no downstream model consumer"
-                    )
-                raise GraphTopologyError(
-                    f"LoRA '{node_id}' model flow bypasses '{expected_next}'"
-                )
-            if len(targets) > 1:
-                raise GraphTopologyError(
-                    f"LoRA branch or bypass after '{cursor}': {targets}"
-                )
-            target = targets[0]
-            if target in visited:
-                raise GraphTopologyError(
-                    f"LoRA downstream cycle detected after '{node_id}'"
-                )
-            visited.add(target)
-            if target in lora_ids:
-                if target != expected_next:
-                    raise GraphTopologyError(
-                        f"LoRA '{node_id}' bypasses expected next LoRA '{expected_next}'"
-                    )
-                break
-            if not model_consumers.get(target):
-                if expected_next is not None:
-                    raise GraphTopologyError(
-                        f"LoRA '{node_id}' reaches consumer '{target}' before "
-                        f"expected LoRA '{expected_next}'"
-                    )
-                break
-            cursor = target
     return ordered
 
 
@@ -485,7 +511,33 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
                             )
                         )
 
-        if _is_lora_node(node):
+        if "powerloraloader" in compact:
+            for field_name, record in node.inputs.items():
+                if (
+                    _POWER_LORA_SLOT.fullmatch(field_name) is None
+                    or not isinstance(record, Mapping)
+                    or record.get("on", True) is False
+                    or not _nonblank_string(record.get("lora"))
+                ):
+                    continue
+                value: dict[str, Any] = {"name": record["lora"]}
+                strength = record.get("strength")
+                if isinstance(strength, (int, float)) and not isinstance(
+                    strength, bool
+                ):
+                    value["strength_bucket"] = strength_bucket(strength)
+                elif isinstance(strength, bool):
+                    value["strength"] = strength
+                grouped[SemanticRole.LORA].append(
+                    _binding(
+                        node,
+                        field_name,
+                        value,
+                        0.99,
+                        f"{node.class_type} exposes nested LoRA slot '{field_name}'",
+                    )
+                )
+        elif _is_lora_node(node):
             for field_name in _LORA_NAME_FIELDS:
                 if _is_literal(node, field_name) and _nonblank_string(node.inputs[field_name]):
                     grouped[SemanticRole.LORA].append(
@@ -576,6 +628,7 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
             or compact.startswith("preview")
             or "videocombine" in compact
             or compact.endswith("output")
+            or compact in {"imagesave", "imagesaversimple"}
         )
         is_reference_provider = not is_output and (
             "loadimage" in compact
@@ -718,12 +771,13 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
                         )
                     )
             else:
+                confidence = 0.8 if "textencode" in compact else 0.85
                 grouped[SemanticRole.ENCODER].append(
                     _binding(
                         node,
                         "$class_type",
                         node.class_type,
-                        0.85,
+                        confidence,
                         "encoder node class",
                     )
                 )
@@ -783,14 +837,26 @@ def normalize_graph(graph: Any) -> NormalizedGraph:
             link = _input_link(node_id, field_name, value, node_ids)
             if link is not None:
                 input_links[field_name] = link
-        normalized_nodes.append(
-            NormalizedNode(
-                node_id=node_id,
-                class_type=node["class_type"],
-                inputs=inputs,
-                input_links=input_links,
+        try:
+            normalized_nodes.append(
+                NormalizedNode(
+                    node_id=node_id,
+                    class_type=node["class_type"],
+                    inputs=inputs,
+                    input_links=input_links,
+                )
             )
-        )
+        except (RecursionError, UnicodeError, ValidationError) as error:
+            raise GraphValidationError(
+                f"node '{node_id}' failed normalized model validation: {error}"
+            ) from error
 
     nodes = tuple(normalized_nodes)
-    return NormalizedGraph(nodes=nodes, role_bindings=_role_bindings(nodes))
+    try:
+        return NormalizedGraph(nodes=nodes, role_bindings=_role_bindings(nodes))
+    except GraphNormalizationError:
+        raise
+    except (RecursionError, UnicodeError, ValidationError) as error:
+        raise GraphValidationError(
+            f"graph failed normalized model validation: {error}"
+        ) from error

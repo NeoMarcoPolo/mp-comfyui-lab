@@ -64,12 +64,16 @@ class SafetyError(ValueError):
     pass
 
 
-def _canonical_key(value: str) -> str:
+def canonical_security_key(value: str) -> str:
     return "".join(
         character.casefold()
         for character in value
         if character.isalnum()
     )
+
+
+def _canonical_key(value: str) -> str:
+    return canonical_security_key(value)
 
 
 def _is_secret_key(value: str) -> bool:

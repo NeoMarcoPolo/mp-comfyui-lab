@@ -9,9 +9,22 @@ import re
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from mp_comfyui_lab.graph.models import NormalizedGraph, NormalizedNode, SemanticRole
-from mp_comfyui_lab.graph.normalize import normalize_graph, semantic_graph_projection
+from mp_comfyui_lab.graph.models import (
+    NormalizedGraph,
+    NormalizedNode,
+    SemanticRole,
+    strength_bucket,
+)
+from mp_comfyui_lab.graph.normalize import (
+    GraphNormalizationError,
+    normalize_graph,
+    semantic_graph_projection,
+)
 from mp_comfyui_lab.json_types import thaw_json
+from mp_comfyui_lab.security import (
+    CANONICAL_SECRET_KEYS,
+    canonical_security_key,
+)
 
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -36,16 +49,14 @@ _OPERATIONAL_FIELDS = frozenset(
         "workflowid",
     }
 )
-_PROMPT_FIELDS = frozenset({"prompt", "promptline", "text", "value"})
+_PROMPT_FIELDS = frozenset(
+    {"negativeprompt", "positiveprompt", "prompt", "promptline", "text", "value"}
+)
 _REFERENCE_FIELDS = frozenset({"filename", "image", "imagename", "path"})
 _OUTPUT_PREFIX_FIELDS = frozenset({"prefix", "saveprefix"})
 _SIGNED_CREDENTIAL_QUERY_KEYS = frozenset(
     {
-        "accesstoken",
-        "authorization",
-        "sig",
-        "signature",
-        "token",
+        "awsaccesskeyid",
         "xamzalgorithm",
         "xamzcredential",
         "xamzdate",
@@ -60,17 +71,23 @@ _SIGNED_CREDENTIAL_QUERY_KEYS = frozenset(
         "xgoogsignature",
         "xgoogsignedheaders",
     }
+    | CANONICAL_SECRET_KEYS
 )
-_CONDITIONAL_SIGNED_QUERY_KEYS = frozenset({"expires", "keypairid", "policy"})
-_STRENGTH_LIMITS = (
-    (0.25, "subtle"),
-    (0.75, "light"),
-    (1.25, "standard"),
-    (2.0, "strong"),
-)
+_MAX_HASH_JSON_DEPTH = 256
+_MAX_HASH_JSON_VALUES = 100_000
+_MAX_CANONICALIZATION_STATES = 10_000
+_MAX_INDIVIDUALIZATION_BRANCHES = 12
 
 
-class HashValidationError(ValueError):
+class GraphHashError(ValueError):
+    pass
+
+
+class HashValidationError(GraphHashError):
+    pass
+
+
+class CapabilityCanonicalizationError(GraphHashError):
     pass
 
 
@@ -90,35 +107,78 @@ def _canonical_json(value: Any) -> str:
 
 
 def _sha256_json(value: Any) -> str:
-    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+    try:
+        return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+    except (RecursionError, TypeError, UnicodeError, ValueError) as error:
+        raise GraphHashError(f"canonical JSON hashing failed: {error}") from error
 
 
-def _strict_json_copy(value: Any, path: str) -> Any:
+def _validate_hash_json(value: Any, path: str) -> None:
+    stack = [(value, path, 0)]
+    value_count = 0
+    while stack:
+        item, item_path, depth = stack.pop()
+        value_count += 1
+        if value_count > _MAX_HASH_JSON_VALUES:
+            raise HashValidationError(
+                f"{path} JSON value limit of {_MAX_HASH_JSON_VALUES} exceeded"
+            )
+        if depth > _MAX_HASH_JSON_DEPTH:
+            raise HashValidationError(
+                f"{path} JSON depth limit of {_MAX_HASH_JSON_DEPTH} exceeded"
+            )
+        if item is None or isinstance(item, (bool, int)):
+            continue
+        if isinstance(item, str):
+            _validate_hash_unicode(item, item_path)
+            continue
+        if isinstance(item, float):
+            if not isfinite(item):
+                raise HashValidationError(
+                    f"{item_path} JSON numbers must be finite"
+                )
+            continue
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                if not isinstance(key, str):
+                    raise HashValidationError(
+                        f"{item_path} object keys must be strings"
+                    )
+                _validate_hash_unicode(key, f"{item_path} object key")
+                stack.append((nested, f"{item_path}.{key}", depth + 1))
+            continue
+        if isinstance(item, (list, tuple)):
+            for index, nested in enumerate(item):
+                stack.append((nested, f"{item_path}[{index}]", depth + 1))
+            continue
+        raise HashValidationError(
+            f"{item_path} has unsupported JSON value type {type(item).__name__}"
+        )
+
+
+def _copy_validated_json(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, str):
-        _validate_hash_unicode(value, path)
         return value
     if isinstance(value, float):
-        if not isfinite(value):
-            raise HashValidationError(f"{path} JSON numbers must be finite")
         return value
     if isinstance(value, Mapping):
-        copied = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise HashValidationError(f"{path} object keys must be strings")
-            _validate_hash_unicode(key, f"{path} object key")
-            copied[key] = _strict_json_copy(item, f"{path}.{key}")
-        return copied
+        return {
+            key: _copy_validated_json(item)
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
-        return [
-            _strict_json_copy(item, f"{path}[{index}]")
-            for index, item in enumerate(value)
-        ]
-    raise HashValidationError(
-        f"{path} has unsupported JSON value type {type(value).__name__}"
-    )
+        return [_copy_validated_json(item) for item in value]
+    raise AssertionError("hash JSON was copied without validation")
+
+
+def _strict_json_copy(value: Any, path: str) -> Any:
+    _validate_hash_json(value, path)
+    try:
+        return _copy_validated_json(value)
+    except (RecursionError, UnicodeError) as error:
+        raise HashValidationError(f"{path} JSON copy failed: {error}") from error
 
 
 def source_graph_hash(graph: Any) -> str:
@@ -195,25 +255,8 @@ def exact_run_hash(
     return _sha256_json(projection)
 
 
-def strength_bucket(value: Any) -> str:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError("strength must be a finite JSON number")
-    if isinstance(value, float) and not isfinite(value):
-        raise ValueError("strength must be a finite JSON number")
-    if value == 0:
-        return "zero"
-    sign = "negative" if value < 0 else "positive"
-    magnitude = abs(value)
-    for upper_bound, label in _STRENGTH_LIMITS:
-        if magnitude <= upper_bound:
-            return f"{sign}_{label}"
-    return f"{sign}_extreme"
-
-
 def _canonical_field_name(field_name: str) -> str:
-    return "".join(
-        character for character in field_name.casefold() if character.isalnum()
-    )
+    return canonical_security_key(field_name)
 
 
 def _compact_class(class_type: str) -> str:
@@ -264,21 +307,13 @@ def _canonicalize_capability_url(value: str) -> str:
         query_items = parse_qsl(parsed.query, keep_blank_values=True)
     except ValueError:
         return value
-    canonical_keys = {
-        _canonical_field_name(key)
-        for key, _ in query_items
-    }
-    has_signed_credentials = bool(canonical_keys & _SIGNED_CREDENTIAL_QUERY_KEYS)
+    canonical_keys = {canonical_security_key(key) for key, _ in query_items}
+    if canonical_keys & _SIGNED_CREDENTIAL_QUERY_KEYS:
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, "", parsed.fragment)
+        )
     retained = sorted(
-        (
-            (key, item)
-            for key, item in query_items
-            if _canonical_field_name(key) not in _SIGNED_CREDENTIAL_QUERY_KEYS
-            and not (
-                has_signed_credentials
-                and _canonical_field_name(key) in _CONDITIONAL_SIGNED_QUERY_KEYS
-            )
-        ),
+        query_items,
         key=lambda pair: (pair[0], pair[1]),
     )
     return urlunsplit(
@@ -296,7 +331,17 @@ def _capability_value(value: Any) -> Any:
     if isinstance(value, str):
         return _canonicalize_capability_url(value)
     if isinstance(value, Mapping):
-        return {key: _capability_value(item) for key, item in value.items()}
+        projected = {}
+        for key, item in value.items():
+            if (
+                _canonical_field_name(key).startswith("strength")
+                and isinstance(item, (int, float))
+                and not isinstance(item, bool)
+            ):
+                projected[key] = {"bucket": strength_bucket(item)}
+            else:
+                projected[key] = _capability_value(item)
+        return projected
     if isinstance(value, (list, tuple)):
         return [_capability_value(item) for item in value]
     return value
@@ -314,6 +359,7 @@ def _capability_inputs(
         or compact_class.startswith("preview")
         or "videocombine" in compact_class
         or compact_class.endswith("output")
+        or compact_class in {"imagesave", "imagesaversimple"}
     )
     for field_name, frozen_value in node.inputs.items():
         if field_name in node.input_links or _is_operational_field(field_name):
@@ -330,72 +376,243 @@ def _capability_inputs(
             projected[field_name] = {"prompt_grammar": _prompt_grammar(value)}
         elif node.node_id in reference_nodes and canonical in _REFERENCE_FIELDS:
             projected[field_name] = {"strategy": "unlinked_literal"}
-        elif canonical.startswith("strength") and isinstance(value, (int, float)):
+        elif (
+            canonical.startswith("strength")
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
             projected[field_name] = {"bucket": strength_bucket(value)}
         else:
             projected[field_name] = _capability_value(value)
     return projected
 
 
-def _topology_labels(
-    graph: NormalizedGraph,
-    bases: Mapping[str, dict[str, Any]],
-) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    incoming: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
-    outgoing: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
-    for node in graph.nodes:
-        for field_name, link in node.input_links.items():
-            source_id, output_index = link
-            incoming[node.node_id].append((field_name, output_index, source_id))
-            outgoing[source_id].append((field_name, output_index, node.node_id))
-
-    labels = {node_id: _sha256_json(base) for node_id, base in bases.items()}
-    for _ in range(max(1, len(graph.nodes))):
-        labels = {
-            node.node_id: _sha256_json(
-                {
-                    "base": bases[node.node_id],
-                    "incoming": sorted(
-                        [
-                            {
-                                "field": field_name,
-                                "output_index": output_index,
-                                "source": labels[source_id],
-                            }
-                            for field_name, output_index, source_id in incoming[node.node_id]
-                        ],
-                        key=_canonical_json,
-                    ),
-                    "outgoing": sorted(
-                        [
-                            {
-                                "field": field_name,
-                                "output_index": output_index,
-                                "target": labels[target_id],
-                            }
-                            for field_name, output_index, target_id in outgoing[node.node_id]
-                        ],
-                        key=_canonical_json,
-                    ),
-                }
-            )
-            for node in graph.nodes
+def _refine_partition(
+    partition: tuple[tuple[str, ...], ...],
+    incoming: Mapping[str, tuple[tuple[str, int, str], ...]],
+    outgoing: Mapping[str, tuple[tuple[str, int, str], ...]],
+) -> tuple[tuple[str, ...], ...]:
+    while True:
+        colors = {
+            node_id: color
+            for color, cell in enumerate(partition)
+            for node_id in cell
         }
+        refined: list[tuple[str, ...]] = []
+        for cell in partition:
+            groups: dict[tuple[Any, ...], list[str]] = defaultdict(list)
+            for node_id in cell:
+                signature = (
+                    tuple(
+                        sorted(
+                            (field, output_index, colors[source_id])
+                            for field, output_index, source_id in incoming[node_id]
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            (field, output_index, colors[target_id])
+                            for field, output_index, target_id in outgoing[node_id]
+                        )
+                    ),
+                )
+                groups[signature].append(node_id)
+            refined.extend(
+                tuple(sorted(groups[signature]))
+                for signature in sorted(groups)
+            )
+        next_partition = tuple(refined)
+        if next_partition == partition:
+            return partition
+        partition = next_partition
 
+
+def _are_exact_twins(
+    left: str,
+    right: str,
+    node_ids: tuple[str, ...],
+    adjacency: Mapping[tuple[str, str], tuple[tuple[str, int], ...]],
+) -> bool:
+    if adjacency.get((left, left), ()) != adjacency.get((right, right), ()):
+        return False
+    if adjacency.get((left, right), ()) != adjacency.get((right, left), ()):
+        return False
+    for other in node_ids:
+        if other in {left, right}:
+            continue
+        if adjacency.get((left, other), ()) != adjacency.get((right, other), ()):
+            return False
+        if adjacency.get((other, left), ()) != adjacency.get((other, right), ()):
+            return False
+    return True
+
+
+def _collapse_exact_twin_cells(
+    partition: tuple[tuple[str, ...], ...],
+    node_ids: tuple[str, ...],
+    adjacency: Mapping[tuple[str, str], tuple[tuple[str, int], ...]],
+) -> tuple[tuple[str, ...], ...]:
+    collapsed: list[tuple[str, ...]] = []
+    for cell in partition:
+        if len(cell) > 1 and all(
+            _are_exact_twins(cell[0], node_id, node_ids, adjacency)
+            for node_id in cell[1:]
+        ):
+            collapsed.extend((node_id,) for node_id in sorted(cell))
+        else:
+            collapsed.append(cell)
+    return tuple(collapsed)
+
+
+def _branch_representatives(
+    cell: tuple[str, ...],
+    node_ids: tuple[str, ...],
+    adjacency: Mapping[tuple[str, str], tuple[tuple[str, int], ...]],
+) -> tuple[str, ...]:
+    representatives: list[str] = []
+    for node_id in sorted(cell):
+        if any(
+            _are_exact_twins(node_id, representative, node_ids, adjacency)
+            for representative in representatives
+        ):
+            continue
+        representatives.append(node_id)
+    return tuple(representatives)
+
+
+def _individualize(
+    partition: tuple[tuple[str, ...], ...],
+    cell_index: int,
+    node_id: str,
+) -> tuple[tuple[str, ...], ...]:
+    cell = partition[cell_index]
+    remainder = tuple(item for item in cell if item != node_id)
+    return (
+        partition[:cell_index]
+        + ((node_id,), remainder)
+        + partition[cell_index + 1 :]
+    )
+
+
+def _canonical_serialization(
+    order: tuple[str, ...],
+    bases: Mapping[str, dict[str, Any]],
+    raw_edges: tuple[tuple[str, str, str, int], ...],
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    positions = {node_id: index for index, node_id in enumerate(order)}
+    nodes = [
+        {"base": bases[node_id], "index": positions[node_id]}
+        for node_id in order
+    ]
     edges = sorted(
         [
             {
                 "field": field_name,
                 "output_index": output_index,
-                "source": labels[source_id],
-                "target": labels[node.node_id],
+                "source": positions[source_id],
+                "target": positions[target_id],
             }
-            for node in graph.nodes
-            for field_name, (source_id, output_index) in node.input_links.items()
+            for source_id, target_id, field_name, output_index in raw_edges
         ],
         key=_canonical_json,
     )
-    return labels, edges
+    certificate = _canonical_json({"edges": edges, "nodes": nodes})
+    return certificate, nodes, edges, positions
+
+
+def _canonicalize_topology(
+    graph: NormalizedGraph,
+    bases: Mapping[str, dict[str, Any]],
+) -> tuple[dict[str, int], list[dict[str, Any]], list[dict[str, Any]]]:
+    incoming_lists: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    outgoing_lists: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    adjacency_lists: dict[tuple[str, str], list[tuple[str, int]]] = defaultdict(list)
+    raw_edges: list[tuple[str, str, str, int]] = []
+    for node in graph.nodes:
+        for field_name, link in node.input_links.items():
+            source_id, output_index = link
+            target_id = node.node_id
+            incoming_lists[target_id].append((field_name, output_index, source_id))
+            outgoing_lists[source_id].append((field_name, output_index, target_id))
+            adjacency_lists[(source_id, target_id)].append(
+                (field_name, output_index)
+            )
+            raw_edges.append((source_id, target_id, field_name, output_index))
+
+    node_ids = tuple(node.node_id for node in graph.nodes)
+    incoming = {
+        node_id: tuple(sorted(incoming_lists[node_id]))
+        for node_id in node_ids
+    }
+    outgoing = {
+        node_id: tuple(sorted(outgoing_lists[node_id]))
+        for node_id in node_ids
+    }
+    adjacency = {
+        endpoints: tuple(sorted(attributes))
+        for endpoints, attributes in adjacency_lists.items()
+    }
+    base_groups: dict[str, list[str]] = defaultdict(list)
+    for node_id in node_ids:
+        base_groups[_canonical_json(bases[node_id])].append(node_id)
+    initial = tuple(
+        tuple(sorted(base_groups[base]))
+        for base in sorted(base_groups)
+    )
+
+    pending = [_refine_partition(initial, incoming, outgoing)]
+    seen: set[tuple[tuple[str, ...], ...]] = set()
+    best: tuple[
+        str,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, int],
+    ] | None = None
+    while pending:
+        partition = pending.pop()
+        if partition in seen:
+            continue
+        seen.add(partition)
+        if len(seen) > _MAX_CANONICALIZATION_STATES:
+            raise CapabilityCanonicalizationError(
+                "capability canonicalization state bound exceeded"
+            )
+        partition = _collapse_exact_twin_cells(partition, node_ids, adjacency)
+        unresolved = next(
+            (
+                (index, cell)
+                for index, cell in enumerate(partition)
+                if len(cell) > 1
+            ),
+            None,
+        )
+        if unresolved is None:
+            order = tuple(cell[0] for cell in partition)
+            candidate = _canonical_serialization(
+                order,
+                bases,
+                tuple(raw_edges),
+            )
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+            continue
+
+        cell_index, cell = unresolved
+        representatives = _branch_representatives(cell, node_ids, adjacency)
+        if len(representatives) > _MAX_INDIVIDUALIZATION_BRANCHES:
+            raise CapabilityCanonicalizationError(
+                "capability canonicalization branch bound exceeded"
+            )
+        for node_id in reversed(representatives):
+            individualized = _individualize(partition, cell_index, node_id)
+            pending.append(_refine_partition(individualized, incoming, outgoing))
+
+    if best is None:
+        raise CapabilityCanonicalizationError(
+            "capability canonicalization produced no exact serialization"
+        )
+    _, nodes, edges, positions = best
+    return positions, edges, nodes
 
 
 def _sorted_role_values(
@@ -431,22 +648,35 @@ def _capability_projection(graph: NormalizedGraph) -> dict[str, Any]:
         }
         for node in graph.nodes
     }
-    labels, edges = _topology_labels(graph, bases)
+    labels, edges, topology_nodes = _canonicalize_topology(graph, bases)
 
     loras = []
     for binding in graph.bindings(SemanticRole.LORA):
         node = nodes_by_id[binding.node_id]
-        strengths = {
-            field_name: strength_bucket(value)
-            for field_name, value in node.inputs.items()
-            if _canonical_field_name(field_name).startswith("strength")
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-        }
+        binding_value = thaw_json(binding.value)
+        if isinstance(binding_value, Mapping) and isinstance(
+            binding_value.get("name"), str
+        ):
+            identity = binding_value["name"]
+            strengths = {
+                key: value
+                for key, value in binding_value.items()
+                if key != "name"
+            }
+        else:
+            identity = binding_value
+            strengths = {
+                field_name: strength_bucket(value)
+                for field_name, value in node.inputs.items()
+                if _canonical_field_name(field_name).startswith("strength")
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            }
         loras.append(
             {
                 "class_type": node.class_type,
-                "identity": _capability_value(thaw_json(binding.value)),
+                "identity": _capability_value(identity),
+                "slot": binding.field_name,
                 "strengths": strengths,
             }
         )
@@ -534,17 +764,19 @@ def _capability_projection(graph: NormalizedGraph) -> dict[str, Any]:
         "schema": "mp-comfyui-lab/capability/v1",
         "topology": {
             "edges": edges,
-            "nodes": sorted(
-                [
-                    {"base": bases[node.node_id], "label": labels[node.node_id]}
-                    for node in graph.nodes
-                ],
-                key=_canonical_json,
-            ),
+            "nodes": topology_nodes,
         },
         "vae": _sorted_role_values(graph, SemanticRole.VAE, nodes_by_id),
     }
 
 
 def capability_hash(graph: Any) -> str:
-    return _sha256_json(_capability_projection(normalize_graph(graph)))
+    try:
+        normalized = normalize_graph(graph)
+        return _sha256_json(_capability_projection(normalized))
+    except (GraphHashError, GraphNormalizationError):
+        raise
+    except (RecursionError, UnicodeError) as error:
+        raise GraphHashError(
+            f"capability hash projection failed: {error}"
+        ) from error

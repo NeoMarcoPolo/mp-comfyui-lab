@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unicodedata
 from enum import StrEnum
+from math import isfinite
 from typing import Annotated, Any
 
 from pydantic import (
@@ -26,6 +27,28 @@ NonBlankStr = Annotated[
     str,
     StringConstraints(strict=True, strip_whitespace=True, min_length=1),
 ]
+
+_STRENGTH_LIMITS = (
+    (0.25, "subtle"),
+    (0.75, "light"),
+    (1.25, "standard"),
+    (2.0, "strong"),
+)
+
+
+def strength_bucket(value: Any) -> str:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError("strength must be a finite JSON number")
+    if isinstance(value, float) and not isfinite(value):
+        raise ValueError("strength must be a finite JSON number")
+    if value == 0:
+        return "zero"
+    sign = "negative" if value < 0 else "positive"
+    magnitude = abs(value)
+    for upper_bound, label in _STRENGTH_LIMITS:
+        if magnitude <= upper_bound:
+            return f"{sign}_{label}"
+    return f"{sign}_extreme"
 
 
 def _validate_node_id(value: Any) -> str:
@@ -118,10 +141,11 @@ class RoleBindings(_FrozenModel):
     bindings: tuple[RoleBinding, ...] = ()
 
 
-def _node_sort_key(node_id: str) -> tuple[int, int | str, str]:
+def _node_sort_key(node_id: str) -> tuple[int, int, str, str]:
     if node_id.isdecimal():
-        return (0, int(node_id), node_id)
-    return (1, node_id, node_id)
+        significant = node_id.lstrip("0") or "0"
+        return (0, len(significant), significant, node_id)
+    return (1, 0, node_id, node_id)
 
 
 def _binding_description(binding: RoleBinding) -> dict[str, Any]:

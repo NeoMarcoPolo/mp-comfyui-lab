@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 
@@ -13,7 +14,11 @@ from mp_comfyui_lab.graph.hashing import (
     source_graph_hash,
     strength_bucket,
 )
-from mp_comfyui_lab.graph.normalize import GraphValidationError, normalize_graph
+from mp_comfyui_lab.graph.normalize import (
+    GraphNormalizationError,
+    GraphValidationError,
+    normalize_graph,
+)
 from mp_comfyui_lab.json_types import freeze_json_object
 
 
@@ -75,6 +80,53 @@ def _renumber_graph(graph: dict) -> dict:
                 new_node["inputs"][field_name] = [replacements[value[0]], value[1]]
         renumbered[replacements[old_id]] = new_node
     return renumbered
+
+
+def _edge_colored_bipartite_graph(permutation: tuple[int, ...]) -> dict:
+    graph = {
+        f"source-{index}": {
+            "class_type": "SymmetricSource",
+            "inputs": {},
+        }
+        for index in range(len(permutation))
+    }
+    graph.update(
+        {
+            f"target-{index}": {
+                "class_type": "SymmetricTarget",
+                "inputs": {
+                    "positive": [f"source-{index}", 0],
+                    "negative": [f"source-{source_index}", 0],
+                },
+            }
+            for index, source_index in enumerate(permutation)
+        }
+    )
+    return graph
+
+
+def _power_lora_graph(strength: object = 1.0) -> dict:
+    return {
+        "loader": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": "base.safetensors"},
+        },
+        "power": {
+            "class_type": "Power Lora Loader (rgthree)",
+            "inputs": {
+                "model": ["loader", 0],
+                "lora_1": {
+                    "on": True,
+                    "lora": "style.safetensors",
+                    "strength": strength,
+                },
+            },
+        },
+        "sampler": {
+            "class_type": "KSampler",
+            "inputs": {"model": ["power", 0], "seed": 1},
+        },
+    }
 
 
 def test_source_graph_hash_is_compact_sorted_utf8_sha256_without_meta() -> None:
@@ -295,6 +347,25 @@ def test_capability_hash_ignores_generic_output_prefix_metadata(qwen_graph) -> N
     )
 
 
+@pytest.mark.parametrize("class_type", ["Image Save", "Image Saver Simple"])
+def test_image_save_classes_ignore_output_prefix_in_capability(class_type) -> None:
+    graph = {
+        "source": {
+            "class_type": "PrimitiveNode",
+            "inputs": {"value": "pixels"},
+        },
+        "output": {
+            "class_type": class_type,
+            "inputs": {"images": ["source", 0], "prefix": "first"},
+        },
+    }
+    changed = copy.deepcopy(graph)
+    changed["output"]["inputs"]["prefix"] = "second"
+
+    assert capability_hash(graph) == capability_hash(changed)
+    assert source_graph_hash(graph) != source_graph_hash(changed)
+
+
 def test_capability_hash_uses_prompt_grammar_not_incidental_wording(qwen_graph) -> None:
     wording = copy.deepcopy(qwen_graph)
     wording["95"]["inputs"]["prompt"] = "Render a coherent follow-up shot."
@@ -307,7 +378,7 @@ def test_capability_hash_uses_prompt_grammar_not_incidental_wording(qwen_graph) 
     assert capability_hash(grammar) != baseline
 
 
-def test_raw_query_parameters_remain_material_except_signed_credentials() -> None:
+def test_signed_query_is_entirely_removed_from_capability_identity() -> None:
     revision_one = {
         "1": {
             "class_type": "ModelProvider",
@@ -338,13 +409,58 @@ def test_raw_query_parameters_remain_material_except_signed_credentials() -> Non
         revision_one, fixtures={}, prompts=[], seed=1
     ) != exact_run_hash(different_signature, fixtures={}, prompts=[], seed=1)
     assert capability_hash(revision_one) == capability_hash(different_signature)
-    assert capability_hash(revision_one) != capability_hash(revision_two)
+    assert capability_hash(revision_one) == capability_hash(revision_two)
 
     projection = graph_hashing._capability_projection(normalize_graph(revision_one))
     serialized = json.dumps(projection, ensure_ascii=False, sort_keys=True)
-    assert "revision=1" in serialized
+    assert "models.example/model?" not in serialized
+    assert "revision=1" not in serialized
     assert "secret-one" not in serialized
     assert "signed-one" not in serialized
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "Signature",
+        "s_i-g.nature",
+        "X-Amz-Credential",
+        "AWSAccessKeyId",
+        "TOKEN",
+        "sig",
+    ],
+)
+def test_security_canonical_signing_markers_remove_complete_query(marker) -> None:
+    first = {
+        "1": {
+            "class_type": "ModelProvider",
+            "inputs": {
+                "endpoint": (
+                    f"https://models.example/model?revision=1&{marker}=secret-one&"
+                    "sp=read&se=2030-01-01"
+                )
+            },
+        }
+    }
+    rotated = copy.deepcopy(first)
+    rotated["1"]["inputs"]["endpoint"] = (
+        f"https://models.example/model?revision=2&{marker}=secret-two&"
+        "sp=write&se=2040-01-01"
+    )
+
+    assert capability_hash(first) == capability_hash(rotated)
+    assert source_graph_hash(first) != source_graph_hash(rotated)
+    assert exact_run_hash(first, fixtures={}, prompts=[], seed=1) != exact_run_hash(
+        rotated,
+        fixtures={},
+        prompts=[],
+        seed=1,
+    )
+
+    projection = graph_hashing._capability_projection(normalize_graph(first))
+    serialized = json.dumps(projection, ensure_ascii=False, sort_keys=True)
+    assert "?" not in serialized
+    assert "secret-one" not in serialized
 
 
 def test_unsigned_expires_query_parameter_remains_material() -> None:
@@ -395,6 +511,49 @@ def test_capability_hash_is_invariant_to_source_order_and_node_renumbering(
         prompts=[],
         seed=1,
     )
+
+
+def test_exact_canonicalization_distinguishes_eight_node_wl_collision() -> None:
+    connected_cycle = _edge_colored_bipartite_graph((1, 2, 3, 0))
+    disconnected_cycles = _edge_colored_bipartite_graph((1, 0, 3, 2))
+
+    connected_hash = capability_hash(connected_cycle)
+
+    assert connected_hash != capability_hash(disconnected_cycles)
+    assert capability_hash(_renumber_graph(connected_cycle)) == connected_hash
+
+
+def test_symmetric_canonicalization_exceeding_bound_fails_closed() -> None:
+    assert hasattr(graph_hashing, "GraphHashError")
+    assert hasattr(graph_hashing, "CapabilityCanonicalizationError")
+    error_type = graph_hashing.CapabilityCanonicalizationError
+    assert issubclass(error_type, graph_hashing.GraphHashError)
+    symmetric = _edge_colored_bipartite_graph(
+        tuple(range(1, 13)) + (0,)
+    )
+
+    with pytest.raises(error_type, match="canonicalization.*bound"):
+        capability_hash(symmetric)
+
+
+def test_canonicalization_performance_scales_for_100_400_800_nodes() -> None:
+    durations = {}
+    for node_count in (100, 400, 800):
+        graph = {
+            f"node-{index}": {
+                "class_type": "UniqueCapabilityNode",
+                "inputs": {"ordinal": index},
+            }
+            for index in range(node_count)
+        }
+        started = perf_counter()
+        capability_hash(graph)
+        durations[node_count] = perf_counter() - started
+
+    assert durations[100] < 2.0
+    assert durations[400] < 4.0
+    assert durations[800] < 8.0
+    assert durations[800] <= durations[100] * 30 + 0.5
 
 
 def test_hashes_accept_repo_frozen_json_graphs(qwen_graph) -> None:
@@ -477,6 +636,50 @@ def test_exact_hash_rejects_surrogates_in_non_graph_inputs(qwen_graph, overrides
         exact_run_hash(qwen_graph, **values)
 
 
+def test_hash_apis_translate_depth_failures_to_domain_errors(qwen_graph) -> None:
+    nested: object = "leaf"
+    for _ in range(601):
+        nested = {"nested": nested}
+    deep_graph = {
+        "1": {
+            "class_type": "PrimitiveNode",
+            "inputs": {"payload": nested},
+        }
+    }
+
+    for hash_call in (
+        lambda: source_graph_hash(deep_graph),
+        lambda: exact_run_hash(deep_graph, fixtures={}, prompts=[], seed=1),
+        lambda: capability_hash(deep_graph),
+    ):
+        with pytest.raises(GraphNormalizationError, match="depth limit"):
+            hash_call()
+
+    assert hasattr(graph_hashing, "GraphHashError")
+    with pytest.raises(graph_hashing.GraphHashError, match="depth limit"):
+        exact_run_hash(
+            qwen_graph,
+            fixtures={},
+            prompts=[],
+            seed=1,
+            execution_parameters={"nested": nested},
+        )
+
+
+def test_all_hashes_accept_very_long_numeric_node_id() -> None:
+    long_id = "8" * 5_000
+    graph = {
+        long_id: {
+            "class_type": "PrimitiveNode",
+            "inputs": {"value": "long identity"},
+        }
+    }
+
+    assert len(source_graph_hash(graph)) == 64
+    assert len(exact_run_hash(graph, fixtures={}, prompts=[], seed=1)) == 64
+    assert len(capability_hash(graph)) == 64
+
+
 @pytest.mark.parametrize(
     ("mutator", "description"),
     [
@@ -552,6 +755,50 @@ def test_capability_hash_uses_strength_buckets_not_incidental_float_noise(
     same_bucket["133"]["inputs"]["strength_model"] = 0.9
 
     assert capability_hash(same_bucket) == capability_hash(qwen_graph)
+
+
+def test_power_lora_nested_strength_uses_stable_bucket() -> None:
+    baseline = _power_lora_graph(1.0)
+    same_bucket = _power_lora_graph(0.9)
+    different_bucket = _power_lora_graph(0.7)
+
+    assert capability_hash(same_bucket) == capability_hash(baseline)
+    assert capability_hash(different_bucket) != capability_hash(baseline)
+
+
+def test_boolean_strength_field_is_preserved_without_numeric_bucketing() -> None:
+    enabled = {
+        "1": {
+            "class_type": "FeatureToggle",
+            "inputs": {"strength_enabled": True},
+        }
+    }
+    disabled = copy.deepcopy(enabled)
+    disabled["1"]["inputs"]["strength_enabled"] = False
+
+    enabled_hash = capability_hash(enabled)
+
+    assert enabled_hash == capability_hash(enabled)
+    assert enabled_hash != capability_hash(disabled)
+
+
+def test_positive_negative_prompt_capability_uses_grammar_not_wording() -> None:
+    baseline = {
+        "1": {
+            "class_type": "WanVideoPrompt",
+            "inputs": {
+                "positive_prompt": "A quiet portrait",
+                "negative_prompt": "blur, noise",
+            },
+        }
+    }
+    wording = copy.deepcopy(baseline)
+    wording["1"]["inputs"]["positive_prompt"] = "A vivid landscape"
+    grammar = copy.deepcopy(baseline)
+    grammar["1"]["inputs"]["positive_prompt"] = "Scene: {subject}"
+
+    assert capability_hash(wording) == capability_hash(baseline)
+    assert capability_hash(grammar) != capability_hash(baseline)
 
 
 @pytest.mark.parametrize(
