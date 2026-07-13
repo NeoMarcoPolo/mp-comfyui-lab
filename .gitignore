@@ -1,0 +1,13 @@
+.venv/
+config.local.yaml
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+experiments/**
+!experiments/.gitkeep
