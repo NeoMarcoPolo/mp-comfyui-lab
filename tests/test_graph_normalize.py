@@ -9,6 +9,7 @@ from mp_comfyui_lab.graph.models import (
     AmbiguousRoleError,
     MissingRoleError,
     NormalizedGraph,
+    NormalizedNode,
     RoleBinding,
     RoleBindings,
     SemanticRole,
@@ -180,7 +181,7 @@ def test_model_name_input_on_custom_model_provider_is_detected() -> None:
     )
 
 
-def test_normalized_nodes_and_bindings_are_deeply_immutable_and_sanitized() -> None:
+def test_normalized_nodes_and_bindings_are_deeply_immutable_and_raw() -> None:
     source = {
         "1": _node(
             "PrimitiveNode",
@@ -201,8 +202,8 @@ def test_normalized_nodes_and_bindings_are_deeply_immutable_and_sanitized() -> N
     )
 
     assert node.inputs["values"] == (1, {"nested": (2, 3)})
-    assert node.inputs["api_key"] == "[REDACTED]"
-    assert node.inputs["url"] == "https://example.test/model"
+    assert node.inputs["api_key"] == "secret"
+    assert node.inputs["url"] == "https://example.test/model?token=secret"
     assert binding.value["nested"] == (1, 2)
     with pytest.raises(TypeError):
         node.inputs["values"] = ()
@@ -330,6 +331,73 @@ def test_literal_arrays_are_not_misclassified_as_links() -> None:
     assert source["2"]["inputs"]["source"] == ["1", 0]
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    ["choices", "values", "list", "indices", "colors", "ranges"],
+)
+def test_literal_pair_matching_real_node_id_stays_literal(field_name) -> None:
+    source = {
+        "1": _node("PrimitiveNode", value="upstream"),
+        "2": _node("CollectionSelector", **{field_name: ["1", 0]}),
+    }
+
+    selector = normalize_graph(source).nodes[1]
+
+    assert selector.inputs[field_name] == ("1", 0)
+    assert selector.input_links == {}
+
+
+def test_unknown_pair_matching_real_node_id_is_reported_as_ambiguous() -> None:
+    source = {
+        "1": _node("PrimitiveNode", value="upstream"),
+        "2": _node("CustomNode", custom_pair=["1", 0]),
+    }
+
+    with pytest.raises(GraphValidationError, match="custom_pair.*ambiguous"):
+        normalize_graph(source)
+
+
+def test_primitive_literal_feeding_text_encoder_is_prompt_source() -> None:
+    source = {
+        "source": _node("PrimitiveNode", value="portrait of a traveler"),
+        "encoder": _node("CLIPTextEncode", text=["source", 0], clip=["clip", 0]),
+        "clip": _node("CLIPLoader", clip_name="encoder.safetensors"),
+    }
+
+    binding = normalize_graph(source).require_one(SemanticRole.PROMPT_SOURCE)
+
+    assert binding.node_id == "source"
+    assert binding.field_name == "value"
+    assert binding.value == "portrait of a traveler"
+    assert binding.confidence > 0.8
+    assert "consumer" in binding.reason
+
+
+def test_class_only_scheduler_node_gets_scheduler_binding() -> None:
+    graph = normalize_graph({"schedule": _node("KarrasScheduler", steps=24)})
+
+    binding = graph.require_one(SemanticRole.SCHEDULER)
+
+    assert binding.field_name == "$class_type"
+    assert binding.value == "KarrasScheduler"
+    assert binding.confidence > 0.8
+    assert binding.reason == "scheduler node class"
+
+
+def test_generic_reference_provider_is_detected_without_save_false_positive() -> None:
+    graph = normalize_graph(
+        {
+            "reference": _node("ReferenceProvider", image_name="character.png"),
+            "save": _node("SaveImage", filename="render.png"),
+        }
+    )
+
+    assert [
+        (binding.node_id, binding.field_name, binding.value)
+        for binding in graph.bindings(SemanticRole.REFERENCE_IMAGE)
+    ] == [("reference", "image_name", "character.png")]
+
+
 def test_only_meta_keys_are_removed_recursively_from_semantic_projection() -> None:
     source = {
         "_meta": {"workflow_title": "ignored top-level UI metadata"},
@@ -432,6 +500,57 @@ def test_lora_order_follows_model_edges_through_passthrough_nodes() -> None:
     bindings = normalize_graph(graph).bindings(SemanticRole.LORA)
 
     assert [binding.node_id for binding in bindings] == ["first", "second"]
+
+
+@pytest.mark.parametrize("mode", ["unused", "bypassed"])
+def test_lora_chain_requires_final_downstream_model_consumer(mode) -> None:
+    graph = _lora_graph()
+    if mode == "unused":
+        del graph["sampler"]
+        del graph["output"]
+    else:
+        graph["sampler"]["inputs"]["model"] = ["upstream", 0]
+
+    with pytest.raises(GraphTopologyError, match="LoRA.*(consumer|bypass|branch)"):
+        normalize_graph(graph)
+
+
+@pytest.mark.parametrize("node_id", [" 1", "1 ", "1\x00", "1\ud800"])
+def test_node_ids_are_exact_safe_unicode_identifiers(node_id) -> None:
+    with pytest.raises(GraphValidationError, match="node ID"):
+        normalize_graph({node_id: _node("PrimitiveNode", value=1)})
+
+
+@pytest.mark.parametrize("node_id", [" 1", "1 ", "1\x00", "1\ud800"])
+def test_strict_models_reject_unsafe_node_ids_without_normalizing(node_id) -> None:
+    with pytest.raises(ValidationError, match="node ID"):
+        NormalizedNode(
+            node_id=node_id,
+            class_type="PrimitiveNode",
+            inputs={},
+            input_links={},
+        )
+    with pytest.raises(ValidationError, match="node ID"):
+        RoleBinding(
+            node_id=node_id,
+            field_name="value",
+            value=1,
+            confidence=1.0,
+            reason="test binding",
+        )
+
+
+@pytest.mark.parametrize(
+    "graph",
+    [
+        {"1": _node("Class\ud800", value="ok")},
+        {"1": {"class_type": "PrimitiveNode", "inputs": {"key\ud800": "ok"}}},
+        {"1": _node("PrimitiveNode", value={"nested": ["bad\ud800"]})},
+    ],
+)
+def test_graph_rejects_lone_surrogates_recursively(graph) -> None:
+    with pytest.raises(GraphValidationError, match="surrogate"):
+        normalize_graph(graph)
 
 
 def test_lora_cycle_is_reported() -> None:

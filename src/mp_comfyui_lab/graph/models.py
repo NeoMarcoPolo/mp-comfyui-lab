@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from enum import StrEnum
 from typing import Annotated, Any
 
@@ -16,7 +17,6 @@ from pydantic import (
 
 from mp_comfyui_lab.json_types import (
     FrozenJsonObject,
-    SanitizedJsonObject,
     freeze_json_object,
     thaw_json,
 )
@@ -26,6 +26,19 @@ NonBlankStr = Annotated[
     str,
     StringConstraints(strict=True, strip_whitespace=True, min_length=1),
 ]
+
+
+def _validate_node_id(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("node ID must be a nonblank string")
+    if value != value.strip():
+        raise ValueError("node ID must not have leading or trailing whitespace")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise ValueError("node ID must not contain control or surrogate characters")
+    return value
+
+
+ExactNodeId = Annotated[str, BeforeValidator(_validate_node_id)]
 
 
 def _freeze_json_value(value: Any) -> Any:
@@ -67,9 +80,9 @@ class SemanticRole(StrEnum):
 
 
 class NormalizedNode(_FrozenModel):
-    node_id: NonBlankStr
+    node_id: ExactNodeId
     class_type: NonBlankStr
-    inputs: SanitizedJsonObject
+    inputs: FrozenJsonObject
     input_links: FrozenJsonObject
 
     @field_validator("input_links")
@@ -81,8 +94,6 @@ class NormalizedNode(_FrozenModel):
             if (
                 not isinstance(link, tuple)
                 or len(link) != 2
-                or not isinstance(link[0], str)
-                or not link[0].strip()
                 or not isinstance(link[1], int)
                 or isinstance(link[1], bool)
                 or link[1] < 0
@@ -90,11 +101,12 @@ class NormalizedNode(_FrozenModel):
                 raise ValueError(
                     "input links must contain [nonblank node ID, nonnegative output index]"
                 )
+            _validate_node_id(link[0])
         return links
 
 
 class RoleBinding(_FrozenModel):
-    node_id: NonBlankStr
+    node_id: ExactNodeId
     field_name: NonBlankStr
     value: FrozenJsonValue
     confidence: float = Field(ge=0.0, le=1.0)

@@ -6,12 +6,14 @@ from pathlib import Path
 
 import pytest
 
+import mp_comfyui_lab.graph.hashing as graph_hashing
 from mp_comfyui_lab.graph.hashing import (
     capability_hash,
     exact_run_hash,
     source_graph_hash,
     strength_bucket,
 )
+from mp_comfyui_lab.graph.normalize import GraphValidationError, normalize_graph
 from mp_comfyui_lab.json_types import freeze_json_object
 
 
@@ -305,6 +307,63 @@ def test_capability_hash_uses_prompt_grammar_not_incidental_wording(qwen_graph) 
     assert capability_hash(grammar) != baseline
 
 
+def test_raw_query_parameters_remain_material_except_signed_credentials() -> None:
+    revision_one = {
+        "1": {
+            "class_type": "ModelProvider",
+            "inputs": {
+                "endpoint": (
+                    "https://models.example/model?revision=1&"
+                    "X-Amz-Signature=secret-one&token=signed-one"
+                )
+            },
+        }
+    }
+    different_signature = copy.deepcopy(revision_one)
+    different_signature["1"]["inputs"]["endpoint"] = (
+        "https://models.example/model?token=signed-two&revision=1&"
+        "X-Amz-Signature=secret-two"
+    )
+    revision_two = copy.deepcopy(revision_one)
+    revision_two["1"]["inputs"]["endpoint"] = (
+        "https://models.example/model?revision=2&"
+        "X-Amz-Signature=secret-one&token=signed-one"
+    )
+
+    assert normalize_graph(revision_one).nodes[0].inputs["endpoint"].endswith(
+        "X-Amz-Signature=secret-one&token=signed-one"
+    )
+    assert source_graph_hash(revision_one) != source_graph_hash(different_signature)
+    assert exact_run_hash(
+        revision_one, fixtures={}, prompts=[], seed=1
+    ) != exact_run_hash(different_signature, fixtures={}, prompts=[], seed=1)
+    assert capability_hash(revision_one) == capability_hash(different_signature)
+    assert capability_hash(revision_one) != capability_hash(revision_two)
+
+    projection = graph_hashing._capability_projection(normalize_graph(revision_one))
+    serialized = json.dumps(projection, ensure_ascii=False, sort_keys=True)
+    assert "revision=1" in serialized
+    assert "secret-one" not in serialized
+    assert "signed-one" not in serialized
+
+
+def test_unsigned_expires_query_parameter_remains_material() -> None:
+    baseline = {
+        "1": {
+            "class_type": "ModelProvider",
+            "inputs": {
+                "endpoint": "https://models.example/model?expires=100&revision=1"
+            },
+        }
+    }
+    changed = copy.deepcopy(baseline)
+    changed["1"]["inputs"]["endpoint"] = (
+        "https://models.example/model?expires=200&revision=1"
+    )
+
+    assert capability_hash(baseline) != capability_hash(changed)
+
+
 def test_capability_hash_ignores_reference_filename_but_not_strategy(qwen_graph) -> None:
     renamed = copy.deepcopy(qwen_graph)
     renamed["74"]["inputs"]["image"] = "different-name.png"
@@ -349,6 +408,73 @@ def test_hashes_accept_repo_frozen_json_graphs(qwen_graph) -> None:
         prompts=[],
         seed=1,
     )
+
+
+@pytest.mark.parametrize(
+    "hash_call",
+    [
+        lambda graph: source_graph_hash(graph),
+        lambda graph: exact_run_hash(graph, fixtures={}, prompts=[], seed=1),
+        lambda graph: capability_hash(graph),
+    ],
+)
+def test_all_hashes_reject_dangling_links_before_serialization(hash_call) -> None:
+    graph = {
+        "1": {
+            "class_type": "KSampler",
+            "inputs": {"model": ["missing", 0], "seed": 1},
+        }
+    }
+
+    with pytest.raises(GraphValidationError, match="unknown node 'missing'"):
+        hash_call(graph)
+
+
+@pytest.mark.parametrize(
+    "graph",
+    [
+        {"bad\ud800": {"class_type": "PrimitiveNode", "inputs": {}}},
+        {"1": {"class_type": "Bad\ud800", "inputs": {}}},
+        {"1": {"class_type": "PrimitiveNode", "inputs": {"bad\ud800": 1}}},
+        {"1": {"class_type": "PrimitiveNode", "inputs": {"nested": ["bad\ud800"]}}},
+    ],
+)
+@pytest.mark.parametrize(
+    "hash_call",
+    [
+        lambda graph: source_graph_hash(graph),
+        lambda graph: exact_run_hash(graph, fixtures={}, prompts=[], seed=1),
+        lambda graph: capability_hash(graph),
+    ],
+)
+def test_all_hashes_reject_graph_surrogates_with_validation_error(
+    graph,
+    hash_call,
+) -> None:
+    with pytest.raises(GraphValidationError, match="surrogate"):
+        hash_call(graph)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"fixtures": {"reference": "a" * 63 + "\ud800"}},
+        {"prompts": ["nested \ud800 prompt"]},
+        {"execution_parameters": {"nested": {"value": "bad\ud800"}}},
+        {"execution_parameters": {"bad\ud800": "value"}},
+    ],
+)
+def test_exact_hash_rejects_surrogates_in_non_graph_inputs(qwen_graph, overrides) -> None:
+    values = {
+        "fixtures": {},
+        "prompts": [],
+        "seed": 1,
+        "execution_parameters": {},
+    }
+    values.update(overrides)
+
+    with pytest.raises(graph_hashing.HashValidationError, match="surrogate"):
+        exact_run_hash(qwen_graph, **values)
 
 
 @pytest.mark.parametrize(

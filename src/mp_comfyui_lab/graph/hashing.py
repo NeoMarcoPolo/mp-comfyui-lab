@@ -7,6 +7,7 @@ import json
 from math import isfinite
 import re
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from mp_comfyui_lab.graph.models import NormalizedGraph, NormalizedNode, SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph, semantic_graph_projection
@@ -38,12 +39,44 @@ _OPERATIONAL_FIELDS = frozenset(
 _PROMPT_FIELDS = frozenset({"prompt", "promptline", "text", "value"})
 _REFERENCE_FIELDS = frozenset({"filename", "image", "imagename", "path"})
 _OUTPUT_PREFIX_FIELDS = frozenset({"prefix", "saveprefix"})
+_SIGNED_CREDENTIAL_QUERY_KEYS = frozenset(
+    {
+        "accesstoken",
+        "authorization",
+        "sig",
+        "signature",
+        "token",
+        "xamzalgorithm",
+        "xamzcredential",
+        "xamzdate",
+        "xamzexpires",
+        "xamzsecuritytoken",
+        "xamzsignature",
+        "xamzsignedheaders",
+        "xgoogalgorithm",
+        "xgoogcredential",
+        "xgoogdate",
+        "xgoogexpires",
+        "xgoogsignature",
+        "xgoogsignedheaders",
+    }
+)
+_CONDITIONAL_SIGNED_QUERY_KEYS = frozenset({"expires", "keypairid", "policy"})
 _STRENGTH_LIMITS = (
     (0.25, "subtle"),
     (0.75, "light"),
     (1.25, "standard"),
     (2.0, "strong"),
 )
+
+
+class HashValidationError(ValueError):
+    pass
+
+
+def _validate_hash_unicode(value: str, path: str) -> None:
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise HashValidationError(f"{path} contains a lone UTF-16 surrogate")
 
 
 def _canonical_json(value: Any) -> str:
@@ -61,17 +94,21 @@ def _sha256_json(value: Any) -> str:
 
 
 def _strict_json_copy(value: Any, path: str) -> Any:
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, str):
+        _validate_hash_unicode(value, path)
         return value
     if isinstance(value, float):
         if not isfinite(value):
-            raise ValueError(f"{path} JSON numbers must be finite")
+            raise HashValidationError(f"{path} JSON numbers must be finite")
         return value
     if isinstance(value, Mapping):
         copied = {}
         for key, item in value.items():
             if not isinstance(key, str):
-                raise ValueError(f"{path} object keys must be strings")
+                raise HashValidationError(f"{path} object keys must be strings")
+            _validate_hash_unicode(key, f"{path} object key")
             copied[key] = _strict_json_copy(item, f"{path}.{key}")
         return copied
     if isinstance(value, (list, tuple)):
@@ -79,42 +116,55 @@ def _strict_json_copy(value: Any, path: str) -> Any:
             _strict_json_copy(item, f"{path}[{index}]")
             for index, item in enumerate(value)
         ]
-    raise ValueError(f"{path} has unsupported JSON value type {type(value).__name__}")
+    raise HashValidationError(
+        f"{path} has unsupported JSON value type {type(value).__name__}"
+    )
 
 
 def source_graph_hash(graph: Any) -> str:
+    normalize_graph(graph)
     return _sha256_json(semantic_graph_projection(graph))
 
 
 def _validate_fixtures(fixtures: Any) -> dict[str, str]:
     if not isinstance(fixtures, Mapping):
-        raise ValueError("fixtures must be a strict mapping of names to SHA-256 hashes")
+        raise HashValidationError(
+            "fixtures must be a strict mapping of names to SHA-256 hashes"
+        )
     validated: dict[str, str] = {}
     for name, digest in fixtures.items():
         if not isinstance(name, str) or not name.strip():
-            raise ValueError("fixture names must be nonblank strings")
+            raise HashValidationError("fixture names must be nonblank strings")
+        _validate_hash_unicode(name, "fixture name")
+        if isinstance(digest, str):
+            _validate_hash_unicode(digest, f"fixture '{name}' hash")
         if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
-            raise ValueError(f"fixture '{name}' must have a lowercase SHA-256 hash")
+            raise HashValidationError(
+                f"fixture '{name}' must have a lowercase SHA-256 hash"
+            )
         validated[name] = digest
     return validated
 
 
 def _validate_prompts(prompts: Any) -> list[str]:
     if isinstance(prompts, (str, bytes)) or not isinstance(prompts, Sequence):
-        raise ValueError("prompts must be an ordered list or tuple of strings")
+        raise HashValidationError(
+            "prompts must be an ordered list or tuple of strings"
+        )
     validated: list[str] = []
     for index, prompt in enumerate(prompts):
         if not isinstance(prompt, str):
-            raise ValueError(f"prompt at index {index} must be a string")
+            raise HashValidationError(f"prompt at index {index} must be a string")
+        _validate_hash_unicode(prompt, f"prompt at index {index}")
         validated.append(prompt)
     return validated
 
 
 def _validate_seed(seed: Any) -> int:
     if not isinstance(seed, int) or isinstance(seed, bool):
-        raise ValueError("seed must be an integer")
+        raise HashValidationError("seed must be an integer")
     if not 0 <= seed < 2**64:
-        raise ValueError("seed must be between 0 and 2^64 - 1")
+        raise HashValidationError("seed must be between 0 and 2^64 - 1")
     return seed
 
 
@@ -129,7 +179,7 @@ def exact_run_hash(
     if execution_parameters is None:
         execution_parameters = {}
     if not isinstance(execution_parameters, Mapping):
-        raise ValueError("execution_parameters must be a mapping")
+        raise HashValidationError("execution_parameters must be a mapping")
 
     projection = {
         "execution_parameters": _strict_json_copy(
@@ -203,6 +253,55 @@ def _is_operational_field(field_name: str) -> bool:
     )
 
 
+def _canonicalize_capability_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return value
+    try:
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return value
+    canonical_keys = {
+        _canonical_field_name(key)
+        for key, _ in query_items
+    }
+    has_signed_credentials = bool(canonical_keys & _SIGNED_CREDENTIAL_QUERY_KEYS)
+    retained = sorted(
+        (
+            (key, item)
+            for key, item in query_items
+            if _canonical_field_name(key) not in _SIGNED_CREDENTIAL_QUERY_KEYS
+            and not (
+                has_signed_credentials
+                and _canonical_field_name(key) in _CONDITIONAL_SIGNED_QUERY_KEYS
+            )
+        ),
+        key=lambda pair: (pair[0], pair[1]),
+    )
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(retained, doseq=True),
+            parsed.fragment,
+        )
+    )
+
+
+def _capability_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _canonicalize_capability_url(value)
+    if isinstance(value, Mapping):
+        return {key: _capability_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_capability_value(item) for item in value]
+    return value
+
+
 def _capability_inputs(
     node: NormalizedNode,
     prompt_fields: frozenset[tuple[str, str]],
@@ -234,7 +333,7 @@ def _capability_inputs(
         elif canonical.startswith("strength") and isinstance(value, (int, float)):
             projected[field_name] = {"bucket": strength_bucket(value)}
         else:
-            projected[field_name] = _strict_json_copy(value, f"node.{field_name}")
+            projected[field_name] = _capability_value(value)
     return projected
 
 
@@ -308,7 +407,7 @@ def _sorted_role_values(
         {
             "class_type": nodes_by_id[binding.node_id].class_type,
             "field": binding.field_name,
-            "value": thaw_json(binding.value),
+            "value": _capability_value(thaw_json(binding.value)),
         }
         for binding in graph.bindings(role)
     ]
@@ -347,7 +446,7 @@ def _capability_projection(graph: NormalizedGraph) -> dict[str, Any]:
         loras.append(
             {
                 "class_type": node.class_type,
-                "identity": thaw_json(binding.value),
+                "identity": _capability_value(thaw_json(binding.value)),
                 "strengths": strengths,
             }
         )
@@ -370,7 +469,7 @@ def _capability_projection(graph: NormalizedGraph) -> dict[str, Any]:
                 "class_type": nodes_by_id[binding.node_id].class_type,
                 "field": binding.field_name,
                 "node_topology": labels[binding.node_id],
-                "strategy": thaw_json(binding.value),
+                "strategy": _capability_value(thaw_json(binding.value)),
             }
             for binding in graph.bindings(SemanticRole.PROMPT_FANOUT)
         ],
@@ -401,7 +500,7 @@ def _capability_projection(graph: NormalizedGraph) -> dict[str, Any]:
             {
                 "class_type": nodes_by_id[binding.node_id].class_type,
                 "field": binding.field_name,
-                "identity": thaw_json(binding.value),
+                "identity": _capability_value(thaw_json(binding.value)),
             }
         )
         for role in (SemanticRole.CHECKPOINT, SemanticRole.MODEL, SemanticRole.UNET)
@@ -420,7 +519,7 @@ def _capability_projection(graph: NormalizedGraph) -> dict[str, Any]:
             "cardinality": len(graph.bindings(SemanticRole.OUTPUT)),
             "types": sorted(
                 (
-                    thaw_json(binding.value)
+                    _capability_value(thaw_json(binding.value))
                     for binding in graph.bindings(SemanticRole.OUTPUT)
                 ),
                 key=_canonical_json,

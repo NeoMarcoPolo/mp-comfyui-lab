@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from collections import defaultdict
 from collections.abc import Mapping
 from math import isfinite
@@ -69,6 +70,16 @@ _LINK_LIKELY_FIELDS = frozenset(
     }
     | {f"image{index}" for index in range(1, 17)}
 )
+_LITERAL_COLLECTION_FIELDS = frozenset(
+    {
+        "choices",
+        "colors",
+        "indices",
+        "list",
+        "ranges",
+        "values",
+    }
+)
 
 
 def _node_sort_key(node_id: str) -> tuple[int, int | str, str]:
@@ -83,8 +94,22 @@ def _compact_class(class_type: str) -> str:
     )
 
 
+def _canonical_field_name(field_name: str) -> str:
+    return "".join(
+        character for character in field_name.casefold() if character.isalnum()
+    )
+
+
+def _validate_unicode(value: str, path: str) -> None:
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise GraphValidationError(f"{path} contains a lone UTF-16 surrogate")
+
+
 def _validate_json(value: Any, path: str, *, allow_frozen: bool) -> None:
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, (bool, int)):
+        return
+    if isinstance(value, str):
+        _validate_unicode(value, path)
         return
     if isinstance(value, float):
         if not isfinite(value):
@@ -94,6 +119,7 @@ def _validate_json(value: Any, path: str, *, allow_frozen: bool) -> None:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise GraphValidationError(f"{path} object keys must be strings")
+            _validate_unicode(key, f"{path} object key")
             _validate_json(item, f"{path}.{key}", allow_frozen=allow_frozen)
         return
     if isinstance(value, list) or (allow_frozen and isinstance(value, tuple)):
@@ -131,6 +157,15 @@ def semantic_graph_projection(graph: Any) -> dict[str, Any]:
         if node_id == "_meta":
             continue
         node_count += 1
+        _validate_unicode(node_id, "graph node ID")
+        if node_id != node_id.strip():
+            raise GraphValidationError(
+                f"graph node ID {node_id!r} must not have leading or trailing whitespace"
+            )
+        if any(unicodedata.category(character) == "Cc" for character in node_id):
+            raise GraphValidationError(
+                f"graph node ID {node_id!r} must not contain control characters"
+            )
         if not node_id.strip():
             raise GraphValidationError("graph node IDs must not be blank")
         if not isinstance(node, Mapping):
@@ -174,14 +209,16 @@ def _input_link(
         return None
 
     source_id, output_index = value
-    known_source = source_id in node_ids
-    looks_like_link = (
-        known_source
-        or field_name.casefold() in _LINK_LIKELY_FIELDS
-        or source_id.isdecimal()
-    )
-    if not looks_like_link:
+    canonical_field = _canonical_field_name(field_name)
+    if canonical_field in _LITERAL_COLLECTION_FIELDS:
         return None
+    known_source = source_id in node_ids
+    recognized_link = field_name.casefold() in _LINK_LIKELY_FIELDS
+    if not recognized_link:
+        raise GraphValidationError(
+            f"node '{node_id}' input '{field_name}' has ambiguous two-item input; "
+            "declare it as a known link or literal collection field"
+        )
     if (
         not isinstance(output_index, int)
         or isinstance(output_index, bool)
@@ -359,6 +396,60 @@ def _lora_order(
         ordered.extend(
             sorted(bindings_by_node[node_id], key=lambda binding: binding.field_name)
         )
+
+    model_consumers: dict[str, list[str]] = defaultdict(list)
+    for consumer in nodes_by_id.values():
+        for field_name in _MODEL_LINK_FIELDS:
+            if field_name in consumer.input_links:
+                model_consumers[consumer.input_links[field_name][0]].append(
+                    consumer.node_id
+                )
+
+    for index, node_id in enumerate(ordered_node_ids):
+        expected_next = (
+            ordered_node_ids[index + 1]
+            if index + 1 < len(ordered_node_ids)
+            else None
+        )
+        cursor = node_id
+        visited = {node_id}
+        while True:
+            targets = sorted(
+                set(model_consumers.get(cursor, [])),
+                key=_node_sort_key,
+            )
+            if not targets:
+                if expected_next is None:
+                    raise GraphTopologyError(
+                        f"LoRA '{node_id}' has no downstream model consumer"
+                    )
+                raise GraphTopologyError(
+                    f"LoRA '{node_id}' model flow bypasses '{expected_next}'"
+                )
+            if len(targets) > 1:
+                raise GraphTopologyError(
+                    f"LoRA branch or bypass after '{cursor}': {targets}"
+                )
+            target = targets[0]
+            if target in visited:
+                raise GraphTopologyError(
+                    f"LoRA downstream cycle detected after '{node_id}'"
+                )
+            visited.add(target)
+            if target in lora_ids:
+                if target != expected_next:
+                    raise GraphTopologyError(
+                        f"LoRA '{node_id}' bypasses expected next LoRA '{expected_next}'"
+                    )
+                break
+            if not model_consumers.get(target):
+                if expected_next is not None:
+                    raise GraphTopologyError(
+                        f"LoRA '{node_id}' reaches consumer '{target}' before "
+                        f"expected LoRA '{expected_next}'"
+                    )
+                break
+            cursor = target
     return ordered
 
 
@@ -417,16 +508,47 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
             value = node.inputs[field_name]
             if not _nonblank_string(value):
                 continue
-            if field_name.casefold() not in {"prompt", "text"} and not textish:
+            prompt_consumers = [
+                (consumer, consumer_field)
+                for consumer, consumer_field in consumers[node.node_id]
+                if _canonical_field_name(consumer_field)
+                in {"prompt", "promptline", "text", "value"}
+                and any(
+                    token in _compact_class(consumer.class_type)
+                    for token in (
+                        "cliptext",
+                        "conditioning",
+                        "prompt",
+                        "string",
+                        "textencode",
+                    )
+                )
+            ]
+            if (
+                field_name.casefold() not in {"prompt", "text"}
+                and not textish
+                and not prompt_consumers
+            ):
                 continue
-            confidence = 0.95 if field_name.casefold() in {"prompt", "text"} else 0.86
+            confidence = (
+                0.97
+                if prompt_consumers
+                else 0.95
+                if field_name.casefold() in {"prompt", "text"}
+                else 0.86
+            )
+            reason = (
+                "literal value feeds recognized text consumer topology"
+                if prompt_consumers
+                else f"literal {field_name} input on {node.class_type}"
+            )
             grouped[SemanticRole.PROMPT_SOURCE].append(
                 _binding(
                     node,
                     field_name,
                     value,
                     confidence,
-                    f"literal {field_name} input on {node.class_type}",
+                    reason,
                 )
             )
 
@@ -449,7 +571,20 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
                 )
             )
 
-        if "loadimage" in compact:
+        is_output = (
+            compact.startswith("save")
+            or compact.startswith("preview")
+            or "videocombine" in compact
+            or compact.endswith("output")
+        )
+        is_reference_provider = not is_output and (
+            "loadimage" in compact
+            or "reference" in compact
+            or "imageprovider" in compact
+            or "imageinput" in compact
+            or "inputimage" in compact
+        )
+        if is_reference_provider:
             for field_name in _REFERENCE_FIELDS:
                 if _is_literal(node, field_name) and _nonblank_string(node.inputs[field_name]):
                     grouped[SemanticRole.REFERENCE_IMAGE].append(
@@ -517,6 +652,22 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
                         f"explicit {field_name} input",
                     )
                 )
+        if (
+            "scheduler" in compact
+            and not any(
+                _is_literal(node, field_name)
+                for field_name in ("scheduler", "scheduler_name")
+            )
+        ):
+            grouped[SemanticRole.SCHEDULER].append(
+                _binding(
+                    node,
+                    "$class_type",
+                    node.class_type,
+                    0.9,
+                    "scheduler node class",
+                )
+            )
 
         for field_name in _DIMENSION_FIELDS:
             if _is_literal(node, field_name):
@@ -588,12 +739,6 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
                 )
             )
 
-        is_output = (
-            compact.startswith("save")
-            or compact.startswith("preview")
-            or "videocombine" in compact
-            or compact.endswith("output")
-        )
         if is_output:
             grouped[SemanticRole.OUTPUT].append(
                 _binding(
