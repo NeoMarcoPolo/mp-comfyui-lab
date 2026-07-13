@@ -1,0 +1,4 @@
+# Keep this file limited to non-secret local paths.
+experiments_root: experiments
+vaults:
+  posted: Z:/path/to/posted-fixtures
