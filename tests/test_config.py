@@ -90,6 +90,42 @@ def test_absent_config_uses_repository_defaults(tmp_path):
     assert config.vaults == {}
 
 
+def test_load_without_base_defaults_to_current_working_directory(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = tmp_path / "fixtures" / "frame.png"
+    fixture.parent.mkdir()
+    fixture.write_bytes(b"png")
+    monkeypatch.chdir(tmp_path)
+
+    config = LabConfig.load()
+
+    assert config.experiments_root == (tmp_path / "experiments").resolve()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert config.resolve_fixture("fixtures/frame.png") == fixture.resolve()
+
+
+def test_load_without_base_reads_local_config_from_current_working_directory(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "config.local.yaml").write_text(
+        "experiments_root: local-runs\n"
+        "vaults:\n"
+        "  posted: fixtures/posted\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    config = LabConfig.load()
+
+    assert config.experiments_root == (tmp_path / "local-runs").resolve()
+    assert config.vaults == {"posted": (tmp_path / "fixtures/posted").resolve()}
+
+
 def test_local_config_resolves_paths_from_repository_root(tmp_path):
     (tmp_path / "config.local.yaml").write_text(
         "experiments_root: local-runs\n"

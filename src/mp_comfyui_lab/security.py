@@ -18,6 +18,19 @@ SECRET_KEYS = frozenset(
 )
 SENSITIVE_QUERY_KEY_PARTS = ("token", "signature", "expires", "credential")
 REDACTED = "[REDACTED]"
+WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
+WINDOWS_RESERVED_BASENAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "conin$",
+        "conout$",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }
+)
 
 
 class SafetyError(ValueError):
@@ -31,16 +44,18 @@ def safe_filename(name: str) -> str:
         raise SafetyError("filename must not be empty")
     if name in {".", ".."}:
         raise SafetyError("filename must not contain dot traversal")
-    if "/" in name or "\\" in name:
-        raise SafetyError("filename must not contain path separators")
+    if any(character in WINDOWS_FORBIDDEN_FILENAME_CHARACTERS for character in name):
+        raise SafetyError("filename contains a Windows-forbidden character")
     if any(unicodedata.category(character) == "Cc" for character in name):
         raise SafetyError("filename must not contain control characters")
+    if name.endswith((".", " ")):
+        raise SafetyError("filename must not end with a dot or space")
+    if name.partition(".")[0].casefold() in WINDOWS_RESERVED_BASENAMES:
+        raise SafetyError("filename uses a reserved Windows device basename")
     return name
 
 
-def _strip_sensitive_url_query(key: Any, value: Any) -> Any:
-    if not isinstance(key, str) or "url" not in key.casefold():
-        return value
+def _strip_sensitive_url_query(value: Any) -> Any:
     if not isinstance(value, str):
         return value
 
@@ -62,18 +77,26 @@ def _strip_sensitive_url_query(key: Any, value: Any) -> Any:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", parsed.fragment))
 
 
-def sanitize_for_persistence(value: Any) -> Any:
+def _sanitize_for_persistence(value: Any, url_context: bool) -> Any:
     if isinstance(value, dict):
         sanitized = {}
         for key, item in value.items():
             if isinstance(key, str) and key.casefold() in SECRET_KEYS:
                 sanitized[key] = REDACTED
                 continue
-            sanitized_item = sanitize_for_persistence(item)
-            sanitized[key] = _strip_sensitive_url_query(key, sanitized_item)
+            child_url_context = url_context or (
+                isinstance(key, str) and "url" in key.casefold()
+            )
+            sanitized[key] = _sanitize_for_persistence(item, child_url_context)
         return sanitized
     if isinstance(value, list):
-        return [sanitize_for_persistence(item) for item in value]
+        return [_sanitize_for_persistence(item, url_context) for item in value]
     if isinstance(value, tuple):
-        return tuple(sanitize_for_persistence(item) for item in value)
+        return tuple(_sanitize_for_persistence(item, url_context) for item in value)
+    if url_context:
+        return _strip_sensitive_url_query(value)
     return value
+
+
+def sanitize_for_persistence(value: Any) -> Any:
+    return _sanitize_for_persistence(value, url_context=False)

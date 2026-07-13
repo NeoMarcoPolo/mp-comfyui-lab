@@ -7,9 +7,6 @@ import yaml
 from mp_comfyui_lab.security import SafetyError
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-
-
 def _resolve_from(base: Path, path: Path) -> Path:
     if path.is_absolute():
         return path.resolve()
@@ -33,7 +30,8 @@ class LabConfig(BaseModel):
 
     @classmethod
     def load(cls, repository_root: str | Path | None = None) -> Self:
-        base = Path(repository_root or REPOSITORY_ROOT).resolve()
+        base = Path.cwd() if repository_root is None else Path(repository_root)
+        base = base.resolve()
         config_path = base / "config.local.yaml"
         if not config_path.is_file():
             return cls.model_validate(
