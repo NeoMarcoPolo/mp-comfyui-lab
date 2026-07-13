@@ -43,7 +43,7 @@ from mp_comfyui_lab.executors.base import (
     WorkflowRef,
 )
 from mp_comfyui_lab.experiments.models import MaterializedVariant, ResolvedFixtures
-from mp_comfyui_lab.security import sanitize_for_persistence
+from mp_comfyui_lab.security import sanitize_embedded_urls, sanitize_for_persistence
 
 
 BASE_URL = "https://www.runninghub.ai"
@@ -53,31 +53,28 @@ GRAPH_ENDPOINT = "/api/openapi/getJsonApiFormat"
 PUBLIC_REQUEST_TIMEOUT = (10, 60)
 PAID_EXECUTION_DISABLED = "runninghub paid execution is not enabled"
 PROVIDER_NUMERIC_STRING_MAX_LENGTH = 64
+MAX_GRAPH_DEPTH = 256
+MAX_GRAPH_NODES = 100_000
 
 NSFW_TERMS = frozenset({"nsfw", "nude", "nudity", "\u88f8\u4f53", "\u6210\u4eba", "\u8272\u60c5"})
 SFW_TERMS = frozenset({"sfw", "safe for work", "\u5b89\u5168"})
 NSFW_PHRASE_PATTERNS = (
     (
-        "not safe for work",
-        re.compile(r"\bnot[\W_]+safe[\W_]+for[\W_]+work\b", re.IGNORECASE),
-    ),
-    (
-        "unsafe for work",
-        re.compile(r"\bunsafe[\W_]+for[\W_]+work\b", re.IGNORECASE),
-    ),
-    (
-        "not sfw",
-        re.compile(r"\bnot[\W_]+sfw\b", re.IGNORECASE),
+        "negated SFW classification",
+        re.compile(
+            r"(?:"
+            r"\bunsafe[\W_]+for[\W_]+work\b|"
+            r"\bnon[\W_]+(?:sfw|safe[\W_]+for[\W_]+work)\b|"
+            r"\b(?:never|not)\b"
+            r"(?:[\W_]+(?!sfw\b|safe\b)[^\W_]+){0,3}"
+            r"[\W_]+(?:sfw\b|safe[\W_]+for[\W_]+work\b)"
+            r")",
+            re.IGNORECASE,
+        ),
     ),
 )
 LORA_INVENTORY_TOKEN = re.compile(
-    r"(?:^|[\\/._\-\s])loras?(?=$|[\\/._\-\s])",
-    re.IGNORECASE,
-)
-DIAGNOSTIC_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-DIAGNOSTIC_SECRET = re.compile(
-    r"\b(api[_-]?key|authorization|cookie|token|access[_-]?token|"
-    r"refresh[_-]?token|credential|signature|sig)\s*[:=]\s*[^\s,;]+",
+    r"(?<![A-Za-z0-9])loras?(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -433,7 +430,7 @@ def _published_at(value: str, endpoint: str, field: str) -> datetime:
 
 
 def _sanitize_url_string(value: str) -> str:
-    return sanitize_for_persistence({"url": value})["url"]
+    return sanitize_embedded_urls(value)
 
 
 def _safe_url(value: str, endpoint: str, field: str) -> str:
@@ -441,36 +438,51 @@ def _safe_url(value: str, endpoint: str, field: str) -> str:
     return _sanitize_url_string(url)
 
 
-def _sanitize_provider_diagnostic(value: str) -> str:
-    without_controls = "".join(
-        " " if unicodedata.category(character) == "Cc" else character
-        for character in value
-    )
-    normalized = re.sub(r"\s+", " ", without_controls).strip()
-    without_url_queries = DIAGNOSTIC_URL.sub(
-        lambda matched: _sanitize_url_string(matched.group(0)),
-        normalized,
-    )
-    return DIAGNOSTIC_SECRET.sub(
-        lambda matched: f"{matched.group(1)}=[REDACTED]",
-        without_url_queries,
-    )
-
-
 def _sanitize_provider_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        sanitized = {
-            key: _sanitize_provider_value(item)
-            for key, item in value.items()
-        }
-        return sanitize_for_persistence(sanitized)
-    if isinstance(value, list):
-        return [_sanitize_provider_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_sanitize_provider_value(item) for item in value)
-    if isinstance(value, str):
-        return sanitize_for_persistence({"url": value})["url"]
-    return value
+    return sanitize_for_persistence(value)
+
+
+def _validate_graph_complexity(graph: dict[str, Any]) -> None:
+    pending: list[tuple[Any, int]] = [(graph, 0)]
+    seen_containers: set[int] = set()
+    visited = 0
+
+    while pending:
+        value, depth = pending.pop()
+        visited += 1
+        if visited > MAX_GRAPH_NODES:
+            _schema_error(
+                GRAPH_ENDPOINT,
+                "graph",
+                "exceeds the maximum supported node count",
+            )
+        if depth > MAX_GRAPH_DEPTH:
+            _schema_error(
+                GRAPH_ENDPOINT,
+                "graph",
+                "exceeds the maximum supported depth",
+            )
+
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in seen_containers:
+                _schema_error(
+                    GRAPH_ENDPOINT,
+                    "graph",
+                    "contains repeated or recursive containers",
+                )
+            seen_containers.add(identity)
+            pending.extend((item, depth + 1) for item in value.values())
+        elif isinstance(value, (list, tuple)):
+            identity = id(value)
+            if identity in seen_containers:
+                _schema_error(
+                    GRAPH_ENDPOINT,
+                    "graph",
+                    "contains repeated or recursive containers",
+                )
+            seen_containers.add(identity)
+            pending.extend((item, depth + 1) for item in value)
 
 
 def _validated_canonical_url(
@@ -770,11 +782,8 @@ class RunningHubExecutor(Executor):
             raise ProviderResponseError(
                 endpoint=endpoint,
                 code=envelope.code,
-                message=_sanitize_provider_diagnostic(envelope.msg),
-                error_messages=tuple(
-                    _sanitize_provider_diagnostic(message)
-                    for message in (envelope.errorMessages or ())
-                ),
+                message=envelope.msg,
+                error_messages=tuple(envelope.errorMessages or ()),
             )
         return _validate_provider_schema(schema, payload, endpoint)
 
@@ -939,14 +948,15 @@ class RunningHubExecutor(Executor):
         if isinstance(raw_graph, str):
             try:
                 graph = json.loads(raw_graph)
-            except ValueError:
+            except (RecursionError, ValueError):
                 _schema_error(GRAPH_ENDPOINT, "graph", "expected a JSON object")
         if not isinstance(graph, dict):
             _schema_error(GRAPH_ENDPOINT, "graph", "expected a JSON object")
+        _validate_graph_complexity(graph)
 
         try:
             return FetchedWorkflow(ref=fetched_ref, detail=detail, graph=graph)
-        except ValidationError:
+        except (RecursionError, ValidationError):
             _schema_error(
                 GRAPH_ENDPOINT,
                 "graph",

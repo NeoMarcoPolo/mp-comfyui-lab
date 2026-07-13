@@ -38,6 +38,16 @@ def _load_fixture(name: str) -> dict[str, Any]:
     return json.loads((FIXTURE_ROOT / name).read_text(encoding="utf-8"))
 
 
+def _deep_graph(depth: int) -> dict[str, Any]:
+    root: dict[str, Any] = {}
+    current = root
+    for _ in range(depth):
+        child: dict[str, Any] = {}
+        current["child"] = child
+        current = child
+    return root
+
+
 class GraphFetcherSpy:
     def __init__(self, value: Any = None, error: Exception | None = None) -> None:
         self.value = value
@@ -292,6 +302,30 @@ def test_public_detail_maps_inventory_and_strips_executable_html() -> None:
             [],
             ContentClassification.NSFW,
         ),
+        (
+            "Portrait workflow",
+            "This workflow is non-SFW.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "This workflow is NEVER SFW.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "This workflow is not really SFW.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "This is NOT, really...SAFE-FOR-WORK.",
+            [],
+            ContentClassification.NSFW,
+        ),
     ],
 )
 def test_content_classification_uses_explicit_evidence_with_nsfw_precedence(
@@ -382,6 +416,30 @@ def test_fetch_workflow_rejects_oversized_json_integer_as_provider_schema() -> N
     assert "openapi/getJsonApiFormat" in message
     assert "graph" in message
     assert oversized_integer not in message
+
+
+@pytest.mark.parametrize(
+    "graph_value",
+    [
+        _deep_graph(1_200),
+        '{"child":' * 1_200 + "{}" + "}" * 1_200,
+    ],
+    ids=["decoded-dict", "json-string"],
+)
+def test_fetch_workflow_rejects_excessively_deep_graphs_as_provider_schema(
+    graph_value: Any,
+) -> None:
+    executor = _executor(GraphFetcherSpy(graph_value))
+    ref = WorkflowRef(executor="runninghub", workflow_id=WORKFLOW_ID)
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.detail_url, _load_fixture("detail_next_scene.json"))
+        with pytest.raises(ProviderSchemaError) as raised:
+            executor.fetch_workflow(ref)
+
+    message = str(raised.value)
+    assert "openapi/getJsonApiFormat" in message
+    assert "graph" in message
 
 
 @pytest.mark.parametrize("kind", ["post", "workflow"])
@@ -494,17 +552,18 @@ def test_inspect_capabilities_uses_only_deterministic_public_inventories() -> No
 
 def test_used_model_urls_are_sanitized_before_detail_and_capability_models() -> None:
     payload = _load_fixture("detail_next_scene.json")
-    aws_url = (
-        "https://models.example/loras/portrait.safetensors"
+    aws_descriptor = (
+        "primary=https://models.example/loras/portrait.safetensors"
         "?X-Amz-Credential=aws-secret&X-Amz-Signature=aws-signature"
+        "; format=fp16"
     )
-    azure_url = (
-        "https://models.example/checkpoints/base.safetensors"
-        "?sv=2025-01-05&sp=r&se=2030-01-01&sig=azure-secret"
+    azure_markdown = (
+        "[base](https://models.example/checkpoints/base.safetensors"
+        "?sv=2025-01-05&sp=r&se=2030-01-01&sig=azure-secret#model)."
     )
     payload["data"]["usedModels"] = [
-        aws_url,
-        azure_url,
+        aws_descriptor,
+        azure_markdown,
         "plain-model.safetensors",
     ]
     executor = _executor(GraphFetcherSpy(_load_fixture("qwen_graph.json")))
@@ -517,8 +576,8 @@ def test_used_model_urls_are_sanitized_before_detail_and_capability_models() -> 
 
     report = executor.inspect_capabilities(fetched)
     assert fetched.detail.used_models == (
-        "https://models.example/loras/portrait.safetensors",
-        "https://models.example/checkpoints/base.safetensors",
+        "primary=https://models.example/loras/portrait.safetensors; format=fp16",
+        "[base](https://models.example/checkpoints/base.safetensors#model).",
         "plain-model.safetensors",
     )
     serialized = fetched.detail.model_dump_json() + report.model_dump_json()
@@ -538,6 +597,10 @@ def test_lora_inventory_detection_uses_token_and_path_boundaries() -> None:
         "FloraXL.safetensors",
         "next-scene_lora_v1-3000.safetensors",
         "https://models.example/loras/portrait.safetensors",
+        "model:lora:v1.safetensors",
+        "kind=lora",
+        "[LoRA]",
+        "mix,lora",
         "next-scene_lora_v1-3000.safetensors",
     ]
     executor = _executor(GraphFetcherSpy(_load_fixture("qwen_graph.json")))
@@ -549,9 +612,17 @@ def test_lora_inventory_detection_uses_token_and_path_boundaries() -> None:
         )
 
     report = executor.inspect_capabilities(fetched)
-    assert report.lora_names == (
-        "https://models.example/loras/portrait.safetensors",
-        "next-scene_lora_v1-3000.safetensors",
+    assert report.lora_names == tuple(
+        sorted(
+            {
+                "https://models.example/loras/portrait.safetensors",
+                "next-scene_lora_v1-3000.safetensors",
+                "model:lora:v1.safetensors",
+                "kind=lora",
+                "[LoRA]",
+                "mix,lora",
+            }
+        )
     )
     assert report.model_names == ("FloraXL.safetensors",)
 
@@ -576,10 +647,6 @@ def test_non_json_public_body_names_search_endpoint() -> None:
 
 def test_nonzero_search_code_raises_sanitized_provider_response_error() -> None:
     executor = _executor()
-    azure_diagnostic = (
-        "https://provider.example/error"
-        "?sv=2025-01-05&sp=r&sig=azure-secret"
-    )
 
     with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
         _add_json(
@@ -587,10 +654,11 @@ def test_nonzero_search_code_raises_sanitized_provider_response_error() -> None:
             executor.search_url,
             {
                 "code": 500,
-                "msg": "failed apiKey=super-secret",
+                "msg": "Authorization: Bearer bearer-secret",
                 "errorMessages": [
-                    azure_diagnostic,
-                    "cookie=session-secret",
+                    '{"apiKey":"json-secret","message":"provider unavailable",'
+                    '"url":"https://provider.example/error?sig=query-secret"}',
+                    "cookie='session-secret'; token=token-secret; retry later",
                 ],
                 "data": {},
             },
@@ -601,22 +669,30 @@ def test_nonzero_search_code_raises_sanitized_provider_response_error() -> None:
     error = raised.value
     assert error.endpoint == "/api/search/workflow"
     assert error.code == 500
-    assert error.message == "failed apiKey=[REDACTED]"
+    assert error.message == "Authorization: [REDACTED]"
     assert error.error_messages == (
-        "https://provider.example/error",
-        "cookie=[REDACTED]",
+        '{"apiKey":"[REDACTED]","message":"provider unavailable",'
+        '"url":"https://provider.example/error"}',
+        "cookie='[REDACTED]'; token=[REDACTED]; retry later",
     )
     assert not isinstance(error, ProviderSchemaError)
-    serialized = json.dumps(
+    serialized = repr(
         {
+            "error": error,
+            "args": error.args,
             "message": error.message,
             "error_messages": error.error_messages,
             "display": str(error),
         }
     )
-    assert "super-secret" not in serialized
-    assert "azure-secret" not in serialized
-    assert "session-secret" not in serialized
+    for secret in (
+        "bearer-secret",
+        "json-secret",
+        "query-secret",
+        "session-secret",
+        "token-secret",
+    ):
+        assert secret not in serialized
 
 
 def test_nonzero_detail_code_names_endpoint_and_code_field() -> None:

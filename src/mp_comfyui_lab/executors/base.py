@@ -20,6 +20,7 @@ from mp_comfyui_lab.json_types import (
     FrozenJsonObject,
     SanitizedJsonObject,
 )
+from mp_comfyui_lab.security import sanitize_untrusted_diagnostic
 
 
 NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -157,6 +158,22 @@ class ProviderResponseError(ExecutorError):
     code: int
     message: str
     error_messages: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "message",
+            sanitize_untrusted_diagnostic(self.message),
+        )
+        object.__setattr__(
+            self,
+            "error_messages",
+            tuple(
+                sanitize_untrusted_diagnostic(message)
+                for message in self.error_messages
+            ),
+        )
+        object.__setattr__(self, "args", ())
 
     def __str__(self) -> str:
         return (

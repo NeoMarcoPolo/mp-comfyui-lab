@@ -109,11 +109,34 @@ def test_provider_response_error_is_structured_immutable_and_semantic() -> None:
     unsafe_error = ProviderResponseError(
         endpoint="/api/provider/action",
         code=500,
-        message="apiKey=raw-secret",
-        error_messages=("cookie=session-secret",),
+        message="Authorization: Bearer bearer-secret",
+        error_messages=(
+            '{"apiKey":"json-secret","message":"provider failed"}',
+            "cookie=session-secret token=token-secret",
+        ),
     )
-    assert "raw-secret" not in str(unsafe_error)
-    assert "session-secret" not in str(unsafe_error)
+    assert unsafe_error.message == "Authorization: [REDACTED]"
+    assert unsafe_error.error_messages == (
+        '{"apiKey":"[REDACTED]","message":"provider failed"}',
+        "cookie=[REDACTED] token=[REDACTED]",
+    )
+    assert unsafe_error.args == ()
+    serialized_error = repr(
+        (
+            unsafe_error,
+            unsafe_error.args,
+            unsafe_error.message,
+            unsafe_error.error_messages,
+            str(unsafe_error),
+        )
+    )
+    for secret in (
+        "bearer-secret",
+        "json-secret",
+        "session-secret",
+        "token-secret",
+    ):
+        assert secret not in serialized_error
 
 
 def _json_bearing_record(kind, value):

@@ -10,7 +10,9 @@ from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.security import (
     SafetyError,
     safe_filename,
+    sanitize_embedded_urls,
     sanitize_for_persistence,
+    sanitize_untrusted_diagnostic,
 )
 
 
@@ -193,6 +195,88 @@ def test_sanitize_for_persistence_leaves_non_url_strings_unchanged():
     }
 
     assert sanitize_for_persistence(value) == value
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "https://cdn.example/model.safetensors?X-Amz-Signature=aws-secret",
+            "https://cdn.example/model.safetensors",
+        ),
+        (
+            "model=https://cdn.example/model.safetensors?sig=secret; format=fp16",
+            "model=https://cdn.example/model.safetensors; format=fp16",
+        ),
+        (
+            "[model](https://cdn.example/model.safetensors?sv=1&sig=secret#card).",
+            "[model](https://cdn.example/model.safetensors#card).",
+        ),
+        (
+            "first=https://one.example/a?token=secret, "
+            "second=https://two.example/b?sv=1&sig=secret!",
+            "first=https://one.example/a, second=https://two.example/b!",
+        ),
+        (
+            "plain-model_lora_v1.safetensors",
+            "plain-model_lora_v1.safetensors",
+        ),
+    ],
+)
+def test_sanitize_embedded_urls_preserves_surrounding_text_and_punctuation(
+    value,
+    expected,
+):
+    assert sanitize_embedded_urls(value) == expected
+
+
+def test_sanitize_for_persistence_strips_urls_embedded_in_plain_text():
+    value = {
+        "descriptor": (
+            "model=https://cdn.example/model.safetensors?sig=secret; format=fp16"
+        )
+    }
+
+    assert sanitize_for_persistence(value) == {
+        "descriptor": "model=https://cdn.example/model.safetensors; format=fp16"
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "Authorization: Bearer bearer-secret",
+            "Authorization: [REDACTED]",
+        ),
+        (
+            "Authorization: [REDACTED]",
+            "Authorization: [REDACTED]",
+        ),
+        (
+            "upstream rejected Bearer abc.def-123",
+            "upstream rejected Bearer [REDACTED]",
+        ),
+        (
+            "cookie='session-secret'; token=token-secret; provider unavailable",
+            "cookie='[REDACTED]'; token=[REDACTED]; provider unavailable",
+        ),
+        (
+            "asset=https://cdn.example/failure?sv=1&sig=query-secret, retry later",
+            "asset=https://cdn.example/failure, retry later",
+        ),
+        (
+            '{"message":"provider unavailable","apiKey":"json-secret",'
+            '"nested":{"token":"nested-secret"},'
+            '"url":"https://cdn.example/failure?sig=query-secret"}',
+            '{"apiKey":"[REDACTED]","message":"provider unavailable",'
+            '"nested":{"token":"[REDACTED]"},'
+            '"url":"https://cdn.example/failure"}',
+        ),
+    ],
+)
+def test_sanitize_untrusted_diagnostic_redacts_credentials(value, expected):
+    assert sanitize_untrusted_diagnostic(value) == expected
 
 
 @pytest.mark.parametrize(
