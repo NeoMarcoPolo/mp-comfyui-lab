@@ -1,4 +1,5 @@
 import importlib
+from datetime import UTC, datetime
 from pathlib import Path
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from mp_comfyui_lab.executors.base import (
     ProviderTaskState,
     SearchPage,
     SearchRequest,
+    SubmissionReceipt,
     ValidationIssue,
     ValidationReport,
     WorkflowRef,
@@ -204,7 +206,7 @@ def test_resolved_fixtures_by_role_preserves_item_order(tmp_path):
             ResolvedFixture,
             {
                 "uri": "memory://input",
-                "path": Path("input.png"),
+                "path": Path.cwd() / "input.png",
                 "sha256": "a" * 64,
                 "binding_index": -1,
             },
@@ -219,6 +221,48 @@ def test_resolved_fixtures_by_role_preserves_item_order(tmp_path):
 def test_models_reject_invalid_counts(model, values):
     with pytest.raises(ValidationError):
         model(**values)
+
+
+@pytest.mark.parametrize(
+    ("model", "values"),
+    [
+        (Engagement, {"likes": "1"}),
+        (SearchRequest, {"query": "qwen", "page": "1"}),
+        (ProviderOutput, {"url": "memory://output", "provider_order": "1"}),
+        (
+            RunRecord,
+            {
+                "run_id": "run-1",
+                "experiment_id": "experiment-1",
+                "variant_id": "variant-1",
+                "state": RunState.PLANNED,
+                "expected_output_count": "1",
+            },
+        ),
+        (
+            RunRecord,
+            {
+                "run_id": "run-1",
+                "experiment_id": "experiment-1",
+                "variant_id": "variant-1",
+                "state": RunState.PLANNED,
+                "expected_output_count": 1,
+                "actual_output_count": "0",
+            },
+        ),
+    ],
+)
+def test_python_constructors_reject_numeric_string_coercion(model, values):
+    with pytest.raises(ValidationError):
+        model(**values)
+
+
+def test_materialized_variant_rejects_string_output_count(sample_variant):
+    values = sample_variant.model_dump()
+    values["expected_output_count"] = "1"
+
+    with pytest.raises(ValidationError):
+        MaterializedVariant(**values)
 
 
 @pytest.mark.parametrize("bad_hash", ["a" * 63, "A" * 64, "g" * 64])
@@ -251,7 +295,12 @@ def test_materialized_variant_rejects_empty_identity_or_graph(
 
 @pytest.mark.parametrize(
     "state",
-    [RunState.SUBMITTED, RunState.RUNNING, RunState.SUCCESS],
+    [
+        RunState.SUBMITTED,
+        RunState.RUNNING,
+        RunState.SUCCESS,
+        RunState.CANCELLED,
+    ],
 )
 def test_active_run_states_require_provider_task_id(state):
     with pytest.raises(ValidationError, match="provider_task_id"):
@@ -262,6 +311,36 @@ def test_active_run_states_require_provider_task_id(state):
             state=state,
             expected_output_count=1,
         )
+
+
+def test_planned_run_rejects_provider_task_id():
+    with pytest.raises(ValidationError, match="provider_task_id"):
+        RunRecord(
+            run_id="run-1",
+            experiment_id="experiment-1",
+            variant_id="variant-1",
+            state=RunState.PLANNED,
+            provider_task_id="fake-task-1",
+            expected_output_count=1,
+        )
+
+
+@pytest.mark.parametrize("state", [RunState.FAILED, RunState.INCOMPLETE])
+@pytest.mark.parametrize("provider_task_id", [None, "fake-task-1"])
+def test_failed_and_incomplete_runs_allow_optional_task_id(
+    state,
+    provider_task_id,
+):
+    record = RunRecord(
+        run_id="run-1",
+        experiment_id="experiment-1",
+        variant_id="variant-1",
+        state=state,
+        provider_task_id=provider_task_id,
+        expected_output_count=1,
+    )
+
+    assert record.provider_task_id == provider_task_id
 
 
 def test_run_record_allows_more_actual_outputs_than_expected():
@@ -276,6 +355,55 @@ def test_run_record_allows_more_actual_outputs_than_expected():
     )
 
     assert record.actual_output_count == 2
+
+
+def test_submission_receipt_requires_provider_task_state_enum():
+    receipt = SubmissionReceipt(
+        provider_task_id="fake-task-1",
+        provider_state=ProviderTaskState.SUBMITTED,
+    )
+
+    assert receipt.provider_state is ProviderTaskState.SUBMITTED
+    with pytest.raises(ValidationError):
+        SubmissionReceipt(
+            provider_task_id="fake-task-1",
+            provider_state="NOT_A_PROVIDER_STATE",
+        )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"path": Path("relative.png")},
+        {"binding_role": "   "},
+        {"uri": "   "},
+        {"sha256": "A" * 64},
+    ],
+)
+def test_resolved_fixture_rejects_invalid_identity_fields(tmp_path, updates):
+    values = {
+        "uri": "memory://input",
+        "path": tmp_path / "missing.png",
+        "sha256": "a" * 64,
+    }
+
+    with pytest.raises(ValidationError):
+        ResolvedFixture(**{**values, **updates})
+
+
+def test_resolved_fixture_strips_role_without_requiring_existence(tmp_path):
+    missing_path = tmp_path / "missing.png"
+
+    fixture = ResolvedFixture(
+        uri="memory://input",
+        path=missing_path,
+        sha256="a" * 64,
+        binding_role="  reference  ",
+    )
+
+    assert fixture.path == missing_path
+    assert fixture.binding_role == "reference"
+    assert not fixture.path.exists()
 
 
 def test_cancel_result_rejects_cancelled_when_unsupported():
@@ -302,6 +430,55 @@ def test_contract_models_are_frozen_and_reject_unknown_fields():
         _candidate(unexpected=True)
     with pytest.raises(ValidationError):
         ResolvedFixtures(items=(), unexpected=True)
+    with pytest.raises(ValidationError):
+        ProviderOutput(url="memory://output", unexpected=True)
+    with pytest.raises(ValidationError):
+        RunRecord(
+            run_id="run-1",
+            experiment_id="experiment-1",
+            variant_id="variant-1",
+            state=RunState.PLANNED,
+            expected_output_count=1,
+            unexpected=True,
+        )
+
+
+def test_strict_records_round_trip_durable_json_values(tmp_path):
+    timestamp = datetime(2026, 7, 13, 12, 30, tzinfo=UTC)
+    records = (
+        _candidate(
+            published_at=timestamp,
+            tags=("qwen", "angles"),
+            covers=(CoverAsset(url="memory://cover.png", width=640, height=480),),
+        ),
+        ResolvedFixtures(
+            items=(
+                ResolvedFixture(
+                    uri="memory://input",
+                    path=tmp_path / "missing.png",
+                    sha256="a" * 64,
+                    binding_role="reference",
+                ),
+            )
+        ),
+        RunRecord(
+            run_id="run-1",
+            experiment_id="experiment-1",
+            variant_id="variant-1",
+            state=RunState.SUBMITTED,
+            provider_task_id="fake-task-1",
+            expected_output_count=1,
+            created_at=timestamp,
+        ),
+        SubmissionReceipt(
+            provider_task_id="fake-task-1",
+            provider_state=ProviderTaskState.QUEUED,
+        ),
+    )
+
+    for record in records:
+        restored = type(record).model_validate_json(record.model_dump_json())
+        assert restored == record
 
 
 def test_mutable_defaults_do_not_leak_between_records():

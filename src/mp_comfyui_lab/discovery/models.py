@@ -24,7 +24,7 @@ SanitizedMetadata = Annotated[
 
 
 class _FrozenModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
 
 class ContentClassification(StrEnum):

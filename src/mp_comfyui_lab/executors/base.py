@@ -27,7 +27,7 @@ SanitizedMetadata = Annotated[
 
 
 class _FrozenModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
 
 class SearchRequest(_FrozenModel):
@@ -79,12 +79,6 @@ class ValidationReport(_FrozenModel):
         return not self.errors
 
 
-class SubmissionReceipt(_FrozenModel):
-    provider_task_id: NonBlankStr
-    provider_state: str | None = None
-    provider_metadata: SanitizedMetadata = Field(default_factory=dict)
-
-
 class ProviderTaskState(StrEnum):
     SUBMITTED = "SUBMITTED"
     QUEUED = "QUEUED"
@@ -93,6 +87,12 @@ class ProviderTaskState(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     UNKNOWN = "UNKNOWN"
+
+
+class SubmissionReceipt(_FrozenModel):
+    provider_task_id: NonBlankStr
+    provider_state: ProviderTaskState | None = None
+    provider_metadata: SanitizedMetadata = Field(default_factory=dict)
 
 
 class PollResult(_FrozenModel):

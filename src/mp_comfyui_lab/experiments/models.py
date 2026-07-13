@@ -21,7 +21,7 @@ Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 class _FrozenModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
 
 class RunState(StrEnum):
@@ -39,8 +39,15 @@ class ResolvedFixture(_FrozenModel):
     path: Path
     sha256: Sha256
     media_type: str | None = None
-    binding_role: str | None = None
+    binding_role: NonBlankStr | None = None
     binding_index: int = Field(default=0, ge=0)
+
+    @field_validator("path")
+    @classmethod
+    def require_absolute_path(cls, path: Path) -> Path:
+        if not path.is_absolute():
+            raise ValueError("path must be absolute")
+        return path
 
 
 class ResolvedFixtures(_FrozenModel):
@@ -87,11 +94,15 @@ class RunRecord(_FrozenModel):
     updated_at: datetime | None = None
 
     @model_validator(mode="after")
-    def require_task_id_for_provider_states(self) -> RunRecord:
-        if self.state in {
+    def validate_provider_task_id(self) -> RunRecord:
+        task_id_required_states = {
             RunState.SUBMITTED,
             RunState.RUNNING,
             RunState.SUCCESS,
-        } and self.provider_task_id is None:
+            RunState.CANCELLED,
+        }
+        if self.state is RunState.PLANNED and self.provider_task_id is not None:
+            raise ValueError("provider_task_id is not allowed for PLANNED")
+        if self.state in task_id_required_states and self.provider_task_id is None:
             raise ValueError(f"provider_task_id is required for {self.state.value}")
         return self
