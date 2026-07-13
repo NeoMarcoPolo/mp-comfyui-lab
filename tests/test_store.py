@@ -353,6 +353,10 @@ def test_sanitize_for_persistence_redacts_canonical_secret_key_aliases():
             "Authorization: [REDACTED]",
         ),
         (
+            "Authorization: Bearer [REDACTED]",
+            "Authorization: [REDACTED]",
+        ),
+        (
             "upstream rejected Bearer abc.def-123",
             "upstream rejected Bearer [REDACTED]",
         ),
@@ -393,6 +397,24 @@ def test_sanitize_for_persistence_redacts_canonical_secret_key_aliases():
 )
 def test_sanitize_untrusted_diagnostic_redacts_credentials(value, expected):
     assert sanitize_untrusted_diagnostic(value) == expected
+
+
+def test_sanitize_untrusted_diagnostic_preserves_redacted_aws_authorization():
+    raw = (
+        "AWS4-HMAC-SHA256 Credential=aws-credential-secret, "
+        "SignedHeaders=host;x-amz-date, Signature=aws-signature-secret"
+    )
+    expected = (
+        "AWS4-HMAC-SHA256 Credential=[REDACTED], "
+        "SignedHeaders=host;x-amz-date, Signature=[REDACTED]"
+    )
+
+    sanitized = sanitize_untrusted_diagnostic(raw)
+
+    assert sanitized == expected
+    assert sanitize_untrusted_diagnostic(sanitized) == expected
+    assert "aws-credential-secret" not in sanitized
+    assert "aws-signature-secret" not in sanitized
 
 
 def test_sanitize_untrusted_diagnostic_redacts_exact_json_aliases_stably():

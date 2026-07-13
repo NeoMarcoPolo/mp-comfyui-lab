@@ -142,6 +142,39 @@ def test_provider_response_error_is_structured_immutable_and_semantic() -> None:
         assert secret not in serialized_error
 
 
+def test_provider_response_error_preserves_redacted_aws_diagnostics() -> None:
+    raw = (
+        "AWS4-HMAC-SHA256 Credential=aws-credential-secret, "
+        "SignedHeaders=host, Signature=aws-signature-secret"
+    )
+    expected = (
+        "AWS4-HMAC-SHA256 Credential=[REDACTED], "
+        "SignedHeaders=host, Signature=[REDACTED]"
+    )
+
+    error = ProviderResponseError(
+        endpoint="/api/provider/action",
+        code=403,
+        message=raw,
+        error_messages=(raw,),
+    )
+    repeated = ProviderResponseError(
+        endpoint=error.endpoint,
+        code=error.code,
+        message=error.message,
+        error_messages=error.error_messages,
+    )
+
+    assert error.message == expected
+    assert error.error_messages == (expected,)
+    assert repeated.message == expected
+    assert repeated.error_messages == (expected,)
+    assert error.args == repeated.args == ()
+    serialized = repr((error, error.args, str(error), repr(error), repeated))
+    assert "aws-credential-secret" not in serialized
+    assert "aws-signature-secret" not in serialized
+
+
 def _json_bearing_record(kind, value):
     if kind == "fetched_graph":
         return FetchedWorkflow(

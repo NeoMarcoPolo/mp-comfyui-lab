@@ -622,8 +622,12 @@ def _classification_segments(value: str) -> tuple[str, ...]:
 
     while index < len(value):
         character = value[index]
-        if character in "!?;|\r\n":
+        if character in ",;!|\r\n":
             finish_segment()
+            index += 1
+            continue
+        if character == "?":
+            current.append(" ")
             index += 1
             continue
         if character == ".":
@@ -701,10 +705,8 @@ def _not_context(
     return "negative"
 
 
-def _sfw_evidence(value: str) -> tuple[tuple[str, ...], bool, bool]:
-    negative_reasons: list[str] = []
+def _has_affirmative_sfw_evidence(value: str) -> bool:
     affirmative = False
-    suppressed = False
 
     for segment in _classification_segments(value):
         tokens = _alphanumeric_tokens(segment)
@@ -723,7 +725,8 @@ def _sfw_evidence(value: str) -> tuple[tuple[str, ...], bool, bool]:
                 continue
 
             if tokens[index : index + 3] == ("unsafe", "for", "work"):
-                negative_reasons.append("unsafe for work")
+                index += 3
+                continue
 
             target_length = _sfw_target_length(tokens, index)
             if target_length == 0:
@@ -765,17 +768,12 @@ def _sfw_evidence(value: str) -> tuple[tuple[str, ...], bool, bool]:
                 None,
             )
             if after_negative is not None or before_negative is not None:
-                negative_reasons.append(
-                    f"{after_negative or before_negative} around SFW"
-                )
                 index += target_length
                 continue
             if "hardly" in before or "never" in before:
-                negative_reasons.append("explicit negation before SFW")
                 index += target_length
                 continue
             if before[-1:] == ("non",):
-                negative_reasons.append("non before SFW")
                 index += target_length
                 continue
 
@@ -785,21 +783,17 @@ def _sfw_evidence(value: str) -> tuple[tuple[str, ...], bool, bool]:
                 continue
 
             not_context = _not_context(tokens, before_start, index)
-            if not_context == "negative":
-                negative_reasons.append("not before SFW")
-            elif not_context == "ambiguous":
-                suppressed = True
-            elif not_context == "affirmative":
+            if not_context == "affirmative":
                 affirmative = True
-            elif any(token in before for token in ("no", "non", "unsafe")):
-                suppressed = True
-            elif "not" in after:
-                suppressed = True
-            else:
+            elif not (
+                not_context in {"negative", "ambiguous"}
+                or any(token in before for token in ("no", "non", "unsafe"))
+                or "not" in after
+            ):
                 affirmative = True
             index += target_length
 
-    return tuple(dict.fromkeys(negative_reasons)), affirmative, suppressed
+    return affirmative
 
 
 def _classification(
@@ -828,22 +822,17 @@ def _classification(
                     reasons.append(f"{label} term '{term}' in {source}")
         return tuple(reasons)
 
-    sfw_evidence = tuple(
-        (source, *_sfw_evidence(text))
-        for source, text in evidence
-    )
-    phrase_reasons = tuple(
-        f"NSFW phrase '{reason}' in {source}"
-        for source, negative_reasons, _, _ in sfw_evidence
-        for reason in negative_reasons
-    )
-    nsfw_reasons = phrase_reasons + matches(NSFW_TERMS, "NSFW")
+    nsfw_reasons = matches(NSFW_TERMS, "NSFW")
     if nsfw_reasons:
         return ContentClassification.NSFW, nsfw_reasons
 
+    sfw_evidence = tuple(
+        (source, _has_affirmative_sfw_evidence(text))
+        for source, text in evidence
+    )
     sfw_reasons = tuple(
         f"SFW evidence in {source}"
-        for source, _, affirmative, _ in sfw_evidence
+        for source, affirmative in sfw_evidence
         if affirmative
     )
     if sfw_reasons:

@@ -54,7 +54,7 @@ DIAGNOSTIC_ASSIGNMENT_START = re.compile(
 )
 DIAGNOSTIC_AUTHORIZATION_SCHEME = re.compile(
     r"(?<![A-Za-z0-9_-])"
-    r"(?P<scheme>Bearer|Basic|Token|Digest|ApiKey|AWS4-HMAC-SHA256)"
+    r"(?P<scheme>Bearer|Basic|Token|Digest|ApiKey)"
     r"(?P<separator>\s+)",
     re.IGNORECASE,
 )
@@ -217,6 +217,9 @@ def _diagnostic_value_replacement(
     delimiters = ",;|}]"
     end = start
     while end < len(value):
+        if value.startswith(REDACTED, end):
+            end += len(REDACTED)
+            continue
         character = value[end]
         if character in delimiters or (not authorization and character.isspace()):
             break
