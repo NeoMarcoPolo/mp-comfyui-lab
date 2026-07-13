@@ -18,6 +18,10 @@ from mp_comfyui_lab.discovery.models import (
     WorkflowCandidate,
     WorkflowDetail,
 )
+from mp_comfyui_lab.discovery.urls import (
+    UnsupportedSourceError,
+    parse_runninghub_url,
+)
 from mp_comfyui_lab.executors.base import (
     CancelResult,
     CapabilityReport,
@@ -119,6 +123,20 @@ def _nonblank_string(value: Any, endpoint: str, field: str) -> str:
     return value.strip()
 
 
+def _string(value: Any, endpoint: str, field: str) -> str:
+    if not isinstance(value, str):
+        _schema_error(endpoint, field, "expected a string")
+    return value
+
+
+def _error_messages(value: Any, endpoint: str, field: str) -> None:
+    if value is None:
+        return
+    messages = _list(value, endpoint, field)
+    for index, message in enumerate(messages):
+        _string(message, endpoint, f"{field}[{index}]")
+
+
 def _workflow_id(value: Any, endpoint: str, field: str) -> str:
     if isinstance(value, bool):
         _schema_error(endpoint, field, "expected a numeric workflow ID")
@@ -186,6 +204,37 @@ def _safe_url(value: Any, endpoint: str, field: str) -> str:
     url = _nonblank_string(value, endpoint, field)
     sanitized = sanitize_for_persistence({"url": url})
     return sanitized["url"]
+
+
+def _sanitize_provider_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized = {
+            key: _sanitize_provider_value(item)
+            for key, item in value.items()
+        }
+        return sanitize_for_persistence(sanitized)
+    if isinstance(value, list):
+        return [_sanitize_provider_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_provider_value(item) for item in value)
+    if isinstance(value, str):
+        return sanitize_for_persistence({"url": value})["url"]
+    return value
+
+
+def _validated_canonical_url(
+    canonical_url: str | None,
+    workflow_id: str,
+) -> str:
+    if canonical_url is None:
+        return f"https://www.runninghub.ai/post/{workflow_id}"
+
+    parsed = parse_runninghub_url(canonical_url)
+    if parsed.workflow_id != workflow_id:
+        raise UnsupportedSourceError(
+            "RunningHub canonical URL must identify the same public post or workflow"
+        )
+    return canonical_url
 
 
 def _cover(value: Any, endpoint: str, field: str) -> CoverAsset:
@@ -431,7 +480,7 @@ def _candidate(
             classification_reasons=reasons,
             provider_metadata={
                 "endpoint": endpoint,
-                "record": value,
+                "record": _sanitize_provider_value(value),
             },
         )
     except (ValidationError, ValueError):
@@ -483,13 +532,25 @@ class RunningHubExecutor(Executor):
             endpoint,
             "code",
         )
+        _string(
+            _required(envelope, "msg", endpoint, "msg"),
+            endpoint,
+            "msg",
+        )
+        _error_messages(
+            _required(
+                envelope,
+                "errorMessages",
+                endpoint,
+                "errorMessages",
+            ),
+            endpoint,
+            "errorMessages",
+        )
+        data = _required(envelope, "data", endpoint, "data")
         if code != 0:
             _schema_error(endpoint, "code", f"expected 0, received {code}")
-        return _mapping(
-            _required(envelope, "data", endpoint, "data"),
-            endpoint,
-            "data",
-        )
+        return _mapping(data, endpoint, "data")
 
     def search(self, request: SearchRequest) -> SearchPage:
         data = self._post_public(
@@ -610,6 +671,7 @@ class RunningHubExecutor(Executor):
             DETAIL_ENDPOINT,
             "request.workflowId",
         )
+        candidate_url = _validated_canonical_url(canonical_url, requested_id)
         data = self._post_public(
             url=self.detail_url,
             endpoint=DETAIL_ENDPOINT,
@@ -678,9 +740,6 @@ class RunningHubExecutor(Executor):
             _required(data, "webappId", DETAIL_ENDPOINT, "data.webappId"),
             DETAIL_ENDPOINT,
             "data.webappId",
-        )
-        candidate_url = canonical_url or (
-            f"https://www.runninghub.ai/post/{requested_id}"
         )
         candidate = _candidate(
             data,
@@ -761,10 +820,10 @@ class RunningHubExecutor(Executor):
             required_nodes=required_nodes,
             model_names=model_names,
             lora_names=lora_names,
-            output_node_ids=output_hints,
+            output_node_ids=(),
             provider_metadata={
                 "inventory_source": "public detail",
-                "output_node_values_are_hints": True,
+                "output_node_class_hints": output_hints,
             },
         )
 

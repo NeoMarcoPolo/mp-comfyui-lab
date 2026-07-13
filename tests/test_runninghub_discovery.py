@@ -315,6 +315,32 @@ def test_fetched_workflow_identity_validator_passes_for_public_url_kinds(
     assert fetched.ref.canonical_url == fetched.detail.candidate.canonical_url
 
 
+@pytest.mark.parametrize(
+    "canonical_url",
+    [
+        f"https://attacker.example/post/{WORKFLOW_ID}",
+        f"http://www.runninghub.ai/post/{WORKFLOW_ID}",
+        "https://www.runninghub.ai/workflow/9999999999999999999",
+    ],
+)
+def test_fetch_workflow_rejects_untrusted_or_mismatched_canonical_url(
+    canonical_url: str,
+) -> None:
+    graph_fetcher = GraphFetcherSpy(_load_fixture("qwen_graph.json"))
+    executor = _executor(graph_fetcher)
+    ref = WorkflowRef(
+        executor="runninghub",
+        workflow_id=WORKFLOW_ID,
+        canonical_url=canonical_url,
+    )
+
+    with responses.RequestsMock(assert_all_requests_are_fired=False):
+        with pytest.raises(UnsupportedSourceError, match="public post or workflow"):
+            executor.fetch_workflow(ref)
+
+    assert graph_fetcher.calls == []
+
+
 def test_inspect_capabilities_uses_only_deterministic_public_inventories() -> None:
     executor = _executor(GraphFetcherSpy(_load_fixture("qwen_graph.json")))
     ref = WorkflowRef(executor="runninghub", workflow_id=WORKFLOW_ID)
@@ -331,13 +357,13 @@ def test_inspect_capabilities_uses_only_deterministic_public_inventories() -> No
     )
     assert report.lora_names == ("next-scene_lora_v1-3000.safetensors",)
     assert "next-scene_lora_v1-3000.safetensors" not in report.model_names
-    assert report.output_node_ids == (
-        "SaveImage",
-        "ShellAgentPluginOutputText",
-    )
+    assert report.output_node_ids == ()
     assert thaw_json(report.provider_metadata) == {
         "inventory_source": "public detail",
-        "output_node_values_are_hints": True,
+        "output_node_class_hints": [
+            "SaveImage",
+            "ShellAgentPluginOutputText",
+        ],
     }
 
 
@@ -363,7 +389,16 @@ def test_nonzero_search_code_names_endpoint_and_code_field() -> None:
     executor = _executor()
 
     with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
-        _add_json(mocked, executor.search_url, {"code": 500, "data": {}})
+        _add_json(
+            mocked,
+            executor.search_url,
+            {
+                "code": 500,
+                "msg": "failed",
+                "errorMessages": ["provider failure"],
+                "data": {},
+            },
+        )
         with pytest.raises(
             ProviderSchemaError,
             match=r"api/search/workflow.*code",
@@ -375,12 +410,52 @@ def test_nonzero_detail_code_names_endpoint_and_code_field() -> None:
     executor = _executor()
 
     with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
-        _add_json(mocked, executor.detail_url, {"code": "403", "data": None})
+        _add_json(
+            mocked,
+            executor.detail_url,
+            {
+                "code": "403",
+                "msg": "forbidden",
+                "errorMessages": None,
+                "data": None,
+            },
+        )
         with pytest.raises(
             ProviderSchemaError,
             match=r"portal/workflow/detail.*code",
         ):
             executor.detail(WORKFLOW_ID)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field"),
+    [
+        (lambda body: body.pop("msg"), "msg"),
+        (lambda body: body.__setitem__("msg", 1), "msg"),
+        (lambda body: body.pop("errorMessages"), "errorMessages"),
+        (
+            lambda body: body.__setitem__("errorMessages", "provider failure"),
+            "errorMessages",
+        ),
+        (lambda body: body.__setitem__("errorMessages", [1]), "errorMessages[0]"),
+    ],
+)
+def test_search_envelope_drift_names_endpoint_and_failing_field(
+    mutation: Any,
+    field: str,
+) -> None:
+    payload = _load_fixture("search_qwen_reputation.json")
+    mutation(payload)
+    executor = _executor()
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.search_url, payload)
+        with pytest.raises(ProviderSchemaError) as raised:
+            executor.search(SearchRequest(query="qwen", size=3))
+
+    message = str(raised.value)
+    assert "api/search/workflow" in message
+    assert field in message
 
 
 @pytest.mark.parametrize(
@@ -498,11 +573,18 @@ def test_network_errors_become_provider_errors_without_credentials() -> None:
 def test_provider_metadata_is_frozen_and_redacts_credentials() -> None:
     payload = _load_fixture("search_qwen_reputation.json")
     first_record = payload["data"]["records"][0]
+    signed_url = (
+        "https://assets.example/image.png"
+        "?X-Amz-Credential=url-secret&X-Amz-Signature=signed-secret"
+    )
     first_record["apiKey"] = "super-secret"
     first_record["cookie"] = "session-secret"
     first_record["assetUrl"] = (
         "https://assets.example/image.png?X-Amz-Credential=super-secret"
     )
+    first_record["owner"]["avatar"] = signed_url
+    first_record["covers"][0]["thumbnailUri"] = signed_url
+    first_record["gallery"] = [signed_url, {"href": signed_url}]
     executor = _executor()
 
     with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
@@ -514,9 +596,21 @@ def test_provider_metadata_is_frozen_and_redacts_credentials() -> None:
     assert isinstance(candidate.provider_metadata, FrozenDict)
     assert "super-secret" not in serialized
     assert "session-secret" not in serialized
+    assert "url-secret" not in serialized
+    assert "signed-secret" not in serialized
     assert metadata["record"]["apiKey"] == "[REDACTED]"
     assert metadata["record"]["cookie"] == "[REDACTED]"
     assert metadata["record"]["assetUrl"] == "https://assets.example/image.png"
+    assert metadata["record"]["owner"]["avatar"] == (
+        "https://assets.example/image.png"
+    )
+    assert metadata["record"]["covers"][0]["thumbnailUri"] == (
+        "https://assets.example/image.png"
+    )
+    assert metadata["record"]["gallery"] == [
+        "https://assets.example/image.png",
+        {"href": "https://assets.example/image.png"},
+    ]
 
 
 def test_graph_fetch_errors_do_not_expose_provider_credentials() -> None:
