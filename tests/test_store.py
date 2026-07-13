@@ -218,6 +218,40 @@ def test_sanitize_for_persistence_leaves_non_url_strings_unchanged():
             "first=https://one.example/a, second=https://two.example/b!",
         ),
         (
+            "first=https://one.example/a?sig=one,"
+            "second=https://two.example/b?sig=two!",
+            "first=https://one.example/a,second=https://two.example/b!",
+        ),
+        (
+            "one=https://one.example/a?sig=one|"
+            "[two](https://two.example/b?sig=two#preview).",
+            "one=https://one.example/a|"
+            "[two](https://two.example/b#preview).",
+        ),
+        (
+            "https://one.example/a?sig=one "
+            "https://two.example/b?sig=two",
+            "https://one.example/a https://two.example/b",
+        ),
+        (
+            "clean=https://one.example/a, "
+            "signed=https://two.example/b?sig=two; "
+            "fragment=https://three.example/c#card.",
+            "clean=https://one.example/a, signed=https://two.example/b; "
+            "fragment=https://three.example/c#card.",
+        ),
+        (
+            "first=https://one.example/a?sig=one;"
+            "second=https://two.example/b?sig=two",
+            "first=https://one.example/a;second=https://two.example/b",
+        ),
+        (
+            "query-free [model](https://cdn.example/model.safetensors#card), "
+            "plain text",
+            "query-free [model](https://cdn.example/model.safetensors#card), "
+            "plain text",
+        ),
+        (
             "plain-model_lora_v1.safetensors",
             "plain-model_lora_v1.safetensors",
         ),
@@ -228,6 +262,18 @@ def test_sanitize_embedded_urls_preserves_surrounding_text_and_punctuation(
     expected,
 ):
     assert sanitize_embedded_urls(value) == expected
+
+
+def test_sanitize_embedded_urls_is_idempotent_for_adjacent_descriptors():
+    value = (
+        "first=https://one.example/a?sig=one,"
+        "second=https://two.example/b?sig=two|"
+        "[third](https://three.example/c?sig=three#card)."
+    )
+
+    sanitized = sanitize_embedded_urls(value)
+
+    assert sanitize_embedded_urls(sanitized) == sanitized
 
 
 def test_sanitize_for_persistence_strips_urls_embedded_in_plain_text():
@@ -242,12 +288,47 @@ def test_sanitize_for_persistence_strips_urls_embedded_in_plain_text():
     }
 
 
+def test_sanitize_for_persistence_redacts_only_exact_secret_key_aliases():
+    value = {
+        "SiGnAtUrE": "signature-secret",
+        "credential": "credential-secret",
+        "sig": "sig-secret",
+        "api-key": "dash-secret",
+        "api_key": "underscore-secret",
+        "apikey": "compact-secret",
+        "X-API-KEY": "header-dash-secret",
+        "x_api_key": "header-underscore-secret",
+        "client_secret": "client-secret",
+        "signatureVersion": "v4",
+        "client_secret_hint": "public-name",
+    }
+
+    sanitized = sanitize_for_persistence(value)
+
+    for key in value.keys() - {"signatureVersion", "client_secret_hint"}:
+        assert sanitized[key] == "[REDACTED]"
+    assert sanitized["signatureVersion"] == "v4"
+    assert sanitized["client_secret_hint"] == "public-name"
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
         (
             "Authorization: Bearer bearer-secret",
             "Authorization: [REDACTED]",
+        ),
+        (
+            "Authorization: Basic base64-secret; retry later",
+            "Authorization: [REDACTED]; retry later",
+        ),
+        (
+            "authorization=Token token-secret, retry later",
+            "authorization=[REDACTED], retry later",
+        ),
+        (
+            "AUTHORIZATION: Custom custom-secret material | retry later",
+            "AUTHORIZATION: [REDACTED] | retry later",
         ),
         (
             "Authorization: [REDACTED]",
@@ -260,6 +341,12 @@ def test_sanitize_for_persistence_strips_urls_embedded_in_plain_text():
         (
             "cookie='session-secret'; token=token-secret; provider unavailable",
             "cookie='[REDACTED]'; token=[REDACTED]; provider unavailable",
+        ),
+        (
+            "SiGnAtUrE='signature-secret'; CREDENTIAL=credential-secret; "
+            'X-API-KEY="header-secret"; client_secret=client-secret; retry later',
+            "SiGnAtUrE='[REDACTED]'; CREDENTIAL=[REDACTED]; "
+            'X-API-KEY="[REDACTED]"; client_secret=[REDACTED]; retry later',
         ),
         (
             "asset=https://cdn.example/failure?sv=1&sig=query-secret, retry later",
@@ -277,6 +364,41 @@ def test_sanitize_for_persistence_strips_urls_embedded_in_plain_text():
 )
 def test_sanitize_untrusted_diagnostic_redacts_credentials(value, expected):
     assert sanitize_untrusted_diagnostic(value) == expected
+
+
+def test_sanitize_untrusted_diagnostic_redacts_exact_json_aliases_stably():
+    value = {
+        "SiGnAtUrE": "signature-secret",
+        "credential": "credential-secret",
+        "sig": "sig-secret",
+        "api-key": "dash-secret",
+        "api_key": "underscore-secret",
+        "apikey": "compact-secret",
+        "X-API-KEY": "header-dash-secret",
+        "x_api_key": "header-underscore-secret",
+        "client_secret": "client-secret",
+        "signatureVersion": "v4",
+        "message": "provider unavailable",
+    }
+    raw = json.dumps(value)
+
+    sanitized = sanitize_untrusted_diagnostic(raw)
+
+    expected = {
+        key: (
+            original
+            if key in {"signatureVersion", "message"}
+            else "[REDACTED]"
+        )
+        for key, original in value.items()
+    }
+    assert json.loads(sanitized) == expected
+    assert sanitized == json.dumps(
+        expected,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 @pytest.mark.parametrize(

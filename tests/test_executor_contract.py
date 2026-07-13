@@ -109,16 +109,16 @@ def test_provider_response_error_is_structured_immutable_and_semantic() -> None:
     unsafe_error = ProviderResponseError(
         endpoint="/api/provider/action",
         code=500,
-        message="Authorization: Bearer bearer-secret",
+        message="aUtHoRiZaTiOn: Basic basic-secret; provider failed",
         error_messages=(
-            '{"apiKey":"json-secret","message":"provider failed"}',
-            "cookie=session-secret token=token-secret",
+            '{"X-API-KEY":"json-secret","message":"provider failed"}',
+            "SiGnAtUrE=signature-secret client_secret=client-secret",
         ),
     )
-    assert unsafe_error.message == "Authorization: [REDACTED]"
+    assert unsafe_error.message == "aUtHoRiZaTiOn: [REDACTED]; provider failed"
     assert unsafe_error.error_messages == (
-        '{"apiKey":"[REDACTED]","message":"provider failed"}',
-        "cookie=[REDACTED] token=[REDACTED]",
+        '{"X-API-KEY":"[REDACTED]","message":"provider failed"}',
+        "SiGnAtUrE=[REDACTED] client_secret=[REDACTED]",
     )
     assert unsafe_error.args == ()
     serialized_error = repr(
@@ -131,10 +131,10 @@ def test_provider_response_error_is_structured_immutable_and_semantic() -> None:
         )
     )
     for secret in (
-        "bearer-secret",
+        "basic-secret",
         "json-secret",
-        "session-secret",
-        "token-secret",
+        "signature-secret",
+        "client-secret",
     ):
         assert secret not in serialized_error
 

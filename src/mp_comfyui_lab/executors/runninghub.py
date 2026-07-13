@@ -58,20 +58,10 @@ MAX_GRAPH_NODES = 100_000
 
 NSFW_TERMS = frozenset({"nsfw", "nude", "nudity", "\u88f8\u4f53", "\u6210\u4eba", "\u8272\u60c5"})
 SFW_TERMS = frozenset({"sfw", "safe for work", "\u5b89\u5168"})
-NSFW_PHRASE_PATTERNS = (
-    (
-        "negated SFW classification",
-        re.compile(
-            r"(?:"
-            r"\bunsafe[\W_]+for[\W_]+work\b|"
-            r"\bnon[\W_]+(?:sfw|safe[\W_]+for[\W_]+work)\b|"
-            r"\b(?:never|not)\b"
-            r"(?:[\W_]+(?!sfw\b|safe\b)[^\W_]+){0,3}"
-            r"[\W_]+(?:sfw\b|safe[\W_]+for[\W_]+work\b)"
-            r")",
-            re.IGNORECASE,
-        ),
-    ),
+SFW_NEGATION_TOKENS = ("not", "never", "non", "unsafe")
+SFW_NEGATION_PAIRS = (
+    ("no", "longer"),
+    ("far", "from"),
 )
 LORA_INVENTORY_TOKEN = re.compile(
     r"(?<![A-Za-z0-9])loras?(?![A-Za-z0-9])",
@@ -612,6 +602,107 @@ def _engagement(
         _normalized_model_error(endpoint, field, error)
 
 
+def _classification_segments(value: str) -> tuple[str, ...]:
+    segments: list[str] = []
+    current: list[str] = []
+    index = 0
+
+    def finish_segment() -> None:
+        segment = "".join(current)
+        if segment:
+            segments.append(segment)
+        current.clear()
+
+    while index < len(value):
+        character = value[index]
+        if character in "!?;|\r\n":
+            finish_segment()
+            index += 1
+            continue
+        if character == ".":
+            run_end = index + 1
+            while run_end < len(value) and value[run_end] == ".":
+                run_end += 1
+            if run_end - index == 1 and (
+                run_end == len(value) or value[run_end].isspace()
+            ):
+                finish_segment()
+            else:
+                current.append(" ")
+            index = run_end
+            continue
+        current.append(character)
+        index += 1
+
+    finish_segment()
+    return tuple(segments)
+
+
+def _alphanumeric_tokens(value: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    current: list[str] = []
+    for character in value.casefold():
+        if character.isalnum():
+            current.append(character)
+        elif current:
+            tokens.append("".join(current))
+            current.clear()
+    if current:
+        tokens.append("".join(current))
+    return tuple(tokens)
+
+
+def _contains_token_pair(
+    tokens: tuple[str, ...],
+    pair: tuple[str, str],
+) -> bool:
+    return any(
+        tokens[index : index + 2] == pair
+        for index in range(len(tokens) - 1)
+    )
+
+
+def _negative_sfw_reasons(value: str) -> tuple[str, ...]:
+    reasons: list[str] = []
+    for segment in _classification_segments(value):
+        tokens = _alphanumeric_tokens(segment)
+        if any(
+            tokens[index : index + 3] == ("unsafe", "for", "work")
+            for index in range(len(tokens) - 2)
+        ):
+            reasons.append("unsafe for work")
+
+        target_indexes = tuple(
+            index
+            for index, token in enumerate(tokens)
+            if token == "sfw"
+            or tokens[index : index + 3] == ("safe", "for", "work")
+        )
+        for target_index in target_indexes:
+            preceding = tokens[:target_index]
+            matched_reason = next(
+                (
+                    f"{token} before SFW"
+                    for token in SFW_NEGATION_TOKENS
+                    if token in preceding
+                ),
+                None,
+            )
+            if matched_reason is None:
+                matched_reason = next(
+                    (
+                        f"{' '.join(pair)} before SFW"
+                        for pair in SFW_NEGATION_PAIRS
+                        if _contains_token_pair(preceding, pair)
+                    ),
+                    None,
+                )
+            if matched_reason is not None:
+                reasons.append(matched_reason)
+
+    return tuple(dict.fromkeys(reasons))
+
+
 def _classification(
     *,
     name: str,
@@ -639,10 +730,9 @@ def _classification(
         return tuple(reasons)
 
     phrase_reasons = tuple(
-        f"NSFW phrase '{phrase}' in {source}"
+        f"NSFW phrase '{reason}' in {source}"
         for source, text in evidence
-        for phrase, pattern in NSFW_PHRASE_PATTERNS
-        if pattern.search(text) is not None
+        for reason in _negative_sfw_reasons(text)
     )
     nsfw_reasons = phrase_reasons + matches(NSFW_TERMS, "NSFW")
     if nsfw_reasons:

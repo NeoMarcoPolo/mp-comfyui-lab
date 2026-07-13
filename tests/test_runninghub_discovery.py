@@ -326,6 +326,36 @@ def test_public_detail_maps_inventory_and_strips_executable_html() -> None:
             [],
             ContentClassification.NSFW,
         ),
+        (
+            "Portrait workflow",
+            "This workflow is no longer SFW.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "This workflow is far from SFW.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "This workflow is not remotely close to being safe for work.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "portrait_not_sfw_v1",
+            "A public workflow",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "No concern was reported. This workflow is SFW.",
+            [],
+            ContentClassification.SFW,
+        ),
     ],
 )
 def test_content_classification_uses_explicit_evidence_with_nsfw_precedence(
