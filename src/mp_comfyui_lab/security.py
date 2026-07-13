@@ -1,6 +1,6 @@
 from typing import Any
 import unicodedata
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 SECRET_KEYS = frozenset(
@@ -16,7 +16,6 @@ SECRET_KEYS = frozenset(
         "signed_url",
     }
 )
-SENSITIVE_QUERY_KEY_PARTS = ("token", "signature", "expires", "credential")
 REDACTED = "[REDACTED]"
 WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
 WINDOWS_RESERVED_BASENAMES = frozenset(
@@ -58,22 +57,19 @@ def safe_filename(name: str) -> str:
     return name
 
 
-def _strip_sensitive_url_query(value: Any) -> Any:
+def _strip_url_query(value: Any) -> Any:
     if not isinstance(value, str):
         return value
 
-    parsed = urlsplit(value)
-    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.query:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
         return value
-
-    query_keys = (
-        query_key.casefold()
-        for query_key, _ in parse_qsl(parsed.query, keep_blank_values=True)
-    )
-    if not any(
-        sensitive_part in query_key
-        for query_key in query_keys
-        for sensitive_part in SENSITIVE_QUERY_KEY_PARTS
+    before_fragment = value.partition("#")[0]
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.netloc
+        or "?" not in before_fragment
     ):
         return value
 
@@ -97,7 +93,7 @@ def _sanitize_for_persistence(value: Any, url_context: bool) -> Any:
     if isinstance(value, tuple):
         return tuple(_sanitize_for_persistence(item, url_context) for item in value)
     if url_context:
-        return _strip_sensitive_url_query(value)
+        return _strip_url_query(value)
     return value
 
 

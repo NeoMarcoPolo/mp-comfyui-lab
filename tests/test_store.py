@@ -107,11 +107,10 @@ def test_sanitize_for_persistence_redacts_nested_secrets_without_mutation():
     assert value["nested"][1][0]["Cookie"] == "session-secret"
 
 
-def test_sanitize_for_persistence_strips_sensitive_url_query():
+def test_sanitize_for_persistence_strips_any_http_url_query():
     value = {
         "outputUrl": (
-            "https://cdn.example.test/frame.png?"
-            "X-Amz-Credential=credential&X-Amz-Signature=secret#preview"
+            "https://cdn.example.test/frame.png?view=public&size=large#preview"
         )
     }
 
@@ -120,7 +119,23 @@ def test_sanitize_for_persistence_strips_sensitive_url_query():
     }
 
 
-def test_sanitize_for_persistence_strips_blank_sensitive_url_query():
+def test_sanitize_for_persistence_strips_azure_sas_query():
+    value = {
+        "blobUrl": (
+            "https://account.blob.core.windows.net/container/frame.png"
+            "?sv=2025-01-05&sp=r&se=2030-01-01T00:00:00Z&sig=secret"
+            "#preview"
+        )
+    }
+
+    assert sanitize_for_persistence(value) == {
+        "blobUrl": (
+            "https://account.blob.core.windows.net/container/frame.png#preview"
+        )
+    }
+
+
+def test_sanitize_for_persistence_strips_url_query_with_blank_value():
     value = {"outputUrl": "https://cdn.example.test/frame.png?TOKEN="}
 
     assert sanitize_for_persistence(value) == {
@@ -153,7 +168,7 @@ def test_sanitize_for_persistence_propagates_url_context_without_mutation():
             {
                 "items": (
                     "https://cdn/x",
-                    ["https://cdn/stable?view=public"],
+                    ["https://cdn/stable"],
                 )
             }
         ]
@@ -162,8 +177,20 @@ def test_sanitize_for_persistence_propagates_url_context_without_mutation():
     assert value["previewUrls"][0]["items"][1][0].endswith("?view=public")
 
 
-def test_sanitize_for_persistence_preserves_stable_url():
-    value = {"source_url": "https://example.test/workflows/42?view=public"}
+def test_sanitize_for_persistence_preserves_url_without_query():
+    value = {"source_url": "https://example.test/workflows/42#source"}
+
+    assert sanitize_for_persistence(value) == value
+
+
+def test_sanitize_for_persistence_leaves_non_url_strings_unchanged():
+    value = {
+        "source_url": "not a URL?sig=plain-text",
+        "outputUrls": [
+            "plain text?view=public",
+            "ftp://files.example.test/frame.png?token=not-http",
+        ],
+    }
 
     assert sanitize_for_persistence(value) == value
 

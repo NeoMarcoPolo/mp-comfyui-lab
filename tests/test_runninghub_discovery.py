@@ -119,6 +119,14 @@ def test_parse_runninghub_url_accepts_exact_public_urls(
         f"https://www.runninghub.ai/workflow/{WORKFLOW_ID}/extra",
         f"https://www.runninghub.ai/post/{WORKFLOW_ID}#comments",
         f"https://www.runninghub.ai/not-a-locale/post/{WORKFLOW_ID}",
+        f" https://www.runninghub.ai/post/{WORKFLOW_ID}",
+        f"https://www.runninghub.ai/post/{WORKFLOW_ID} ",
+        f"\nhttps://www.runninghub.ai/post/{WORKFLOW_ID}",
+        f"https://www.runninghub.ai/post/{WORKFLOW_ID}\r\n",
+        f"https://www.runninghub.ai/\tpost/{WORKFLOW_ID}",
+        f"\x00https://www.runninghub.ai/post/{WORKFLOW_ID}",
+        f"https://www.runninghub.ai/post/\x1f{WORKFLOW_ID}",
+        f"https://www.runninghub.ai/post/{WORKFLOW_ID}\x7f",
     ],
 )
 def test_parse_runninghub_url_rejects_nonpublic_or_malformed_urls(url: str) -> None:
@@ -313,6 +321,42 @@ def test_fetched_workflow_identity_validator_passes_for_public_url_kinds(
 
     assert fetched.detail.candidate.canonical_url == canonical_url
     assert fetched.ref.canonical_url == fetched.detail.candidate.canonical_url
+
+
+@pytest.mark.parametrize(
+    ("source_url", "canonical_url"),
+    [
+        (
+            f"https://www.runninghub.ai/zh-cn/post/{WORKFLOW_ID}/"
+            "?sv=2025-01-05&sp=r&sig=secret",
+            f"https://www.runninghub.ai/post/{WORKFLOW_ID}",
+        ),
+        (
+            f"https://runninghub.ai/en-us/workflow/{WORKFLOW_ID}"
+            "?from=search&credential=secret",
+            f"https://www.runninghub.ai/workflow/{WORKFLOW_ID}",
+        ),
+    ],
+)
+def test_fetch_workflow_canonicalizes_accepted_locale_and_query_source_urls(
+    source_url: str,
+    canonical_url: str,
+) -> None:
+    executor = _executor(GraphFetcherSpy(_load_fixture("qwen_graph.json")))
+    ref = WorkflowRef(
+        executor="runninghub",
+        workflow_id=WORKFLOW_ID,
+        canonical_url=source_url,
+    )
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.detail_url, _load_fixture("detail_next_scene.json"))
+        fetched = executor.fetch_workflow(ref)
+
+    assert fetched.ref.canonical_url == canonical_url
+    assert fetched.detail.candidate.canonical_url == canonical_url
+    assert "?" not in fetched.ref.canonical_url
+    assert "secret" not in fetched.ref.canonical_url
 
 
 @pytest.mark.parametrize(

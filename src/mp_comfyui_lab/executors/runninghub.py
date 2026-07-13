@@ -234,7 +234,7 @@ def _validated_canonical_url(
         raise UnsupportedSourceError(
             "RunningHub canonical URL must identify the same public post or workflow"
         )
-    return canonical_url
+    return parsed.canonical_url
 
 
 def _cover(value: Any, endpoint: str, field: str) -> CoverAsset:
@@ -766,9 +766,21 @@ class RunningHubExecutor(Executor):
         if ref.executor != self.name:
             raise ExecutorError("RunningHub workflow ref executor must be runninghub")
 
+        canonical_url = None
+        fetched_ref = ref
+        if ref.canonical_url is not None:
+            canonical_url = _validated_canonical_url(
+                ref.canonical_url,
+                ref.workflow_id,
+            )
+            fetched_ref = WorkflowRef(
+                executor=ref.executor,
+                workflow_id=ref.workflow_id,
+                canonical_url=canonical_url,
+            )
         detail = self.detail(
             ref.workflow_id,
-            canonical_url=ref.canonical_url,
+            canonical_url=canonical_url,
         )
         try:
             raw_graph = self.graph_fetcher(None, ref.workflow_id)
@@ -787,7 +799,7 @@ class RunningHubExecutor(Executor):
             _schema_error(GRAPH_ENDPOINT, "graph", "expected a JSON object")
 
         try:
-            return FetchedWorkflow(ref=ref, detail=detail, graph=graph)
+            return FetchedWorkflow(ref=fetched_ref, detail=detail, graph=graph)
         except ValidationError:
             _schema_error(
                 GRAPH_ENDPOINT,
