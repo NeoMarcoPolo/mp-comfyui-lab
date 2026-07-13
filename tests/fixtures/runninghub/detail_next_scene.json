@@ -1,0 +1,90 @@
+{
+  "code": 0,
+  "msg": "success",
+  "errorMessages": null,
+  "data": {
+    "id": "1980860923768426497",
+    "name": "\u3010\u5fae\u7535\u5f71\u3011\u955c\u5934\u98ce\u683c\u4e00\u81f4\u6027\u7535\u5f713\u5206\u955c Qwen+Next+Scene+\u5f71\u89c6\u5267\u60c5\u5206\u955c\u5236\u4f5c",
+    "desc": "<p>\u5355\u56fe\u63d0\u4f9b\u53c2\u8003\uff0c\u751f\u6210\u4e0d\u540c\u666f\u522b\uff0c\u4e0d\u540c\u89d2\u5ea6\u7684\u955c\u5934\uff0c\u4fdd\u6301\u4e00\u81f4\u6027\u3002</p>",
+    "publishTime": "2025-10-22T08:28:12.000+00:00",
+    "owner": {
+      "id": "1951923163988975617",
+      "avatar": "https://rh-hk-images.xiaoyaoyou.com/default_head_icon.png",
+      "name": "\u4e50\u5bfc"
+    },
+    "statisticsInfo": {
+      "likeCount": "512",
+      "downloadCount": "0",
+      "useCount": "25757",
+      "pv": "0",
+      "collectCount": "2194"
+    },
+    "nodeCount": 19,
+    "tags": [
+      {
+        "id": "1871131188657909761",
+        "name": "\u56fe\u751f\u56fe",
+        "nameEn": "IOS",
+        "labels": null
+      }
+    ],
+    "covers": [
+      {
+        "id": "1980884512689311746",
+        "url": "https://rh-hk-images.xiaoyaoyou.com/b116e821da5802b3ed2c99ffc797dbc9/2025-10-22/db64873dc1b52b9ba7a703241da2808d.jpg",
+        "thumbnailUri": "https://rh-hk-images.xiaoyaoyou.com/b116e821da5802b3ed2c99ffc797dbc9/2025-10-22/db64873dc1b52b9ba7a703241da2808d.jpg?imageMogr2/format/jpeg/ignore-error/1",
+        "imageWidth": "936",
+        "imageHeight": "1664"
+      },
+      {
+        "id": "1980884512689311747",
+        "url": "https://rh-hk-images.xiaoyaoyou.com/b116e821da5802b3ed2c99ffc797dbc9/2025-10-22/b9ddf5fad7387497075579a22e2170bb.png",
+        "thumbnailUri": "https://rh-hk-images.xiaoyaoyou.com/b116e821da5802b3ed2c99ffc797dbc9/2025-10-22/b9ddf5fad7387497075579a22e2170bb.png?imageMogr2/format/jpg/ignore-error/1",
+        "imageWidth": "675",
+        "imageHeight": "967"
+      }
+    ],
+    "preview": {
+      "id": "1980883179374596097",
+      "url": "https://rh-hk-images.xiaoyaoyou.com/b116e821da5802b3ed2c99ffc797dbc9/2025-10-22/93b2dadd20b3b16d5c5a8ffc285abc67.png",
+      "thumbnailUri": "https://rh-hk-images.xiaoyaoyou.com/b116e821da5802b3ed2c99ffc797dbc9/2025-10-22/93b2dadd20b3b16d5c5a8ffc285abc67.png?imageMogr2/format/jpg/ignore-error/1",
+      "imageWidth": "4050",
+      "imageHeight": "1638"
+    },
+    "primitiveNodes": [
+      "CLIPLoader",
+      "KSampler",
+      "LoadImage",
+      "LoraLoaderModelOnly",
+      "SaveImage",
+      "UNETLoader",
+      "VAEDecode",
+      "VAEEncode",
+      "VAELoader"
+    ],
+    "customNodes": [
+      "Anything Everywhere3",
+      "Int",
+      "JjkText",
+      "LayerUtility: ImageScaleByAspectRatio V2",
+      "ProcessString",
+      "RH_LLMAPI_NODE",
+      "ShellAgentPluginOutputText",
+      "TextEncodeQwenImageEditPlus",
+      "easy promptLine",
+      "easy showAnything"
+    ],
+    "usedModels": [
+      "Qwen-Image-Edit-2509_fp8_e4m3fn.safetensors",
+      "Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors",
+      "Qwen-Image-Lightning-4steps-V1.0.safetensors",
+      "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image-Lightning-4steps-V1.0.safetensors",
+      "next-scene_lora_v1-3000.safetensors",
+      "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "qwen_image_vae.safetensors"
+    ],
+    "webappId": "1980884267800678402",
+    "labels": "RECOMMEND"
+  }
+}
