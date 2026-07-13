@@ -1,0 +1,480 @@
+import copy
+import json
+from pathlib import Path
+
+from pydantic import ValidationError
+import pytest
+
+from mp_comfyui_lab.graph.models import (
+    AmbiguousRoleError,
+    MissingRoleError,
+    NormalizedGraph,
+    RoleBinding,
+    RoleBindings,
+    SemanticRole,
+)
+from mp_comfyui_lab.graph.normalize import (
+    GraphTopologyError,
+    GraphValidationError,
+    normalize_graph,
+)
+
+
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runninghub" / "qwen_graph.json"
+
+
+@pytest.fixture
+def qwen_graph() -> dict:
+    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+
+def _node(class_type: str, **inputs: object) -> dict:
+    return {"class_type": class_type, "inputs": inputs}
+
+
+def _lora_graph() -> dict:
+    return {
+        "loader": _node("UNETLoader", unet_name="base.safetensors"),
+        "upstream": _node(
+            "LoraLoaderModelOnly",
+            model=["loader", 0],
+            lora_name="first.safetensors",
+            strength_model=0.8,
+        ),
+        "downstream": _node(
+            "LoraLoaderModelOnly",
+            model=["upstream", 0],
+            lora_name="second.safetensors",
+            strength_model=1.0,
+        ),
+        "sampler": _node(
+            "KSampler",
+            model=["downstream", 0],
+            seed=7,
+            sampler_name="euler",
+            scheduler="normal",
+        ),
+        "output": _node("SaveImage", images=["sampler", 0], filename_prefix="x"),
+    }
+
+
+def test_qwen_graph_detects_golden_roles_in_topology_order(qwen_graph) -> None:
+    source = copy.deepcopy(qwen_graph)
+
+    graph = normalize_graph(qwen_graph)
+
+    assert graph.require_one(SemanticRole.CHECKPOINT).value == (
+        "Qwen-Image-Edit-2509_fp8_e4m3fn.safetensors"
+    )
+    assert graph.require_one(SemanticRole.MODEL).field_name == "unet_name"
+    assert graph.require_one(SemanticRole.UNET).field_name == "unet_name"
+    assert [binding.value for binding in graph.bindings(SemanticRole.LORA)] == [
+        "next-scene_lora_v1-3000.safetensors",
+        "Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors",
+    ]
+    assert graph.require_one(SemanticRole.REFERENCE_IMAGE).field_name == "image"
+    assert graph.require_one(SemanticRole.REFERENCE_IMAGE).value == "reference.png"
+    assert graph.require_one(SemanticRole.SEED).node_id == "56"
+    assert graph.require_one(SemanticRole.SEED).field_name == "seed"
+    assert graph.bindings(SemanticRole.OUTPUT)
+    assert qwen_graph == source
+
+
+def test_qwen_topology_supports_approved_newer_golden_identities(qwen_graph) -> None:
+    qwen_graph["106"]["inputs"]["unet_name"] = (
+        "Qwen-Rapid-AIO-SFW-v5.safetensors"
+    )
+    qwen_graph["133"]["inputs"]["lora_name"] = (
+        "next-scene_lora-v2-3000.safetensors"
+    )
+    qwen_graph["109"]["inputs"]["lora_name"] = (
+        "qe2511_consis_alpha_patched.safetensors"
+    )
+
+    graph = normalize_graph(qwen_graph)
+
+    assert graph.require_one(SemanticRole.CHECKPOINT).value == (
+        "Qwen-Rapid-AIO-SFW-v5.safetensors"
+    )
+    assert [binding.value for binding in graph.bindings(SemanticRole.LORA)] == [
+        "next-scene_lora-v2-3000.safetensors",
+        "qe2511_consis_alpha_patched.safetensors",
+    ]
+
+
+def test_qwen_graph_detects_prompt_encoder_conditioning_vae_and_fanout(
+    qwen_graph,
+) -> None:
+    graph = normalize_graph(qwen_graph)
+
+    assert any(
+        binding.node_id == "95" and binding.field_name == "prompt"
+        for binding in graph.bindings(SemanticRole.PROMPT_SOURCE)
+    )
+    assert any(
+        binding.node_id == "76"
+        for binding in graph.bindings(SemanticRole.PROMPT_FANOUT)
+    )
+    assert any(
+        binding.value == "qwen_2.5_vl_7b_fp8_scaled.safetensors"
+        for binding in graph.bindings(SemanticRole.ENCODER)
+    )
+    assert {binding.node_id for binding in graph.bindings(SemanticRole.CONDITIONING)} >= {
+        "61",
+        "68",
+    }
+    assert graph.require_one(SemanticRole.VAE).value == "qwen_image_vae.safetensors"
+
+
+def test_detects_checkpoint_loader_dimensions_noise_seed_and_output_types() -> None:
+    source = {
+        "checkpoint": _node(
+            "CheckpointLoaderSimple", ckpt_name="photo-model.safetensors"
+        ),
+        "latent": _node("EmptyLatentImage", width=1024, height=768, batch_size=2),
+        "sample": _node(
+            "SamplerCustomAdvanced",
+            model=["checkpoint", 0],
+            latent_image=["latent", 0],
+            noise_seed=42,
+            sampler_name="dpmpp_2m",
+            scheduler_name="karras",
+        ),
+        "preview": _node("PreviewImage", images=["sample", 0]),
+        "animated": _node("SaveAnimatedWEBP", images=["sample", 0], fps=12),
+        "video": _node("VHS_VideoCombine", images=["sample", 0], frame_rate=24),
+    }
+
+    graph = normalize_graph(source)
+
+    assert graph.require_one(SemanticRole.CHECKPOINT).value == "photo-model.safetensors"
+    assert graph.require_one(SemanticRole.SEED).field_name == "noise_seed"
+    assert graph.require_one(SemanticRole.SAMPLER).value == "dpmpp_2m"
+    assert graph.require_one(SemanticRole.SCHEDULER).value == "karras"
+    assert [(item.field_name, item.value) for item in graph.bindings(SemanticRole.DIMENSIONS)] == [
+        ("height", 768),
+        ("width", 1024),
+    ]
+    assert [item.value for item in graph.bindings(SemanticRole.OUTPUT)] == [
+        "SaveAnimatedWEBP",
+        "PreviewImage",
+        "VHS_VideoCombine",
+    ]
+
+
+def test_model_name_input_on_custom_model_provider_is_detected() -> None:
+    graph = normalize_graph(
+        {
+            "model": _node(
+                "CustomModelProvider",
+                model_name="provider-model.safetensors",
+            )
+        }
+    )
+
+    assert graph.require_one(SemanticRole.CHECKPOINT).value == (
+        "provider-model.safetensors"
+    )
+    assert graph.require_one(SemanticRole.MODEL).value == (
+        "provider-model.safetensors"
+    )
+
+
+def test_normalized_nodes_and_bindings_are_deeply_immutable_and_sanitized() -> None:
+    source = {
+        "1": _node(
+            "PrimitiveNode",
+            values=[1, {"nested": [2, 3]}],
+            api_key="secret",
+            url="https://example.test/model?token=secret",
+        )
+    }
+
+    graph = normalize_graph(source)
+    node = graph.nodes[0]
+    binding = RoleBinding(
+        node_id="1",
+        field_name="value",
+        value={"nested": [1, 2]},
+        confidence=0.9,
+        reason="synthetic binding",
+    )
+
+    assert node.inputs["values"] == (1, {"nested": (2, 3)})
+    assert node.inputs["api_key"] == "[REDACTED]"
+    assert node.inputs["url"] == "https://example.test/model"
+    assert binding.value["nested"] == (1, 2)
+    with pytest.raises(TypeError):
+        node.inputs["values"] = ()
+    with pytest.raises(TypeError):
+        node.inputs["values"][1]["nested"] = ()
+    with pytest.raises(TypeError):
+        binding.value["nested"] = ()
+    with pytest.raises(ValidationError):
+        graph.nodes = ()
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"confidence": -0.01}, "greater than or equal"),
+        ({"confidence": 1.01}, "less than or equal"),
+        ({"reason": "   "}, "at least 1 character"),
+        ({"field_name": ""}, "at least 1 character"),
+        ({"extra_field": "nope"}, "Extra inputs"),
+    ],
+)
+def test_role_binding_is_strict(updates, message) -> None:
+    values = {
+        "node_id": "1",
+        "field_name": "seed",
+        "value": 1,
+        "confidence": 0.9,
+        "reason": "seed input",
+    }
+    values.update(updates)
+
+    with pytest.raises(ValidationError, match=message):
+        RoleBinding(**values)
+
+
+def test_normalized_graph_node_order_is_deterministic_not_source_order() -> None:
+    graph = {
+        "10": _node("PrimitiveNode", value=10),
+        "alpha": _node("PrimitiveNode", value="a"),
+        "2": _node("PrimitiveNode", value=2),
+        "01": _node("PrimitiveNode", value=1),
+    }
+
+    normalized = normalize_graph(dict(reversed(list(graph.items()))))
+
+    assert [node.node_id for node in normalized.nodes] == ["01", "2", "10", "alpha"]
+
+
+def test_require_one_returns_only_binding_strictly_above_confidence_threshold() -> None:
+    weak = RoleBinding(
+        node_id="weak",
+        field_name="ckpt_name",
+        value="guess.safetensors",
+        confidence=0.8,
+        reason="weak heuristic",
+    )
+    strong = RoleBinding(
+        node_id="strong",
+        field_name="ckpt_name",
+        value="known.safetensors",
+        confidence=0.81,
+        reason="known loader",
+    )
+    graph = NormalizedGraph(
+        nodes=(),
+        role_bindings=(
+            RoleBindings(role=SemanticRole.CHECKPOINT, bindings=(weak, strong)),
+        ),
+    )
+
+    assert graph.require_one(SemanticRole.CHECKPOINT) is strong
+
+
+def test_require_one_reports_all_ambiguous_bindings_without_node_id_tiebreak() -> None:
+    graph = normalize_graph(
+        {
+            "99": _node("UNETLoader", unet_name="second.safetensors"),
+            "1": _node("CheckpointLoaderSimple", ckpt_name="first.safetensors"),
+        }
+    )
+
+    with pytest.raises(AmbiguousRoleError) as raised:
+        graph.require_one(SemanticRole.CHECKPOINT)
+
+    assert [item.node_id for item in raised.value.bindings] == ["1", "99"]
+    assert "first.safetensors" in str(raised.value)
+    assert "second.safetensors" in str(raised.value)
+
+
+def test_require_one_reports_low_confidence_candidates_when_role_is_missing() -> None:
+    candidate = RoleBinding(
+        node_id="maybe",
+        field_name="model_name",
+        value="uncertain.safetensors",
+        confidence=0.8,
+        reason="not confident enough",
+    )
+    graph = NormalizedGraph(
+        nodes=(),
+        role_bindings=(
+            RoleBindings(role=SemanticRole.CHECKPOINT, bindings=(candidate,)),
+        ),
+    )
+
+    with pytest.raises(MissingRoleError) as raised:
+        graph.require_one(SemanticRole.CHECKPOINT)
+
+    assert raised.value.bindings == (candidate,)
+    assert "maybe" in str(raised.value)
+    assert "0.8" in str(raised.value)
+
+
+def test_literal_arrays_are_not_misclassified_as_links() -> None:
+    source = {
+        "1": _node("PrimitiveNode", choices=["red", "blue"], pair=[1, 2]),
+        "2": _node("Consumer", source=["1", 0], nested=[["1", 0]]),
+    }
+
+    graph = normalize_graph(source)
+    consumer = next(node for node in graph.nodes if node.node_id == "2")
+
+    assert consumer.input_links == {"source": ("1", 0)}
+    assert consumer.inputs["nested"] == (("1", 0),)
+    assert next(node for node in graph.nodes if node.node_id == "1").input_links == {}
+    assert source["2"]["inputs"]["source"] == ["1", 0]
+
+
+def test_only_meta_keys_are_removed_recursively_from_semantic_projection() -> None:
+    source = {
+        "_meta": {"workflow_title": "ignored top-level UI metadata"},
+        "1": {
+            "class_type": "PrimitiveNode",
+            "inputs": {
+                "_meta": {"widget": "hidden"},
+                "config": {"_meta": {"ui": True}, "_private": "kept", "value": 3},
+            },
+            "_meta": {"title": "UI title"},
+            "display_name": "kept source field",
+        }
+    }
+    original = copy.deepcopy(source)
+
+    node = normalize_graph(source).nodes[0]
+
+    assert "_meta" not in node.inputs
+    assert node.inputs["config"] == {"_private": "kept", "value": 3}
+    assert source == original
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ({}, "nonempty"),
+        ([], "object"),
+        ({1: _node("PrimitiveNode")}, "string"),
+        ({"": _node("PrimitiveNode")}, "blank"),
+        ({"1": []}, "node '1'.*object"),
+        ({"1": {"inputs": {}}}, "class_type"),
+        ({"1": {"class_type": "", "inputs": {}}}, "class_type.*nonblank"),
+        ({"1": {"class_type": 7, "inputs": {}}}, "class_type.*string"),
+        ({"1": {"class_type": "Node"}}, "inputs"),
+        ({"1": {"class_type": "Node", "inputs": []}}, "inputs.*object"),
+        ({"1": {"class_type": "Node", "inputs": {1: "x"}}}, "input names.*string"),
+        ({"1": _node("Node", value=float("nan"))}, "finite"),
+        ({"1": _node("Node", value=(1, 2))}, "unsupported JSON"),
+        (
+            {
+                "1": _node("Node"),
+                "2": _node("Consumer", model=["1", True]),
+            },
+            "output index",
+        ),
+        ({"1": _node("Consumer", model=["missing", 0])}, "unknown node"),
+        ({"1": _node("Consumer", model=["2", 0])}, "unknown node"),
+    ],
+)
+def test_malformed_api_graphs_are_rejected_deterministically(source, message) -> None:
+    with pytest.raises(GraphValidationError, match=message):
+        normalize_graph(source)
+
+
+def test_lora_order_follows_model_edges_not_numeric_or_source_order() -> None:
+    graph = {
+        "2": _node(
+            "LoraLoaderModelOnly",
+            model=["99", 0],
+            lora_name="second.safetensors",
+            strength_model=0.7,
+        ),
+        "50": _node("UNETLoader", unet_name="base.safetensors"),
+        "1": _node("KSampler", model=["2", 0], sampler_name="euler", seed=1),
+        "99": _node(
+            "LoraLoaderModelOnly",
+            model=["50", 0],
+            lora_name="first.safetensors",
+            strength_model=0.9,
+        ),
+    }
+
+    bindings = normalize_graph(graph).bindings(SemanticRole.LORA)
+
+    assert [(binding.node_id, binding.value) for binding in bindings] == [
+        ("99", "first.safetensors"),
+        ("2", "second.safetensors"),
+    ]
+
+
+def test_lora_order_follows_model_edges_through_passthrough_nodes() -> None:
+    graph = {
+        "loader": _node("UNETLoader", unet_name="base.safetensors"),
+        "first": _node(
+            "LoraLoaderModelOnly",
+            model=["loader", 0],
+            lora_name="first.safetensors",
+            strength_model=0.8,
+        ),
+        "sampling": _node("ModelSamplingFlux", model=["first", 0], shift=3.0),
+        "second": _node(
+            "LoraLoaderModelOnly",
+            model=["sampling", 0],
+            lora_name="second.safetensors",
+            strength_model=0.8,
+        ),
+        "sampler": _node("KSampler", model=["second", 0], seed=1),
+    }
+
+    bindings = normalize_graph(graph).bindings(SemanticRole.LORA)
+
+    assert [binding.node_id for binding in bindings] == ["first", "second"]
+
+
+def test_lora_cycle_is_reported() -> None:
+    graph = {
+        "a": _node(
+            "LoraLoaderModelOnly",
+            model=["b", 0],
+            lora_name="a.safetensors",
+            strength_model=1.0,
+        ),
+        "b": _node(
+            "LoraLoaderModelOnly",
+            model=["a", 0],
+            lora_name="b.safetensors",
+            strength_model=1.0,
+        ),
+    }
+
+    with pytest.raises(GraphTopologyError, match="LoRA cycle.*a.*b"):
+        normalize_graph(graph)
+
+
+def test_disconnected_lora_chains_are_reported() -> None:
+    graph = _lora_graph()
+    graph["other"] = _node(
+        "LoraLoaderModelOnly",
+        model=["loader", 0],
+        lora_name="other.safetensors",
+        strength_model=1.0,
+    )
+
+    with pytest.raises(GraphTopologyError, match="disconnected LoRA chains"):
+        normalize_graph(graph)
+
+
+def test_branched_lora_chain_is_reported_as_ambiguous() -> None:
+    graph = _lora_graph()
+    graph["branch"] = _node(
+        "LoraLoaderModelOnly",
+        model=["upstream", 0],
+        lora_name="branch.safetensors",
+        strength_model=1.0,
+    )
+
+    with pytest.raises(GraphTopologyError, match="ambiguous LoRA branch.*upstream"):
+        normalize_graph(graph)
