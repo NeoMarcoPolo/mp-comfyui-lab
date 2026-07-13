@@ -51,7 +51,9 @@ class RunState(StrEnum):
 
 
 _NORMAL_RUN_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
-    RunState.PLANNED: frozenset({RunState.SUBMITTED, RunState.INCOMPLETE}),
+    RunState.PLANNED: frozenset(
+        {RunState.SUBMITTED, RunState.FAILED, RunState.INCOMPLETE}
+    ),
     RunState.SUBMITTED: frozenset(
         {
             RunState.RUNNING,
@@ -219,17 +221,32 @@ class RunRecord(_FrozenModel):
                     f"transition from {self.state.value} to {new_state.value} "
                     "is not allowed"
                 )
-            if self.state is RunState.PLANNED and new_state is RunState.INCOMPLETE:
+            if self.state is RunState.PLANNED:
                 error = updates.get("error", self.error)
-                if not _is_ambiguous_submission(error):
-                    raise ValueError(
-                        "PLANNED to INCOMPLETE transition requires "
-                        "error.kind == 'ambiguous_submission'"
-                    )
-                if updates.get("provider_task_id", self.provider_task_id) is not None:
-                    raise ValueError(
-                        "provider_task_id must be absent for ambiguous submission"
-                    )
+                provider_task_id = updates.get(
+                    "provider_task_id",
+                    self.provider_task_id,
+                )
+                if new_state is RunState.INCOMPLETE:
+                    if not _is_ambiguous_submission(error):
+                        raise ValueError(
+                            "PLANNED to INCOMPLETE transition requires "
+                            "error.kind == 'ambiguous_submission'"
+                        )
+                    if provider_task_id is not None:
+                        raise ValueError(
+                            "provider_task_id must be absent for ambiguous submission"
+                        )
+                elif new_state is RunState.FAILED:
+                    if provider_task_id is not None:
+                        raise ValueError(
+                            "provider_task_id must be absent for confirmed rejection"
+                        )
+                    if _is_ambiguous_submission(error):
+                        raise ValueError(
+                            "error.kind == 'ambiguous_submission' must transition "
+                            "from PLANNED to INCOMPLETE"
+                        )
 
         values = self.model_dump()
         values.update(updates)

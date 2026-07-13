@@ -675,6 +675,11 @@ def test_run_transition_cannot_replace_provider_task_id():
             RunState.INCOMPLETE,
             {"error": {"kind": "ambiguous_submission"}},
         ),
+        (
+            RunState.PLANNED,
+            RunState.FAILED,
+            {"error": {"kind": "provider_rejection"}},
+        ),
         (RunState.SUBMITTED, RunState.RUNNING, {}),
         (RunState.SUBMITTED, RunState.SUCCESS, {"actual_output_count": 1}),
         (RunState.SUBMITTED, RunState.FAILED, {}),
@@ -692,6 +697,52 @@ def test_run_transition_accepts_normal_edges(source_state, destination, updates)
     transitioned = record.transition(destination, **updates)
 
     assert transitioned.state is destination
+
+
+def test_planned_run_can_record_confirmed_failure_without_provider_task_id():
+    record = _run_for_transition(RunState.PLANNED)
+
+    failed = record.transition(
+        RunState.FAILED,
+        error={"kind": "provider_rejection"},
+    )
+
+    assert failed.state is RunState.FAILED
+    assert failed.provider_task_id is None
+    assert failed.error == {"kind": "provider_rejection"}
+
+
+@pytest.mark.parametrize("destination", list(RunState))
+def test_confirmed_planned_failure_is_terminal(destination):
+    record = _run_for_transition(RunState.PLANNED)
+    failed = record.transition(
+        RunState.FAILED,
+        error={"kind": "provider_rejection"},
+    )
+
+    with pytest.raises(ValueError, match="transition"):
+        failed.transition(destination)
+
+
+def test_planned_to_failed_rejects_provider_task_id():
+    record = _run_for_transition(RunState.PLANNED)
+
+    with pytest.raises(ValueError, match="provider_task_id"):
+        record.transition(
+            RunState.FAILED,
+            provider_task_id="fake-task-1",
+            error={"kind": "provider_rejection"},
+        )
+
+
+def test_planned_to_failed_rejects_ambiguous_submission_error():
+    record = _run_for_transition(RunState.PLANNED)
+
+    with pytest.raises(ValueError, match="ambiguous_submission"):
+        record.transition(
+            RunState.FAILED,
+            error={"kind": "ambiguous_submission"},
+        )
 
 
 @pytest.mark.parametrize("error", [None, {"kind": "partial_outputs"}])
