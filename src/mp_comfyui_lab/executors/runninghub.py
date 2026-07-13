@@ -7,6 +7,7 @@ from ipaddress import ip_address
 import json
 import re
 from typing import Annotated, Any, NoReturn, TypeVar
+import unicodedata
 from urllib.parse import urlsplit
 
 from mp_runninghub_api.runninghub import get_workflow_json
@@ -71,8 +72,7 @@ def _provider_aware_timestamp(value: str) -> str:
 def _provider_http_url(value: str) -> str:
     if any(
         character.isspace()
-        or ord(character) < 0x20
-        or ord(character) == 0x7F
+        or unicodedata.category(character) == "Cc"
         for character in value
     ):
         raise ValueError("URL must not contain whitespace or control characters")

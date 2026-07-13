@@ -630,6 +630,14 @@ def test_search_rejects_wrong_provider_numeric_representations(
         "https://assets.example/image.png\n?token=secret",
         "https://assets.\texample/image.png",
         "https://assets.example/image\x01.png",
+        pytest.param(
+            "https://assets.example/image\u0080.png",
+            id="control-U+0080",
+        ),
+        pytest.param(
+            "https://assets.example/image\u009f.png",
+            id="control-U+009F",
+        ),
         "https://user:password@assets.example/image.png",
         "https:///image.png",
         "https://-bad.example/image.png",
