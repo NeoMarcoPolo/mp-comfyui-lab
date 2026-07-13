@@ -1,30 +1,35 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC
 from enum import StrEnum
 from typing import Annotated
 
 from pydantic import (
     BaseModel,
-    BeforeValidator,
+    AfterValidator,
+    AwareDatetime,
     ConfigDict,
     Field,
-    JsonValue,
     StringConstraints,
 )
 
-from mp_comfyui_lab.security import sanitize_for_persistence
+from mp_comfyui_lab.json_types import FrozenDict, SanitizedJsonObject
 
 
 NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-SanitizedMetadata = Annotated[
-    dict[str, JsonValue],
-    BeforeValidator(sanitize_for_persistence),
+UtcDatetime = Annotated[
+    AwareDatetime,
+    AfterValidator(lambda value: value.astimezone(UTC)),
 ]
 
 
 class _FrozenModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        allow_inf_nan=False,
+    )
 
 
 class ContentClassification(StrEnum):
@@ -58,13 +63,13 @@ class WorkflowCandidate(_FrozenModel):
     description: str | None = None
     author_id: str | None = None
     author_name: str | None = None
-    published_at: datetime | None = None
+    published_at: UtcDatetime | None = None
     tags: tuple[str, ...] = ()
     engagement: Engagement = Field(default_factory=Engagement)
     covers: tuple[CoverAsset, ...] = ()
     content_classification: ContentClassification = ContentClassification.UNKNOWN
     classification_reasons: tuple[str, ...] = ()
-    provider_metadata: SanitizedMetadata = Field(default_factory=dict)
+    provider_metadata: SanitizedJsonObject = Field(default_factory=FrozenDict)
 
 
 class WorkflowDetail(_FrozenModel):

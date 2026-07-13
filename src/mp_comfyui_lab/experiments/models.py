@@ -1,27 +1,42 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
 from pydantic import (
     BaseModel,
+    AfterValidator,
+    AwareDatetime,
     ConfigDict,
     Field,
-    JsonValue,
     StringConstraints,
     field_validator,
     model_validator,
 )
 
+from mp_comfyui_lab.json_types import (
+    FrozenJsonObject,
+    SanitizedJsonObject,
+)
+
 
 NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+UtcDatetime = Annotated[
+    AwareDatetime,
+    AfterValidator(lambda value: value.astimezone(UTC)),
+]
 
 
 class _FrozenModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        allow_inf_nan=False,
+    )
 
 
 class RunState(StrEnum):
@@ -60,7 +75,7 @@ class ResolvedFixtures(_FrozenModel):
 class MaterializedVariant(_FrozenModel):
     variant_id: NonBlankStr
     source_workflow_id: NonBlankStr
-    graph: dict[str, Any]
+    graph: FrozenJsonObject
     exact_run_hash: Sha256
     capability_hash: Sha256
     instance_type: str | None = None
@@ -70,7 +85,7 @@ class MaterializedVariant(_FrozenModel):
 
     @field_validator("graph")
     @classmethod
-    def validate_graph(cls, graph: dict[str, Any]) -> dict[str, Any]:
+    def validate_graph(cls, graph: FrozenJsonObject) -> FrozenJsonObject:
         if not graph:
             raise ValueError("graph must not be empty")
         if any(not node_id.strip() for node_id in graph):
@@ -86,12 +101,12 @@ class RunRecord(_FrozenModel):
     provider_task_id: NonBlankStr | None = None
     expected_output_count: int = Field(gt=0)
     actual_output_count: int = Field(default=0, ge=0)
-    error: dict[str, JsonValue] | None = None
-    created_at: datetime | None = None
-    submitted_at: datetime | None = None
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
-    updated_at: datetime | None = None
+    error: SanitizedJsonObject | None = None
+    created_at: UtcDatetime | None = None
+    submitted_at: UtcDatetime | None = None
+    started_at: UtcDatetime | None = None
+    completed_at: UtcDatetime | None = None
+    updated_at: UtcDatetime | None = None
 
     @model_validator(mode="after")
     def validate_provider_task_id(self) -> RunRecord:
@@ -105,4 +120,32 @@ class RunRecord(_FrozenModel):
             raise ValueError("provider_task_id is not allowed for PLANNED")
         if self.state in task_id_required_states and self.provider_task_id is None:
             raise ValueError(f"provider_task_id is required for {self.state.value}")
+        if (
+            self.state is RunState.SUCCESS
+            and self.actual_output_count < self.expected_output_count
+        ):
+            raise ValueError(
+                "actual_output_count must meet expected_output_count for SUCCESS"
+            )
+
+        timestamps = [
+            timestamp
+            for timestamp in (
+                self.created_at,
+                self.submitted_at,
+                self.started_at,
+                self.completed_at,
+                self.updated_at,
+            )
+            if timestamp is not None
+        ]
+        if any(later < earlier for earlier, later in zip(timestamps, timestamps[1:])):
+            raise ValueError("run timestamps must be chronologically nondecreasing")
         return self
+
+    def transition(self, new_state: RunState, **updates: Any) -> Self:
+        """Revalidate a state change; never use model_copy(update=...) for transitions."""
+        values = self.model_dump()
+        values.update(updates)
+        values["state"] = new_state
+        return type(self).model_validate(values)

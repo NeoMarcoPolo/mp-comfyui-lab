@@ -2,32 +2,35 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated
 
 from pydantic import (
     BaseModel,
-    BeforeValidator,
     ConfigDict,
     Field,
-    JsonValue,
     StringConstraints,
     model_validator,
 )
 
 from mp_comfyui_lab.discovery.models import WorkflowCandidate, WorkflowDetail
 from mp_comfyui_lab.experiments.models import MaterializedVariant, ResolvedFixtures
-from mp_comfyui_lab.security import sanitize_for_persistence
+from mp_comfyui_lab.json_types import (
+    FrozenDict,
+    FrozenJsonObject,
+    SanitizedJsonObject,
+)
 
 
 NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-SanitizedMetadata = Annotated[
-    dict[str, JsonValue],
-    BeforeValidator(sanitize_for_persistence),
-]
 
 
 class _FrozenModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        allow_inf_nan=False,
+    )
 
 
 class SearchRequest(_FrozenModel):
@@ -54,7 +57,23 @@ class WorkflowRef(_FrozenModel):
 class FetchedWorkflow(_FrozenModel):
     ref: WorkflowRef
     detail: WorkflowDetail
-    graph: dict[str, Any]
+    graph: FrozenJsonObject
+
+    @model_validator(mode="after")
+    def validate_ref_matches_detail(self) -> FetchedWorkflow:
+        candidate = self.detail.candidate
+        if self.ref.executor != candidate.executor:
+            raise ValueError("ref executor must match detail candidate executor")
+        if self.ref.workflow_id != candidate.workflow_id:
+            raise ValueError("ref workflow_id must match detail candidate workflow_id")
+        if (
+            self.ref.canonical_url is not None
+            and self.ref.canonical_url != candidate.canonical_url
+        ):
+            raise ValueError(
+                "ref canonical_url must match detail candidate canonical_url"
+            )
+        return self
 
 
 class CapabilityReport(_FrozenModel):
@@ -62,7 +81,7 @@ class CapabilityReport(_FrozenModel):
     model_names: tuple[str, ...] = ()
     lora_names: tuple[str, ...] = ()
     output_node_ids: tuple[str, ...] = ()
-    provider_metadata: SanitizedMetadata = Field(default_factory=dict)
+    provider_metadata: SanitizedJsonObject = Field(default_factory=FrozenDict)
 
 
 class ValidationIssue(_FrozenModel):
@@ -92,14 +111,14 @@ class ProviderTaskState(StrEnum):
 class SubmissionReceipt(_FrozenModel):
     provider_task_id: NonBlankStr
     provider_state: ProviderTaskState | None = None
-    provider_metadata: SanitizedMetadata = Field(default_factory=dict)
+    provider_metadata: SanitizedJsonObject = Field(default_factory=FrozenDict)
 
 
 class PollResult(_FrozenModel):
     provider_task_id: NonBlankStr
     state: ProviderTaskState
     diagnostic: str | None = None
-    provider_metadata: SanitizedMetadata = Field(default_factory=dict)
+    provider_metadata: SanitizedJsonObject = Field(default_factory=FrozenDict)
 
 
 class ProviderOutput(_FrozenModel):
@@ -108,7 +127,7 @@ class ProviderOutput(_FrozenModel):
     media_type: str | None = None
     file_name: str | None = None
     provider_order: int = Field(default=0, ge=0)
-    provider_metadata: SanitizedMetadata = Field(default_factory=dict)
+    provider_metadata: SanitizedJsonObject = Field(default_factory=FrozenDict)
 
 
 class CancelResult(_FrozenModel):
@@ -140,7 +159,10 @@ class AmbiguousSubmissionError(ExecutorError):
 
 
 class Executor(ABC):
-    name: str
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        raise NotImplementedError
 
     @abstractmethod
     def search(self, request: SearchRequest) -> SearchPage:

@@ -1,5 +1,7 @@
 import importlib
-from datetime import UTC, datetime
+import json
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -20,6 +22,7 @@ from mp_comfyui_lab.executors.base import (
     CancelResult,
     CapabilityReport,
     Executor,
+    FetchedWorkflow,
     PollResult,
     ProviderOutput,
     ProviderTaskState,
@@ -37,6 +40,7 @@ from mp_comfyui_lab.experiments.models import (
     RunRecord,
     RunState,
 )
+from mp_comfyui_lab.experiments.store import ExperimentStore
 
 
 @pytest.fixture
@@ -80,6 +84,58 @@ def _candidate(**updates) -> WorkflowCandidate:
     return WorkflowCandidate(**values)
 
 
+def _json_bearing_record(kind, value):
+    if kind == "fetched_graph":
+        return FetchedWorkflow(
+            ref=WorkflowRef(
+                executor="fake",
+                workflow_id="workflow-1",
+                canonical_url="memory://workflow-1",
+            ),
+            detail=WorkflowDetail(candidate=_candidate()),
+            graph=value,
+        )
+    if kind == "variant_graph":
+        return MaterializedVariant(
+            variant_id="variant-json",
+            source_workflow_id="workflow-json",
+            graph=value,
+            exact_run_hash="a" * 64,
+            capability_hash="b" * 64,
+            expected_output_count=1,
+        )
+    if kind == "candidate_metadata":
+        return _candidate(provider_metadata=value)
+    if kind == "capability_metadata":
+        return CapabilityReport(provider_metadata=value)
+    if kind == "receipt_metadata":
+        return SubmissionReceipt(
+            provider_task_id="fake-task-json",
+            provider_metadata=value,
+        )
+    if kind == "poll_metadata":
+        return PollResult(
+            provider_task_id="fake-task-json",
+            state=ProviderTaskState.RUNNING,
+            provider_metadata=value,
+        )
+    if kind == "output_metadata":
+        return ProviderOutput(
+            url="memory://output",
+            provider_metadata=value,
+        )
+    if kind == "run_error":
+        return RunRecord(
+            run_id="run-json",
+            experiment_id="experiment-json",
+            variant_id="variant-json",
+            state=RunState.FAILED,
+            expected_output_count=1,
+            error=value,
+        )
+    raise AssertionError(f"unknown JSON-bearing record: {kind}")
+
+
 def test_fake_executor_exposes_complete_lifecycle(
     sample_variant,
     resolved_fixtures,
@@ -110,30 +166,46 @@ def test_fake_executor_exposes_complete_lifecycle(
     ]
 
 
-def test_fake_executor_uses_configurable_poll_sequence_in_call_order(
+def test_fake_executor_uses_task_keyed_poll_sequences_in_call_order(
     sample_variant,
     resolved_fixtures,
 ):
     executor = FakeExecutor(
-        poll_sequence=(
-            ProviderTaskState.QUEUED,
-            ProviderTaskState.RUNNING,
-            ProviderTaskState.SUCCESS,
-        )
+        poll_sequences={
+            "fake-task-1": (
+                ProviderTaskState.QUEUED,
+                ProviderTaskState.SUCCESS,
+            ),
+            "fake-task-2": (
+                ProviderTaskState.RUNNING,
+                ProviderTaskState.FAILED,
+            ),
+        }
     )
 
-    receipt = executor.submit(sample_variant, resolved_fixtures)
-    states = tuple(executor.poll(receipt.provider_task_id).state for _ in range(3))
-    second_receipt = executor.submit(sample_variant, resolved_fixtures)
+    first = executor.submit(sample_variant, resolved_fixtures)
+    second = executor.submit(sample_variant, resolved_fixtures)
+    states = (
+        executor.poll(first.provider_task_id).state,
+        executor.poll(second.provider_task_id).state,
+        executor.poll(first.provider_task_id).state,
+        executor.poll(second.provider_task_id).state,
+    )
 
     assert states == (
         ProviderTaskState.QUEUED,
         ProviderTaskState.RUNNING,
         ProviderTaskState.SUCCESS,
+        ProviderTaskState.FAILED,
     )
-    assert second_receipt.provider_task_id == "fake-task-2"
-    assert executor.calls == ["submit", "poll", "poll", "poll", "submit"]
-    assert executor.polls == ["fake-task-1", "fake-task-1", "fake-task-1"]
+    assert second.provider_task_id == "fake-task-2"
+    assert executor.calls == ["submit", "submit", "poll", "poll", "poll", "poll"]
+    assert executor.polls == [
+        "fake-task-1",
+        "fake-task-2",
+        "fake-task-1",
+        "fake-task-2",
+    ]
 
 
 def test_fake_executor_raises_ambiguous_submission_without_task_id(
@@ -149,14 +221,92 @@ def test_fake_executor_raises_ambiguous_submission_without_task_id(
     assert executor.calls == ["submit"]
 
 
-def test_fake_executor_preserves_partial_output_batches():
+def test_fake_executor_preserves_task_keyed_partial_output_scripts():
     first = ProviderOutput(node_id="9", url="memory://one.png", provider_order=0)
     second = ProviderOutput(node_id="9", url="memory://two.png", provider_order=1)
-    executor = FakeExecutor(output_batches=((first,), (first, second)))
+    executor = FakeExecutor(
+        output_scripts={
+            "fake-task-1": ((first,), (first, second)),
+            "fake-task-2": ((second,),),
+        }
+    )
 
     assert executor.collect_outputs("fake-task-1") == (first,)
+    assert executor.collect_outputs("fake-task-2") == (second,)
     assert executor.collect_outputs("fake-task-1") == (first, second)
-    assert executor.collections == ["fake-task-1", "fake-task-1"]
+    assert executor.collections == [
+        "fake-task-1",
+        "fake-task-2",
+        "fake-task-1",
+    ]
+
+
+def test_fake_executor_rejects_mismatched_configured_poll_result():
+    mismatched = PollResult(
+        provider_task_id="fake-task-2",
+        state=ProviderTaskState.RUNNING,
+    )
+
+    with pytest.raises(ValueError, match="fake-task-1"):
+        FakeExecutor(poll_sequences={"fake-task-1": (mismatched,)})
+
+
+def test_fake_executor_supports_configurable_cancel_result():
+    configured = CancelResult(
+        supported=False,
+        cancelled=False,
+        diagnostic="provider has no cancellation endpoint",
+    )
+    executor = FakeExecutor(cancel_result=configured)
+
+    assert executor.cancel("fake-task-1") is configured
+    assert executor.calls == ["cancel"]
+
+
+def test_fake_executor_supports_retry_style_method_exceptions(
+    sample_variant,
+    resolved_fixtures,
+):
+    output = ProviderOutput(node_id="9", url="memory://one.png")
+    executor = FakeExecutor(
+        poll_sequences={"fake-task-1": (ProviderTaskState.SUCCESS,)},
+        output_scripts={"fake-task-1": ((output,),)},
+        method_exceptions={
+            "poll": (TimeoutError("poll timed out"),),
+            "collect_outputs": (OSError("download failed"),),
+        },
+    )
+    receipt = executor.submit(sample_variant, resolved_fixtures)
+
+    with pytest.raises(TimeoutError, match="poll timed out"):
+        executor.poll(receipt.provider_task_id)
+    assert executor.poll(receipt.provider_task_id).state is ProviderTaskState.SUCCESS
+    with pytest.raises(OSError, match="download failed"):
+        executor.collect_outputs(receipt.provider_task_id)
+    assert executor.collect_outputs(receipt.provider_task_id) == (output,)
+    assert executor.calls == [
+        "submit",
+        "poll",
+        "poll",
+        "collect_outputs",
+        "collect_outputs",
+    ]
+
+
+def test_fake_executor_success_scripts_every_submitted_task(
+    sample_variant,
+    resolved_fixtures,
+):
+    output = ProviderOutput(node_id="9", url="memory://one.png")
+    executor = FakeExecutor.success(outputs=(output,))
+
+    first = executor.submit(sample_variant, resolved_fixtures)
+    second = executor.submit(sample_variant, resolved_fixtures)
+
+    assert executor.poll(first.provider_task_id).state is ProviderTaskState.SUCCESS
+    assert executor.poll(second.provider_task_id).state is ProviderTaskState.SUCCESS
+    assert executor.collect_outputs(first.provider_task_id) == (output,)
+    assert executor.collect_outputs(second.provider_task_id) == (output,)
 
 
 def test_discovery_models_preserve_absent_engagement_and_compose_detail():
@@ -177,6 +327,44 @@ def test_discovery_models_preserve_absent_engagement_and_compose_detail():
     assert candidate.tags == ()
     assert detail.candidate is candidate
     assert detail.node_count == 1
+
+
+@pytest.mark.parametrize(
+    ("ref_updates", "candidate_updates"),
+    [
+        ({"executor": "other"}, {}),
+        ({"workflow_id": "other-workflow"}, {}),
+        ({"canonical_url": "memory://other-workflow"}, {}),
+    ],
+)
+def test_fetched_workflow_rejects_ref_detail_identity_mismatch(
+    ref_updates,
+    candidate_updates,
+):
+    ref_values = {
+        "executor": "fake",
+        "workflow_id": "workflow-1",
+        "canonical_url": "memory://workflow-1",
+        **ref_updates,
+    }
+    candidate = _candidate(**candidate_updates)
+
+    with pytest.raises(ValidationError, match="match"):
+        FetchedWorkflow(
+            ref=WorkflowRef(**ref_values),
+            detail=WorkflowDetail(candidate=candidate),
+            graph={"9": {"class_type": "SaveImage", "inputs": {}}},
+        )
+
+
+def test_fetched_workflow_allows_absent_ref_canonical_url():
+    fetched = FetchedWorkflow(
+        ref=WorkflowRef(executor="fake", workflow_id="workflow-1"),
+        detail=WorkflowDetail(candidate=_candidate()),
+        graph={"9": {"class_type": "SaveImage", "inputs": {}}},
+    )
+
+    assert fetched.ref.canonical_url is None
 
 
 def test_resolved_fixtures_by_role_preserves_item_order(tmp_path):
@@ -343,6 +531,71 @@ def test_failed_and_incomplete_runs_allow_optional_task_id(
     assert record.provider_task_id == provider_task_id
 
 
+def test_success_run_requires_at_least_expected_output_count():
+    with pytest.raises(ValidationError, match="actual_output_count"):
+        RunRecord(
+            run_id="run-1",
+            experiment_id="experiment-1",
+            variant_id="variant-1",
+            state=RunState.SUCCESS,
+            provider_task_id="fake-task-1",
+            expected_output_count=2,
+            actual_output_count=1,
+        )
+
+
+def test_run_transition_revalidates_complete_record():
+    created_at = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+    planned = RunRecord(
+        run_id="run-1",
+        experiment_id="experiment-1",
+        variant_id="variant-1",
+        state=RunState.PLANNED,
+        expected_output_count=1,
+        created_at=created_at,
+    )
+
+    submitted = planned.transition(
+        RunState.SUBMITTED,
+        provider_task_id="fake-task-1",
+        submitted_at=created_at + timedelta(seconds=1),
+    )
+    running = submitted.transition(
+        RunState.RUNNING,
+        started_at=created_at + timedelta(seconds=2),
+    )
+    success = running.transition(
+        RunState.SUCCESS,
+        actual_output_count=1,
+        completed_at=created_at + timedelta(seconds=3),
+        updated_at=created_at + timedelta(seconds=4),
+    )
+
+    assert planned.state is RunState.PLANNED
+    assert submitted.state is RunState.SUBMITTED
+    assert running.state is RunState.RUNNING
+    assert success.state is RunState.SUCCESS
+    assert success.actual_output_count == 1
+    with pytest.raises(ValidationError, match="provider_task_id"):
+        planned.transition(RunState.RUNNING)
+
+
+def test_state_changes_must_not_use_unvalidated_model_copy():
+    planned = RunRecord(
+        run_id="run-1",
+        experiment_id="experiment-1",
+        variant_id="variant-1",
+        state=RunState.PLANNED,
+        expected_output_count=1,
+    )
+
+    invalid_copy = planned.model_copy(update={"state": RunState.RUNNING})
+
+    assert invalid_copy.state is RunState.RUNNING
+    assert invalid_copy.provider_task_id is None
+    assert "model_copy(update=...)" in RunRecord.transition.__doc__
+
+
 def test_run_record_allows_more_actual_outputs_than_expected():
     record = RunRecord(
         run_id="run-1",
@@ -355,6 +608,74 @@ def test_run_record_allows_more_actual_outputs_than_expected():
     )
 
     assert record.actual_output_count == 2
+
+
+def test_workflow_and_run_datetimes_normalize_to_utc():
+    offset = timezone(timedelta(hours=-4))
+    source = datetime(2026, 7, 13, 8, 0, tzinfo=offset)
+    candidate = _candidate(published_at=source)
+    run = RunRecord(
+        run_id="run-1",
+        experiment_id="experiment-1",
+        variant_id="variant-1",
+        state=RunState.FAILED,
+        expected_output_count=1,
+        created_at=source,
+        updated_at=source + timedelta(minutes=1),
+    )
+
+    assert candidate.published_at == datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+    assert candidate.published_at.tzinfo is UTC
+    assert run.created_at.tzinfo is UTC
+    assert run.updated_at.tzinfo is UTC
+
+
+def test_workflow_published_at_rejects_naive_datetime():
+    with pytest.raises(ValidationError):
+        _candidate(published_at=datetime(2026, 7, 13, 12, 0))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["created_at", "submitted_at", "started_at", "completed_at", "updated_at"],
+)
+def test_run_timestamps_reject_naive_datetimes(field):
+    with pytest.raises(ValidationError):
+        RunRecord(
+            run_id="run-1",
+            experiment_id="experiment-1",
+            variant_id="variant-1",
+            state=RunState.FAILED,
+            expected_output_count=1,
+            **{field: datetime(2026, 7, 13, 12, 0)},
+        )
+
+
+@pytest.mark.parametrize(
+    ("earlier_field", "later_field"),
+    [
+        ("created_at", "submitted_at"),
+        ("submitted_at", "started_at"),
+        ("started_at", "completed_at"),
+        ("completed_at", "updated_at"),
+    ],
+)
+def test_run_timestamps_must_be_chronologically_nondecreasing(
+    earlier_field,
+    later_field,
+):
+    later = datetime(2026, 7, 13, 12, 1, tzinfo=UTC)
+    earlier = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+
+    with pytest.raises(ValidationError, match="chronological"):
+        RunRecord(
+            run_id="run-1",
+            experiment_id="experiment-1",
+            variant_id="variant-1",
+            state=RunState.FAILED,
+            expected_output_count=1,
+            **{earlier_field: later, later_field: earlier},
+        )
 
 
 def test_submission_receipt_requires_provider_task_state_enum():
@@ -481,19 +802,215 @@ def test_strict_records_round_trip_durable_json_values(tmp_path):
         assert restored == record
 
 
+@pytest.mark.parametrize(
+    "record_kind",
+    [
+        "fetched_graph",
+        "variant_graph",
+        "candidate_metadata",
+        "capability_metadata",
+        "receipt_metadata",
+        "poll_metadata",
+        "output_metadata",
+        "run_error",
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        Path("not-json.txt"),
+        object(),
+        {1: "non-string-key"},
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+    ids=["path", "object", "non-string-key", "nan", "positive-inf", "negative-inf"],
+)
+def test_json_bearing_records_reject_non_json_or_non_finite_values(
+    record_kind,
+    invalid_value,
+):
+    with pytest.raises(ValidationError):
+        _json_bearing_record(record_kind, {"nested": invalid_value})
+
+
+@pytest.mark.parametrize(
+    "record_kind",
+    [
+        "candidate_metadata",
+        "capability_metadata",
+        "receipt_metadata",
+        "poll_metadata",
+        "output_metadata",
+        "run_error",
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        Path("not-json.txt"),
+        object(),
+        {1: "non-string-key"},
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+    ids=["path", "object", "non-string-key", "nan", "positive-inf", "negative-inf"],
+)
+def test_sanitization_does_not_hide_invalid_json_values(
+    record_kind,
+    invalid_value,
+):
+    with pytest.raises(ValidationError):
+        _json_bearing_record(record_kind, {"api_key": invalid_value})
+
+
+def test_json_bearing_records_are_deeply_frozen_and_detached_from_sources():
+    fetched_graph_source = {
+        "9": {
+            "class_type": "SaveImage",
+            "inputs": {"weights": [1, 2]},
+        }
+    }
+    graph_source = {
+        "9": {
+            "class_type": "SaveImage",
+            "inputs": {"weights": [1, 2]},
+        }
+    }
+    metadata_source = {"nested": {"labels": ["one", "two"]}}
+    error_source = {"context": {"attempts": [1, 2]}}
+
+    fetched = _json_bearing_record("fetched_graph", fetched_graph_source)
+    variant = _json_bearing_record("variant_graph", graph_source)
+    candidate = _json_bearing_record("candidate_metadata", metadata_source)
+    run = _json_bearing_record("run_error", error_source)
+    fetched_graph_source["9"]["inputs"]["weights"].append(3)
+    graph_source["9"]["inputs"]["weights"].append(3)
+    metadata_source["nested"]["labels"].append("three")
+    error_source["context"]["attempts"].append(3)
+
+    assert fetched.graph["9"]["inputs"]["weights"] == (1, 2)
+    assert variant.graph["9"]["inputs"]["weights"] == (1, 2)
+    assert candidate.provider_metadata["nested"]["labels"] == ("one", "two")
+    assert run.error["context"]["attempts"] == (1, 2)
+    for value in (
+        fetched.graph,
+        fetched.graph["9"]["inputs"],
+        variant.graph,
+        variant.graph["9"]["inputs"],
+        candidate.provider_metadata,
+        candidate.provider_metadata["nested"],
+        run.error,
+        run.error["context"],
+    ):
+        assert isinstance(value, Mapping)
+        with pytest.raises(TypeError):
+            value["mutate"] = True
+    with pytest.raises(TypeError):
+        variant.graph._data = {}
+
+
+def test_frozen_json_serializes_to_plain_json_and_has_schema():
+    variant = _json_bearing_record(
+        "variant_graph",
+        {"9": {"inputs": {"weights": [1, 2]}}},
+    )
+
+    dumped = variant.model_dump(mode="json")
+    assert type(dumped["graph"]) is dict
+    assert type(dumped["graph"]["9"]["inputs"]["weights"]) is list
+    assert json.loads(variant.model_dump_json()) == dumped
+    assert MaterializedVariant.model_validate_json(variant.model_dump_json()) == variant
+    for model, field in (
+        (FetchedWorkflow, "graph"),
+        (MaterializedVariant, "graph"),
+        (WorkflowCandidate, "provider_metadata"),
+        (CapabilityReport, "provider_metadata"),
+        (SubmissionReceipt, "provider_metadata"),
+        (PollResult, "provider_metadata"),
+        (ProviderOutput, "provider_metadata"),
+        (RunRecord, "error"),
+    ):
+        field_schema = model.model_json_schema()["properties"][field]
+        assert field_schema.get("type") == "object" or any(
+            option.get("type") == "object"
+            for option in field_schema.get("anyOf", ())
+        )
+
+
+def test_json_model_configs_disallow_non_finite_numbers():
+    for model in (WorkflowCandidate, MaterializedVariant, ProviderOutput, RunRecord):
+        assert model.model_config["allow_inf_nan"] is False
+
+
+def test_error_and_provider_metadata_serialize_sanitized_and_persist_safely(
+    tmp_path,
+):
+    signed_url = "https://cdn.test/output.png?X-Amz-Signature=secret"
+    output = ProviderOutput(
+        url="memory://output",
+        provider_metadata={
+            "api_key": "provider-secret",
+            "signedUrl": signed_url,
+        },
+    )
+    run = RunRecord(
+        run_id="run-json",
+        experiment_id="experiment-json",
+        variant_id="variant-json",
+        state=RunState.FAILED,
+        expected_output_count=1,
+        error={
+            "Authorization": "Bearer secret",
+            "outputUrl": signed_url,
+        },
+    )
+
+    assert json.loads(output.model_dump_json())["provider_metadata"] == {
+        "api_key": "[REDACTED]",
+        "signedUrl": "https://cdn.test/output.png",
+    }
+    assert json.loads(run.model_dump_json())["error"] == {
+        "Authorization": "[REDACTED]",
+        "outputUrl": "https://cdn.test/output.png",
+    }
+    store = ExperimentStore(tmp_path / "experiments")
+    store.create("json-001")
+    store.write_json(
+        "json-001",
+        "runs/run-json.json",
+        {
+            "run": run.model_dump(mode="json"),
+            "output": output.model_dump(mode="json"),
+        },
+    )
+    persisted = store.read_json("json-001", "runs/run-json.json")
+    assert persisted["run"]["error"] == {
+        "Authorization": "[REDACTED]",
+        "outputUrl": "https://cdn.test/output.png",
+    }
+    assert persisted["output"]["provider_metadata"] == {
+        "api_key": "[REDACTED]",
+        "signedUrl": "https://cdn.test/output.png",
+    }
+
+
 def test_mutable_defaults_do_not_leak_between_records():
     first_candidate = _candidate()
     second_candidate = _candidate(workflow_id="workflow-2")
     first_report = CapabilityReport()
     second_report = CapabilityReport()
 
-    first_candidate.provider_metadata["provider"] = "first"
-    first_report.provider_metadata["provider"] = "first"
-
     assert second_candidate.provider_metadata == {}
     assert second_report.provider_metadata == {}
     assert first_candidate.provider_metadata is not second_candidate.provider_metadata
     assert first_report.provider_metadata is not second_report.provider_metadata
+    with pytest.raises(TypeError):
+        first_candidate.provider_metadata["provider"] = "first"
+    with pytest.raises(TypeError):
+        first_report.provider_metadata["provider"] = "first"
 
 
 def test_provider_metadata_is_sanitized_and_json_like():
@@ -575,6 +1092,39 @@ def test_executor_abc_cannot_instantiate_incomplete_implementation():
 
     with pytest.raises(TypeError, match="abstract"):
         IncompleteExecutor()
+
+
+def test_executor_name_is_abstract_and_fake_implements_property():
+    class MissingNameExecutor(Executor):
+        def search(self, request):
+            raise NotImplementedError
+
+        def fetch_workflow(self, ref):
+            raise NotImplementedError
+
+        def inspect_capabilities(self, workflow):
+            raise NotImplementedError
+
+        def validate_variant(self, variant, fixtures):
+            raise NotImplementedError
+
+        def submit(self, variant, fixtures):
+            raise NotImplementedError
+
+        def poll(self, provider_task_id):
+            raise NotImplementedError
+
+        def collect_outputs(self, provider_task_id):
+            raise NotImplementedError
+
+        def cancel(self, provider_task_id):
+            raise NotImplementedError
+
+    assert "name" in Executor.__abstractmethods__
+    with pytest.raises(TypeError, match="name"):
+        MissingNameExecutor()
+    assert isinstance(FakeExecutor.name, property)
+    assert FakeExecutor().name == "fake"
 
 
 def test_executor_contract_modules_are_importable_by_name():
