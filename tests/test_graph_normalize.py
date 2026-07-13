@@ -895,6 +895,57 @@ def test_normalized_model_json_depth_contract_is_direct_and_serializable() -> No
         normalize_graph({"node": {"class_type": "PrimitiveNode", "inputs": rejected}})
 
 
+def test_input_links_direct_validation_precedes_recursive_freezing() -> None:
+    max_depth = graph_models.MAX_SERIALIZABLE_JSON_DEPTH
+    node = NormalizedNode(
+        node_id="node",
+        class_type="ModelConsumer",
+        inputs=_nested_json(max_depth),
+        input_links={"model": ["source", 0]},
+    )
+
+    assert NormalizedNode.model_validate_json(node.model_dump_json()) == node
+    with pytest.raises(ValidationError, match="input links must contain"):
+        NormalizedNode(
+            node_id="node",
+            class_type="ModelConsumer",
+            inputs={},
+            input_links=_nested_json(max_depth),
+        )
+    for rejected_depth in (max_depth + 1, 600):
+        with pytest.raises(ValidationError, match="depth limit"):
+            NormalizedNode(
+                node_id="node",
+                class_type="ModelConsumer",
+                inputs={},
+                input_links=_nested_json(rejected_depth),
+            )
+
+
+@pytest.mark.parametrize(
+    ("input_links", "message"),
+    [
+        ({"nested": {"value": "bad\ud800"}}, "surrogate"),
+        ({"nested": {"value": float("inf")}}, "finite"),
+        (
+            {"nested": [0] * graph_models.MAX_SERIALIZABLE_JSON_VALUES},
+            "value limit",
+        ),
+    ],
+)
+def test_input_links_direct_validation_enforces_json_contract(
+    input_links,
+    message,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        NormalizedNode(
+            node_id="node",
+            class_type="ModelConsumer",
+            inputs={},
+            input_links=input_links,
+        )
+
+
 def test_graph_node_and_value_limits_are_enforced_before_freezing(monkeypatch) -> None:
     monkeypatch.setattr(graph_normalize, "_MAX_GRAPH_NODES", 2, raising=False)
     with pytest.raises(GraphValidationError, match="node limit"):

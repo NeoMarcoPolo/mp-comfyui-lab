@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import json
 import unicodedata
 from collections import defaultdict
@@ -403,6 +404,7 @@ def _lora_chains(
             model_consumers[link[0]].append((consumer.node_id, field_name))
 
     transform_parent: dict[str, str] = {}
+    resolved_model_anchors: dict[str, str] = {}
     for node_id in sorted(transform_ids, key=_node_sort_key):
         links = _model_links(nodes_by_id[node_id])
         if len(links) != 1:
@@ -410,21 +412,26 @@ def _lora_chains(
                 f"LoRA node '{node_id}' must have exactly one model input edge"
             )
         source_id = links[0][1][0]
-        path = [node_id]
+        trail: list[str] = []
+        trail_positions: dict[str, int] = {}
         while source_id not in transform_ids and not _is_model_loader(
             nodes_by_id[source_id]
         ):
-            if source_id in path:
-                path.append(source_id)
+            if source_id in resolved_model_anchors:
+                source_id = resolved_model_anchors[source_id]
+                break
+            if source_id in trail_positions:
+                cycle = trail[trail_positions[source_id] :] + [source_id]
                 raise GraphTopologyError(
-                    f"LoRA model-edge cycle detected: {' -> '.join(path)}"
+                    f"LoRA model-edge cycle detected: {' -> '.join(cycle)}"
                 )
             if source_id in selector_ids:
                 raise GraphTopologyError(
                     f"LoRA model transform '{node_id}' follows selector '{source_id}' "
                     "through a model edge"
                 )
-            path.append(source_id)
+            trail_positions[source_id] = len(trail)
+            trail.append(source_id)
             upstream = _model_links(nodes_by_id[source_id])
             if len(upstream) != 1:
                 raise GraphTopologyError(
@@ -432,27 +439,56 @@ def _lora_chains(
                     f"input through '{source_id}'"
                 )
             source_id = upstream[0][1][0]
+        for intermediate_id in trail:
+            resolved_model_anchors[intermediate_id] = source_id
         transform_parent[node_id] = source_id
 
-    def check_parent_cycles(parent_by_node: Mapping[str, str], kind: str) -> None:
-        for start in sorted(parent_by_node, key=_node_sort_key):
-            path: list[str] = []
-            cursor = start
-            while cursor in parent_by_node:
-                if cursor in path:
-                    cycle = path[path.index(cursor) :] + [cursor]
-                    label = (
-                        "LoRA cycle detected (model)"
-                        if kind == "model"
-                        else "LoRA selector cycle detected"
-                    )
-                    raise GraphTopologyError(
-                        f"{label}: {' -> '.join(cycle)}"
-                    )
-                path.append(cursor)
-                cursor = parent_by_node[cursor]
+    def parent_topology(
+        chain_ids: frozenset[str],
+        parent_by_node: Mapping[str, str],
+        kind: str,
+    ) -> tuple[list[str], dict[str, list[str]], list[str]]:
+        children: dict[str, list[str]] = defaultdict(list)
+        indegree = {node_id: 0 for node_id in chain_ids}
+        for node_id, parent_id in parent_by_node.items():
+            if parent_id in chain_ids:
+                children[parent_id].append(node_id)
+                indegree[node_id] += 1
 
-    check_parent_cycles(transform_parent, "model")
+        ready = [
+            (_node_sort_key(node_id), node_id)
+            for node_id, degree in indegree.items()
+            if degree == 0
+        ]
+        heapq.heapify(ready)
+        roots = [node_id for _, node_id in sorted(ready)]
+        ordered: list[str] = []
+        while ready:
+            _, node_id = heapq.heappop(ready)
+            ordered.append(node_id)
+            for child_id in children.get(node_id, []):
+                indegree[child_id] -= 1
+                if indegree[child_id] == 0:
+                    heapq.heappush(ready, (_node_sort_key(child_id), child_id))
+
+        if len(ordered) != len(chain_ids):
+            remaining = sorted(
+                (node_id for node_id, degree in indegree.items() if degree > 0),
+                key=_node_sort_key,
+            )
+            label = (
+                "LoRA cycle detected (model)"
+                if kind == "model"
+                else "LoRA selector cycle detected"
+            )
+            raise GraphTopologyError(f"{label}: {remaining}")
+        return ordered, children, roots
+
+    transform_order, _, transform_roots = parent_topology(
+        transform_ids,
+        transform_parent,
+        "model",
+    )
 
     def downstream_model_outcomes(
         start: str,
@@ -499,47 +535,45 @@ def _lora_chains(
 
     chains: list[_LoraChain] = []
 
-    def expanded_bindings(path: tuple[str, ...]) -> tuple[RoleBinding, ...]:
+    def expanded_bindings(path: list[str]) -> tuple[RoleBinding, ...]:
         return tuple(
             binding
             for node_id in path
             for binding in bindings_by_node[node_id]
         )
 
-    transform_roots = sorted(
-        (
-            node_id
-            for node_id in transform_ids
-            if transform_parent[node_id] not in transform_ids
-        ),
-        key=_node_sort_key,
-    )
+    def chain_bindings(
+        terminal_node_id: str,
+        chain_ids: frozenset[str],
+        parent_by_node: Mapping[str, str],
+    ) -> tuple[RoleBinding, ...]:
+        path: list[str] = []
+        cursor = terminal_node_id
+        while cursor in chain_ids:
+            path.append(cursor)
+            cursor = parent_by_node.get(cursor, "")
+        path.reverse()
+        return expanded_bindings(path)
 
-    def walk_transform(node_id: str, path: tuple[str, ...]) -> None:
+    for node_id in transform_order:
         child_ids, terminals = transform_outcomes[node_id]
         if not child_ids and not terminals:
             prefix = "disconnected LoRA chains: " if len(transform_roots) > 1 else ""
             raise GraphTopologyError(
                 f"{prefix}LoRA '{node_id}' has no downstream model consumer"
             )
-        next_path = path + (node_id,)
         for consumer_id, field_name in sorted(terminals):
             chains.append(
                 _LoraChain(
-                    bindings=expanded_bindings(next_path),
+                    bindings=chain_bindings(
+                        node_id,
+                        transform_ids,
+                        transform_parent,
+                    ),
                     consumer_node_id=consumer_id,
                     consumer_field=field_name,
                 )
             )
-        for child_id in sorted(child_ids, key=_node_sort_key):
-            if child_id in next_path:
-                raise GraphTopologyError(
-                    f"LoRA model cycle detected: {' -> '.join(next_path + (child_id,))}"
-                )
-            walk_transform(child_id, next_path)
-
-    for root in transform_roots:
-        walk_transform(root, ())
 
     selector_parent: dict[str, str] = {}
     for node_id in sorted(selector_ids, key=_node_sort_key):
@@ -560,7 +594,11 @@ def _lora_chains(
                 )
             selector_parent[node_id] = parent_id
 
-    check_parent_cycles(selector_parent, "selector")
+    selector_order, _, _ = parent_topology(
+        selector_ids,
+        selector_parent,
+        "selector",
+    )
     selector_consumers: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for consumer in nodes_by_id.values():
         for field_name, link in consumer.input_links.items():
@@ -605,33 +643,24 @@ def _lora_chains(
                 terminals.add((target_id, field_name))
         selector_outcomes[node_id] = (children, terminals)
 
-    selector_roots = sorted(
-        (node_id for node_id in selector_ids if node_id not in selector_parent),
-        key=_node_sort_key,
-    )
-
-    def walk_selector(node_id: str, path: tuple[str, ...]) -> None:
+    for node_id in selector_order:
         child_ids, terminals = selector_outcomes[node_id]
         if not child_ids and not terminals:
             raise GraphTopologyError(
                 f"LoRA selector '{node_id}' has no downstream model consumer"
             )
-        next_path = path + (node_id,)
         for consumer_id, field_name in sorted(terminals):
             chains.append(
                 _LoraChain(
-                    bindings=expanded_bindings(next_path),
+                    bindings=chain_bindings(
+                        node_id,
+                        selector_ids,
+                        selector_parent,
+                    ),
                     consumer_node_id=consumer_id,
                     consumer_field=field_name,
                 )
             )
-        for child_id in sorted(child_ids, key=_node_sort_key):
-            walk_selector(child_id, next_path)
-
-    for root in selector_roots:
-        walk_selector(root, ())
-    if selector_ids and not selector_roots:
-        raise GraphTopologyError("LoRA selector cycle has no root")
 
     chains_by_consumer: dict[tuple[str, str], list[_LoraChain]] = defaultdict(list)
     for chain in chains:

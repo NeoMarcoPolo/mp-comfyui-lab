@@ -528,36 +528,100 @@ def _dag_signature_partition(
     )
 
 
-def _are_exact_twins(
-    left: str,
-    right: str,
-    node_ids: tuple[str, ...],
+def _proven_exact_twin_classes(
+    partition: tuple[tuple[str, ...], ...],
+    bases: Mapping[str, dict[str, Any]],
+    incoming: Mapping[str, tuple[tuple[str, int, str], ...]],
+    outgoing: Mapping[str, tuple[tuple[str, int, str], ...]],
     adjacency: Mapping[tuple[str, str], tuple[tuple[str, int], ...]],
-) -> bool:
-    if adjacency.get((left, left), ()) != adjacency.get((right, right), ()):
-        return False
-    if adjacency.get((left, right), ()) != adjacency.get((right, left), ()):
-        return False
-    for other in node_ids:
-        if other in {left, right}:
+) -> dict[str, int]:
+    colors = {
+        node_id: color
+        for color, cell in enumerate(partition)
+        for node_id in cell
+    }
+    twin_classes: dict[str, int] = {}
+    next_class = 0
+    for cell in partition:
+        if len(cell) < 2:
             continue
-        if adjacency.get((left, other), ()) != adjacency.get((right, other), ()):
-            return False
-        if adjacency.get((other, left), ()) != adjacency.get((other, right), ()):
-            return False
-    return True
+        cell_nodes = frozenset(cell)
+        candidates: dict[tuple[Any, ...], list[str]] = defaultdict(list)
+        for node_id in cell:
+            signature = (
+                _canonical_json(bases[node_id]),
+                adjacency.get((node_id, node_id), ()),
+                tuple(
+                    (colors[source_id], source_id, field, output_index)
+                    for field, output_index, source_id in incoming[node_id]
+                    if source_id not in cell_nodes
+                ),
+                tuple(
+                    (colors[target_id], target_id, field, output_index)
+                    for field, output_index, target_id in outgoing[node_id]
+                    if target_id not in cell_nodes
+                ),
+            )
+            candidates[signature].append(node_id)
+
+        for candidate in candidates.values():
+            if len(candidate) < 2:
+                continue
+            candidate_nodes = frozenset(candidate)
+            external_signatures: set[tuple[Any, ...]] = set()
+            internal_edges: dict[tuple[str, str], list[tuple[str, int]]] = (
+                defaultdict(list)
+            )
+            for node_id in candidate:
+                external_signatures.add(
+                    (
+                        adjacency.get((node_id, node_id), ()),
+                        tuple(
+                            (colors[source_id], source_id, field, output_index)
+                            for field, output_index, source_id in incoming[node_id]
+                            if source_id not in candidate_nodes
+                        ),
+                        tuple(
+                            (colors[target_id], target_id, field, output_index)
+                            for field, output_index, target_id in outgoing[node_id]
+                            if target_id not in candidate_nodes
+                        ),
+                    )
+                )
+                for field, output_index, target_id in outgoing[node_id]:
+                    if target_id in candidate_nodes and target_id != node_id:
+                        internal_edges[(node_id, target_id)].append(
+                            (field, output_index)
+                        )
+            if len(external_signatures) != 1:
+                continue
+            internal_values = {
+                tuple(sorted(attributes))
+                for attributes in internal_edges.values()
+            }
+            expected_internal_pairs = len(candidate) * (len(candidate) - 1)
+            if internal_edges and (
+                len(internal_edges) != expected_internal_pairs
+                or len(internal_values) != 1
+            ):
+                continue
+            for node_id in candidate:
+                twin_classes[node_id] = next_class
+            next_class += 1
+    return twin_classes
 
 
 def _collapse_exact_twin_cells(
     partition: tuple[tuple[str, ...], ...],
-    node_ids: tuple[str, ...],
-    adjacency: Mapping[tuple[str, str], tuple[tuple[str, int], ...]],
+    twin_classes: Mapping[str, int],
 ) -> tuple[tuple[str, ...], ...]:
     collapsed: list[tuple[str, ...]] = []
     for cell in partition:
-        if len(cell) > 1 and all(
-            _are_exact_twins(cell[0], node_id, node_ids, adjacency)
-            for node_id in cell[1:]
+        first_class = twin_classes.get(cell[0])
+        if (
+            len(cell) > 1
+            and first_class is not None
+            and all(twin_classes.get(node_id) == first_class for node_id in cell)
         ):
             collapsed.extend((node_id,) for node_id in sorted(cell))
         else:
@@ -567,17 +631,17 @@ def _collapse_exact_twin_cells(
 
 def _branch_representatives(
     cell: tuple[str, ...],
-    node_ids: tuple[str, ...],
-    adjacency: Mapping[tuple[str, str], tuple[tuple[str, int], ...]],
+    twin_classes: Mapping[str, int],
 ) -> tuple[str, ...]:
     representatives: list[str] = []
+    represented_classes: set[int] = set()
     for node_id in sorted(cell):
-        if any(
-            _are_exact_twins(node_id, representative, node_ids, adjacency)
-            for representative in representatives
-        ):
+        twin_class = twin_classes.get(node_id)
+        if twin_class is not None and twin_class in represented_classes:
             continue
         representatives.append(node_id)
+        if twin_class is not None:
+            represented_classes.add(twin_class)
     return tuple(representatives)
 
 
@@ -685,7 +749,14 @@ def _canonicalize_topology(
             raise CapabilityCanonicalizationError(
                 "capability canonicalization state bound exceeded"
             )
-        partition = _collapse_exact_twin_cells(partition, node_ids, adjacency)
+        twin_classes = _proven_exact_twin_classes(
+            partition,
+            bases,
+            incoming,
+            outgoing,
+            adjacency,
+        )
+        partition = _collapse_exact_twin_cells(partition, twin_classes)
         unresolved = next(
             (
                 (index, cell)
@@ -706,7 +777,7 @@ def _canonicalize_topology(
             continue
 
         cell_index, cell = unresolved
-        representatives = _branch_representatives(cell, node_ids, adjacency)
+        representatives = _branch_representatives(cell, twin_classes)
         if len(representatives) > _MAX_INDIVIDUALIZATION_BRANCHES:
             raise CapabilityCanonicalizationError(
                 "capability canonicalization branch bound exceeded"

@@ -162,6 +162,11 @@ class NormalizedNode(_FrozenModel):
     def validate_inputs_before_freezing(cls, value: Any) -> Any:
         return validate_serializable_json(value, "normalized node inputs")
 
+    @field_validator("input_links", mode="before")
+    @classmethod
+    def validate_input_links_before_freezing(cls, value: Any) -> Any:
+        return validate_serializable_json(value, "normalized node input links")
+
     @field_validator("input_links")
     @classmethod
     def validate_input_links(cls, links: FrozenJsonObject) -> FrozenJsonObject:

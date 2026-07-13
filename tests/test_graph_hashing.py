@@ -1,5 +1,6 @@
 import copy
 import hashlib
+from itertools import permutations, product
 import json
 import math
 from pathlib import Path
@@ -8,6 +9,7 @@ from time import perf_counter
 import pytest
 
 import mp_comfyui_lab.graph.hashing as graph_hashing
+from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.hashing import (
     capability_hash,
     exact_run_hash,
@@ -16,6 +18,7 @@ from mp_comfyui_lab.graph.hashing import (
 )
 from mp_comfyui_lab.graph.normalize import (
     GraphNormalizationError,
+    GraphTopologyError,
     GraphValidationError,
     normalize_graph,
 )
@@ -105,6 +108,27 @@ def _edge_colored_bipartite_graph(permutation: tuple[int, ...]) -> dict:
     return graph
 
 
+def _functional_graph(predecessors: tuple[int, ...]) -> dict:
+    return {
+        f"node-{target}": {
+            "class_type": "FunctionalNode",
+            "inputs": {"edge": [f"node-{source}", 0]},
+        }
+        for target, source in enumerate(predecessors)
+    }
+
+
+def _brute_functional_certificate(predecessors: tuple[int, ...]) -> tuple[int, ...]:
+    certificates = []
+    for order in permutations(range(len(predecessors))):
+        position = {old_id: new_id for new_id, old_id in enumerate(order)}
+        renumbered = [0] * len(predecessors)
+        for old_target, old_source in enumerate(predecessors):
+            renumbered[position[old_target]] = position[old_source]
+        certificates.append(tuple(renumbered))
+    return min(certificates)
+
+
 def _power_lora_graph(strength: object = 1.0) -> dict:
     return {
         "loader": {
@@ -181,6 +205,16 @@ def _homogeneous_chain(node_count: int) -> dict:
     return graph
 
 
+def _homogeneous_isolated_twins(node_count: int) -> dict:
+    return {
+        f"twin-{index}": {
+            "class_type": "HomogeneousTwin",
+            "inputs": {},
+        }
+        for index in range(node_count)
+    }
+
+
 def _wan_selector_graph(second_strength: float = 1.0) -> dict:
     return {
         "first": {
@@ -207,6 +241,61 @@ def _wan_selector_graph(second_strength: float = 1.0) -> dict:
             "inputs": {"model": ["loader", 0], "seed": 1},
         },
     }
+
+
+def _deep_lora_chain(kind: str, lora_count: int) -> dict:
+    if kind == "transform":
+        graph = {
+            "loader": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": "base.safetensors"},
+            }
+        }
+        parent = "loader"
+        for index in range(lora_count):
+            node_id = f"lora-{index}"
+            graph[node_id] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {
+                    "model": [parent, 0],
+                    "lora_name": "shared-style.safetensors",
+                    "strength_model": 1.0,
+                },
+            }
+            parent = node_id
+        graph["sampler"] = {
+            "class_type": "KSampler",
+            "inputs": {"model": [parent, 0], "seed": 1},
+        }
+        return graph
+
+    graph = {}
+    parent = None
+    for index in range(lora_count):
+        node_id = f"lora-{index}"
+        inputs = {
+            "lora": "shared-style.safetensors",
+            "strength": 1.0,
+        }
+        if parent is not None:
+            inputs["prev_lora"] = [parent, 0]
+        graph[node_id] = {
+            "class_type": "WanVideoLoraSelect",
+            "inputs": inputs,
+        }
+        parent = node_id
+    graph["loader"] = {
+        "class_type": "WanVideoModelLoader",
+        "inputs": {
+            "model_name": "wan.safetensors",
+            "lora": [parent, 0],
+        },
+    }
+    graph["sampler"] = {
+        "class_type": "WanVideoSampler",
+        "inputs": {"model": ["loader", 0], "seed": 1},
+    }
+    return graph
 
 
 def test_source_graph_hash_is_compact_sorted_utf8_sha256_without_meta() -> None:
@@ -603,6 +692,17 @@ def test_exact_canonicalization_distinguishes_eight_node_wl_collision() -> None:
     assert capability_hash(_renumber_graph(connected_cycle)) == connected_hash
 
 
+def test_exact_canonicalization_matches_exhaustive_three_node_oracle() -> None:
+    hashes_by_certificate = {}
+    certificates_by_hash = {}
+    for predecessors in product(range(3), repeat=3):
+        certificate = _brute_functional_certificate(predecessors)
+        digest = capability_hash(_functional_graph(predecessors))
+
+        assert hashes_by_certificate.setdefault(certificate, digest) == digest
+        assert certificates_by_hash.setdefault(digest, certificate) == certificate
+
+
 def test_symmetric_canonicalization_exceeding_bound_fails_closed() -> None:
     assert hasattr(graph_hashing, "GraphHashError")
     assert hasattr(graph_hashing, "CapabilityCanonicalizationError")
@@ -629,6 +729,45 @@ def test_dag_canonicalization_scales_for_homogeneous_chains_through_4096_nodes()
     assert durations[800] < 8.0
     assert durations[4_096] < 15.0
     assert durations[4_096] <= durations[400] * 30 + 1.0
+
+
+def test_exact_twin_canonicalization_scales_for_4096_isolated_nodes() -> None:
+    graph = _homogeneous_isolated_twins(4_096)
+    started = perf_counter()
+
+    digest = capability_hash(graph)
+    duration = perf_counter() - started
+
+    assert duration < 6.0
+    assert capability_hash(_renumber_graph(graph)) == digest
+
+
+@pytest.mark.parametrize("kind", ["transform", "selector"])
+def test_deep_lora_chains_normalize_and_hash_near_linearly(kind) -> None:
+    durations = {}
+    for lora_count in (1_000, 4_000):
+        graph = _deep_lora_chain(kind, lora_count)
+        started = perf_counter()
+
+        normalized = normalize_graph(graph)
+        digest = capability_hash(graph)
+
+        durations[lora_count] = perf_counter() - started
+        assert len(normalized.bindings(SemanticRole.LORA)) == lora_count
+        assert len(digest) == 64
+
+    assert durations[4_000] < 20.0
+    assert durations[4_000] <= durations[1_000] * 8 + 1.0
+
+
+@pytest.mark.parametrize("kind", ["transform", "selector"])
+def test_deep_lora_cycle_near_tail_fails_with_topology_error(kind) -> None:
+    graph = _deep_lora_chain(kind, 1_000)
+    parent_field = "model" if kind == "transform" else "prev_lora"
+    graph["lora-998"]["inputs"][parent_field] = ["lora-999", 0]
+
+    with pytest.raises(GraphTopologyError, match="LoRA.*cycle"):
+        normalize_graph(graph)
 
 
 def test_hashes_accept_repo_frozen_json_graphs(qwen_graph) -> None:
