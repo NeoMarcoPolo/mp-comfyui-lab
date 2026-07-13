@@ -129,6 +129,86 @@ def _power_lora_graph(strength: object = 1.0) -> dict:
     }
 
 
+def _independent_lora_branches() -> dict:
+    return {
+        "high_loader": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": "high.safetensors"},
+        },
+        "low_loader": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": "low.safetensors"},
+        },
+        "high_lora": {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": ["high_loader", 0],
+                "lora_name": "high-lora.safetensors",
+                "strength_model": 1.0,
+            },
+        },
+        "low_lora": {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": ["low_loader", 0],
+                "lora_name": "low-lora.safetensors",
+                "strength_model": 1.0,
+            },
+        },
+        "high_sampler": {
+            "class_type": "KSampler",
+            "inputs": {"model": ["high_lora", 0], "seed": 1},
+        },
+        "low_sampler": {
+            "class_type": "KSampler",
+            "inputs": {"model": ["low_lora", 0], "seed": 2},
+        },
+    }
+
+
+def _homogeneous_chain(node_count: int) -> dict:
+    graph = {
+        "node-0": {
+            "class_type": "HomogeneousChainNode",
+            "inputs": {},
+        }
+    }
+    for index in range(1, node_count):
+        graph[f"node-{index}"] = {
+            "class_type": "HomogeneousChainNode",
+            "inputs": {"input": [f"node-{index - 1}", 0]},
+        }
+    return graph
+
+
+def _wan_selector_graph(second_strength: float = 1.0) -> dict:
+    return {
+        "first": {
+            "class_type": "WanVideoLoraSelect",
+            "inputs": {"lora": "first.safetensors", "strength": 0.6},
+        },
+        "second": {
+            "class_type": "WanVideoLoraSelect",
+            "inputs": {
+                "lora": "second.safetensors",
+                "strength": second_strength,
+                "prev_lora": ["first", 0],
+            },
+        },
+        "loader": {
+            "class_type": "WanVideoModelLoader",
+            "inputs": {
+                "model_name": "wan.safetensors",
+                "lora": ["second", 0],
+            },
+        },
+        "sampler": {
+            "class_type": "WanVideoSampler",
+            "inputs": {"model": ["loader", 0], "seed": 1},
+        },
+    }
+
+
 def test_source_graph_hash_is_compact_sorted_utf8_sha256_without_meta() -> None:
     graph = {
         "节点": {
@@ -528,24 +608,18 @@ def test_symmetric_canonicalization_exceeding_bound_fails_closed() -> None:
     assert hasattr(graph_hashing, "CapabilityCanonicalizationError")
     error_type = graph_hashing.CapabilityCanonicalizationError
     assert issubclass(error_type, graph_hashing.GraphHashError)
-    symmetric = _edge_colored_bipartite_graph(
-        tuple(range(1, 13)) + (0,)
-    )
+    symmetric = _edge_colored_bipartite_graph(tuple(range(1, 12)) + (0,))
 
+    started = perf_counter()
     with pytest.raises(error_type, match="canonicalization.*bound"):
         capability_hash(symmetric)
+    assert perf_counter() - started < 3.0
 
 
-def test_canonicalization_performance_scales_for_100_400_800_nodes() -> None:
+def test_dag_canonicalization_scales_for_homogeneous_chains_through_4096_nodes() -> None:
     durations = {}
-    for node_count in (100, 400, 800):
-        graph = {
-            f"node-{index}": {
-                "class_type": "UniqueCapabilityNode",
-                "inputs": {"ordinal": index},
-            }
-            for index in range(node_count)
-        }
+    for node_count in (100, 400, 800, 4_096):
+        graph = _homogeneous_chain(node_count)
         started = perf_counter()
         capability_hash(graph)
         durations[node_count] = perf_counter() - started
@@ -553,7 +627,8 @@ def test_canonicalization_performance_scales_for_100_400_800_nodes() -> None:
     assert durations[100] < 2.0
     assert durations[400] < 4.0
     assert durations[800] < 8.0
-    assert durations[800] <= durations[100] * 30 + 0.5
+    assert durations[4_096] < 15.0
+    assert durations[4_096] <= durations[400] * 30 + 1.0
 
 
 def test_hashes_accept_repo_frozen_json_graphs(qwen_graph) -> None:
@@ -764,6 +839,62 @@ def test_power_lora_nested_strength_uses_stable_bucket() -> None:
 
     assert capability_hash(same_bucket) == capability_hash(baseline)
     assert capability_hash(different_bucket) != capability_hash(baseline)
+
+
+def test_disabled_power_lora_slot_is_absent_from_capability_projection() -> None:
+    baseline = _power_lora_graph()
+    baseline["power"]["inputs"]["lora_2"] = {
+        "on": False,
+        "lora": "disabled-one.safetensors",
+        "strength": 0.2,
+    }
+    renamed = copy.deepcopy(baseline)
+    renamed["power"]["inputs"]["lora_2"] = {
+        "on": False,
+        "lora": "disabled-two.safetensors",
+        "strength": 8.0,
+    }
+    enabled = copy.deepcopy(renamed)
+    enabled["power"]["inputs"]["lora_2"]["on"] = True
+
+    assert capability_hash(renamed) == capability_hash(baseline)
+    assert capability_hash(enabled) != capability_hash(baseline)
+
+    projection = graph_hashing._capability_projection(normalize_graph(baseline))
+    serialized = json.dumps(projection, sort_keys=True)
+    assert "disabled-one.safetensors" not in serialized
+    assert '"lora_2"' not in serialized
+
+
+def test_capability_groups_independent_lora_branches_by_consumer_topology() -> None:
+    graph = _independent_lora_branches()
+    projection = graph_hashing._capability_projection(normalize_graph(graph))
+
+    assert sorted(
+        branch["chain"][0]["identity"] for branch in projection["loras"]
+    ) == ["high-lora.safetensors", "low-lora.safetensors"]
+    assert all("consumer_topology" in branch for branch in projection["loras"])
+    assert capability_hash(_renumber_graph(graph)) == capability_hash(graph)
+
+    changed = copy.deepcopy(graph)
+    changed["low_lora"]["inputs"]["lora_name"] = "other-low.safetensors"
+    assert capability_hash(changed) != capability_hash(graph)
+
+
+def test_wan_selector_capability_preserves_order_and_strength_buckets() -> None:
+    baseline = _wan_selector_graph(1.0)
+    same_bucket = _wan_selector_graph(0.9)
+    different_bucket = _wan_selector_graph(0.7)
+    reversed_identities = copy.deepcopy(baseline)
+    reversed_identities["first"]["inputs"]["lora"] = "second.safetensors"
+    reversed_identities["second"]["inputs"]["lora"] = "first.safetensors"
+
+    digest = capability_hash(baseline)
+
+    assert capability_hash(_renumber_graph(baseline)) == digest
+    assert capability_hash(same_bucket) == digest
+    assert capability_hash(different_bucket) != digest
+    assert capability_hash(reversed_identities) != digest
 
 
 def test_boolean_strength_field_is_preserved_without_numeric_bucketing() -> None:

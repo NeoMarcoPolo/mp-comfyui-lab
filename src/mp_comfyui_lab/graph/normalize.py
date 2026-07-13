@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import unicodedata
 from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import dataclass
 from math import isfinite
 import re
 from typing import Any
@@ -10,6 +12,8 @@ from typing import Any
 from pydantic import ValidationError
 
 from mp_comfyui_lab.graph.models import (
+    MAX_SERIALIZABLE_JSON_DEPTH,
+    MAX_SERIALIZABLE_JSON_VALUES,
     NormalizedGraph,
     NormalizedNode,
     RoleBinding,
@@ -17,7 +21,7 @@ from mp_comfyui_lab.graph.models import (
     SemanticRole,
     strength_bucket,
 )
-from mp_comfyui_lab.json_types import FrozenDict
+from mp_comfyui_lab.json_types import FrozenDict, thaw_json
 
 
 class GraphNormalizationError(ValueError):
@@ -40,15 +44,6 @@ _MODEL_NAME_FIELDS = (
     "unet_name",
 )
 _LORA_NAME_FIELDS = ("lora_name", "lora_file", "lora")
-_MODEL_LINK_FIELDS = ("model", "unet")
-_PROMPT_FIELDS = (
-    "prompt",
-    "text",
-    "value",
-    "promptLine",
-    "positive_prompt",
-    "negative_prompt",
-)
 _REFERENCE_FIELDS = ("image", "image_name", "filename", "path")
 _SEED_FIELDS = ("noise_seed", "random_seed", "seed")
 _DIMENSION_FIELDS = ("height", "width")
@@ -65,9 +60,16 @@ _LITERAL_COLLECTION_FIELDS = frozenset(
     }
 )
 _POWER_LORA_SLOT = re.compile(r"^lora_(\d+)$", re.IGNORECASE)
+_PROMPT_FIELD_KEYS = frozenset(
+    {"negativeprompt", "positiveprompt", "prompt", "promptline", "text", "value"}
+)
+_SELECTOR_PARENT_FIELDS = frozenset(
+    {"lorastack", "previouslora", "prevlora"}
+)
+_SELECTOR_FLOW_FIELDS = _SELECTOR_PARENT_FIELDS | {"lora", "loras"}
 _MAX_GRAPH_NODES = 4_096
-_MAX_JSON_DEPTH = 256
-_MAX_JSON_VALUES = 100_000
+_MAX_JSON_DEPTH = MAX_SERIALIZABLE_JSON_DEPTH
+_MAX_JSON_VALUES = MAX_SERIALIZABLE_JSON_VALUES
 
 
 def _node_sort_key(node_id: str) -> tuple[int, int, str, str]:
@@ -100,7 +102,14 @@ def _validate_identifier(value: str, path: str) -> None:
         raise GraphValidationError(f"{path} must not contain control characters")
 
 
-def _validate_json(value: Any, path: str, *, allow_frozen: bool) -> None:
+def _validate_json(
+    value: Any,
+    path: str,
+    *,
+    allow_frozen: bool,
+    depth_limit: int | None = None,
+) -> None:
+    effective_depth_limit = _MAX_JSON_DEPTH if depth_limit is None else depth_limit
     stack = [(value, path, 0)]
     value_count = 0
     while stack:
@@ -110,9 +119,9 @@ def _validate_json(value: Any, path: str, *, allow_frozen: bool) -> None:
             raise GraphValidationError(
                 f"graph JSON value limit of {_MAX_JSON_VALUES} exceeded"
             )
-        if depth > _MAX_JSON_DEPTH:
+        if depth > effective_depth_limit:
             raise GraphValidationError(
-                f"graph JSON depth limit of {_MAX_JSON_DEPTH} exceeded"
+                f"graph JSON depth limit of {effective_depth_limit} exceeded"
             )
         if item is None or isinstance(item, (bool, int)):
             continue
@@ -167,6 +176,11 @@ def semantic_graph_projection(graph: Any) -> dict[str, Any]:
         if not isinstance(node_id, str):
             raise GraphValidationError("graph node IDs must be strings")
         if node_id == "_meta":
+            _validate_json(
+                node,
+                "graph._meta",
+                allow_frozen=isinstance(graph, FrozenDict),
+            )
             continue
         node_count += 1
         if node_count > _MAX_GRAPH_NODES:
@@ -182,6 +196,18 @@ def semantic_graph_projection(graph: Any) -> dict[str, Any]:
             raise GraphValidationError("graph node IDs must not be blank")
         if not isinstance(node, Mapping):
             raise GraphValidationError(f"node '{node_id}' must be an object")
+        for node_field, node_value in node.items():
+            if not isinstance(node_field, str):
+                raise GraphValidationError(
+                    f"node '{node_id}' object keys must be strings"
+                )
+            _validate_unicode(node_field, f"node '{node_id}' object key")
+            if node_field not in {"class_type", "inputs"}:
+                _validate_json(
+                    node_value,
+                    f"node '{node_id}'.{node_field}",
+                    allow_frozen=isinstance(graph, FrozenDict),
+                )
         if "class_type" not in node:
             raise GraphValidationError(f"node '{node_id}' requires class_type")
         class_type = node["class_type"]
@@ -201,11 +227,20 @@ def semantic_graph_projection(graph: Any) -> dict[str, Any]:
             )
         for field_name in inputs:
             _validate_identifier(field_name, f"node '{node_id}' input name")
+        _validate_json(
+            inputs,
+            f"node '{node_id}' inputs",
+            allow_frozen=isinstance(graph, FrozenDict),
+        )
     if node_count == 0:
         raise GraphValidationError("API graph must contain a nonempty node object")
 
-    allow_frozen = isinstance(graph, FrozenDict)
-    _validate_json(graph, "graph", allow_frozen=allow_frozen)
+    _validate_json(
+        graph,
+        "graph",
+        allow_frozen=isinstance(graph, FrozenDict),
+        depth_limit=_MAX_JSON_DEPTH + 2,
+    )
     projected = _without_meta(graph)
     return projected
 
@@ -316,6 +351,19 @@ def _is_lora_node(node: NormalizedNode) -> bool:
     )
 
 
+def _is_model_flow_field(field_name: str) -> bool:
+    canonical = _canonical_field_name(field_name)
+    return canonical in {"model", "unet"} or canonical.endswith(("model", "unet"))
+
+
+def _model_links(node: NormalizedNode) -> list[tuple[str, tuple[str, int]]]:
+    return [
+        (field_name, link)
+        for field_name, link in node.input_links.items()
+        if _is_model_flow_field(field_name)
+    ]
+
+
 def _lora_binding_sort_key(binding: RoleBinding) -> tuple[int, int, str]:
     match = _POWER_LORA_SLOT.fullmatch(binding.field_name)
     if match is not None:
@@ -324,34 +372,46 @@ def _lora_binding_sort_key(binding: RoleBinding) -> tuple[int, int, str]:
     return (1, 0, binding.field_name)
 
 
-def _lora_order(
+@dataclass(frozen=True)
+class _LoraChain:
+    bindings: tuple[RoleBinding, ...]
+    consumer_node_id: str
+    consumer_field: str
+
+
+def _lora_chains(
     nodes_by_id: Mapping[str, NormalizedNode],
     bindings: list[RoleBinding],
-) -> list[RoleBinding]:
+) -> tuple[_LoraChain, ...]:
     if not bindings:
-        return []
+        return ()
 
     bindings_by_node: dict[str, list[RoleBinding]] = defaultdict(list)
     for binding in bindings:
         bindings_by_node[binding.node_id].append(binding)
+    for node_bindings in bindings_by_node.values():
+        node_bindings.sort(key=_lora_binding_sort_key)
     lora_ids = frozenset(bindings_by_node)
-    parent_by_node: dict[str, str] = {}
+    transform_ids = frozenset(
+        node_id for node_id in lora_ids if _model_links(nodes_by_id[node_id])
+    )
+    selector_ids = lora_ids - transform_ids
 
-    for node_id in sorted(lora_ids, key=_node_sort_key):
-        node = nodes_by_id[node_id]
-        model_links = [
-            node.input_links[field_name]
-            for field_name in _MODEL_LINK_FIELDS
-            if field_name in node.input_links
-        ]
-        if len(model_links) != 1:
+    model_consumers: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for consumer in nodes_by_id.values():
+        for field_name, link in _model_links(consumer):
+            model_consumers[link[0]].append((consumer.node_id, field_name))
+
+    transform_parent: dict[str, str] = {}
+    for node_id in sorted(transform_ids, key=_node_sort_key):
+        links = _model_links(nodes_by_id[node_id])
+        if len(links) != 1:
             raise GraphTopologyError(
-                f"disconnected LoRA node '{node_id}' must have exactly one model input edge"
+                f"LoRA node '{node_id}' must have exactly one model input edge"
             )
-        source_id = model_links[0][0]
+        source_id = links[0][1][0]
         path = [node_id]
-        # Model-preserving intermediates do not break the effective LoRA chain.
-        while source_id not in lora_ids and not _is_model_loader(
+        while source_id not in transform_ids and not _is_model_loader(
             nodes_by_id[source_id]
         ):
             if source_id in path:
@@ -359,123 +419,296 @@ def _lora_order(
                 raise GraphTopologyError(
                     f"LoRA model-edge cycle detected: {' -> '.join(path)}"
                 )
+            if source_id in selector_ids:
+                raise GraphTopologyError(
+                    f"LoRA model transform '{node_id}' follows selector '{source_id}' "
+                    "through a model edge"
+                )
             path.append(source_id)
-            source = nodes_by_id[source_id]
-            upstream_links = [
-                source.input_links[field_name]
-                for field_name in _MODEL_LINK_FIELDS
-                if field_name in source.input_links
-            ]
-            if len(upstream_links) != 1:
+            upstream = _model_links(nodes_by_id[source_id])
+            if len(upstream) != 1:
                 raise GraphTopologyError(
                     f"disconnected LoRA node '{node_id}' cannot trace its model "
                     f"input through '{source_id}'"
                 )
-            source_id = upstream_links[0][0]
-        parent_by_node[node_id] = source_id
+            source_id = upstream[0][1][0]
+        transform_parent[node_id] = source_id
 
-    for start in sorted(lora_ids, key=_node_sort_key):
-        path: list[str] = []
-        cursor = start
-        while cursor in lora_ids:
-            if cursor in path:
-                cycle = path[path.index(cursor) :] + [cursor]
-                raise GraphTopologyError(f"LoRA cycle detected: {' -> '.join(cycle)}")
-            path.append(cursor)
-            cursor = parent_by_node[cursor]
+    def check_parent_cycles(parent_by_node: Mapping[str, str], kind: str) -> None:
+        for start in sorted(parent_by_node, key=_node_sort_key):
+            path: list[str] = []
+            cursor = start
+            while cursor in parent_by_node:
+                if cursor in path:
+                    cycle = path[path.index(cursor) :] + [cursor]
+                    label = (
+                        "LoRA cycle detected (model)"
+                        if kind == "model"
+                        else "LoRA selector cycle detected"
+                    )
+                    raise GraphTopologyError(
+                        f"{label}: {' -> '.join(cycle)}"
+                    )
+                path.append(cursor)
+                cursor = parent_by_node[cursor]
 
-    roots = [node_id for node_id in lora_ids if parent_by_node[node_id] not in lora_ids]
-    roots.sort(key=_node_sort_key)
-    if len(roots) != 1:
-        raise GraphTopologyError(
-            "disconnected LoRA chains: expected one model-edge root, found "
-            f"{roots}"
-        )
-    root_parent = nodes_by_id[parent_by_node[roots[0]]]
-    if not _is_model_loader(root_parent):
-        raise GraphTopologyError(
-            f"disconnected LoRA chain root '{roots[0]}' does not follow a model loader"
-        )
+    check_parent_cycles(transform_parent, "model")
 
-    children: dict[str, list[str]] = defaultdict(list)
-    for node_id, parent_id in parent_by_node.items():
-        if parent_id in lora_ids:
-            children[parent_id].append(node_id)
-    for parent_id, child_ids in children.items():
-        child_ids.sort(key=_node_sort_key)
-        if len(child_ids) > 1:
-            raise GraphTopologyError(
-                f"ambiguous LoRA branch at '{parent_id}': {child_ids}"
-            )
-
-    ordered_node_ids: list[str] = []
-    cursor: str | None = roots[0]
-    while cursor is not None:
-        ordered_node_ids.append(cursor)
-        cursor = children.get(cursor, [None])[0]
-    if len(ordered_node_ids) != len(lora_ids):
-        missing = sorted(lora_ids - set(ordered_node_ids), key=_node_sort_key)
-        raise GraphTopologyError(f"disconnected LoRA nodes: {missing}")
-
-    ordered: list[RoleBinding] = []
-    for node_id in ordered_node_ids:
-        ordered.extend(
-            sorted(bindings_by_node[node_id], key=_lora_binding_sort_key)
-        )
-
-    model_consumers: dict[str, list[str]] = defaultdict(list)
-    for consumer in nodes_by_id.values():
-        for field_name in _MODEL_LINK_FIELDS:
-            if field_name in consumer.input_links:
-                model_consumers[consumer.input_links[field_name][0]].append(
-                    consumer.node_id
-                )
-
-    def downstream_outcomes(start: str) -> tuple[set[str], set[str]]:
-        pending = [(start, frozenset({start}))]
+    def downstream_model_outcomes(
+        start: str,
+    ) -> tuple[set[str], set[tuple[str, str]]]:
+        pending = [(start, frozenset({start}), "model")]
         reached_loras: set[str] = set()
-        terminal_consumers: set[str] = set()
+        terminal_consumers: set[tuple[str, str]] = set()
         while pending:
-            cursor, path = pending.pop()
-            targets = set(model_consumers.get(cursor, []))
+            cursor, path, incoming_field = pending.pop()
+            targets = model_consumers.get(cursor, [])
             if not targets:
                 if cursor != start:
-                    terminal_consumers.add(cursor)
+                    terminal_consumers.add((cursor, incoming_field))
                 continue
-            for target in targets:
+            for target, field_name in targets:
                 if target in path:
                     raise GraphTopologyError(
                         f"LoRA downstream cycle detected after '{start}'"
                     )
-                if target in lora_ids:
+                if target in transform_ids:
                     reached_loras.add(target)
                     continue
-                pending.append((target, path | {target}))
+                pending.append((target, path | {target}, field_name))
         return reached_loras, terminal_consumers
 
-    for index, node_id in enumerate(ordered_node_ids):
-        expected_next = (
-            ordered_node_ids[index + 1]
-            if index + 1 < len(ordered_node_ids)
-            else None
-        )
-        reached_loras, terminals = downstream_outcomes(node_id)
-        if expected_next is None:
-            if reached_loras:
+    transform_outcomes = {
+        node_id: downstream_model_outcomes(node_id)
+        for node_id in transform_ids
+    }
+    for parent_id, (child_ids, _) in transform_outcomes.items():
+        for child_id in child_ids:
+            if transform_parent.get(child_id) != parent_id:
                 raise GraphTopologyError(
-                    f"LoRA '{node_id}' has competing downstream LoRA order: "
-                    f"{sorted(reached_loras, key=_node_sort_key)}"
+                    f"LoRA '{parent_id}' has competing downstream order through "
+                    f"'{child_id}'"
                 )
-            if not terminals:
-                raise GraphTopologyError(
-                    f"LoRA '{node_id}' has no downstream model consumer"
-                )
-            continue
-        if reached_loras != {expected_next} or terminals:
+        if len(child_ids) > 1 and any(
+            not any(transform_outcomes[child_id]) for child_id in child_ids
+        ):
             raise GraphTopologyError(
-                f"LoRA '{node_id}' model flow bypasses or branches around "
-                f"'{expected_next}'"
+                f"ambiguous LoRA branch at '{parent_id}': "
+                f"{sorted(child_ids, key=_node_sort_key)}"
             )
+
+    chains: list[_LoraChain] = []
+
+    def expanded_bindings(path: tuple[str, ...]) -> tuple[RoleBinding, ...]:
+        return tuple(
+            binding
+            for node_id in path
+            for binding in bindings_by_node[node_id]
+        )
+
+    transform_roots = sorted(
+        (
+            node_id
+            for node_id in transform_ids
+            if transform_parent[node_id] not in transform_ids
+        ),
+        key=_node_sort_key,
+    )
+
+    def walk_transform(node_id: str, path: tuple[str, ...]) -> None:
+        child_ids, terminals = transform_outcomes[node_id]
+        if not child_ids and not terminals:
+            prefix = "disconnected LoRA chains: " if len(transform_roots) > 1 else ""
+            raise GraphTopologyError(
+                f"{prefix}LoRA '{node_id}' has no downstream model consumer"
+            )
+        next_path = path + (node_id,)
+        for consumer_id, field_name in sorted(terminals):
+            chains.append(
+                _LoraChain(
+                    bindings=expanded_bindings(next_path),
+                    consumer_node_id=consumer_id,
+                    consumer_field=field_name,
+                )
+            )
+        for child_id in sorted(child_ids, key=_node_sort_key):
+            if child_id in next_path:
+                raise GraphTopologyError(
+                    f"LoRA model cycle detected: {' -> '.join(next_path + (child_id,))}"
+                )
+            walk_transform(child_id, next_path)
+
+    for root in transform_roots:
+        walk_transform(root, ())
+
+    selector_parent: dict[str, str] = {}
+    for node_id in sorted(selector_ids, key=_node_sort_key):
+        parent_links = [
+            link
+            for field_name, link in nodes_by_id[node_id].input_links.items()
+            if _canonical_field_name(field_name) in _SELECTOR_PARENT_FIELDS
+        ]
+        if len(parent_links) > 1:
+            raise GraphTopologyError(
+                f"LoRA selector '{node_id}' has competing stack parents"
+            )
+        if parent_links:
+            parent_id = parent_links[0][0]
+            if parent_id not in selector_ids:
+                raise GraphTopologyError(
+                    f"LoRA selector '{node_id}' follows non-selector '{parent_id}'"
+                )
+            selector_parent[node_id] = parent_id
+
+    check_parent_cycles(selector_parent, "selector")
+    selector_consumers: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for consumer in nodes_by_id.values():
+        for field_name, link in consumer.input_links.items():
+            if _canonical_field_name(field_name) in _SELECTOR_FLOW_FIELDS:
+                selector_consumers[link[0]].append((consumer.node_id, field_name))
+
+    def has_downstream_model_consumer(start: str) -> bool:
+        pending = [(start, frozenset({start}))]
+        while pending:
+            cursor, path = pending.pop()
+            targets = model_consumers.get(cursor, [])
+            if not targets:
+                if cursor != start:
+                    return True
+                continue
+            for target, _ in targets:
+                if target in path:
+                    raise GraphTopologyError(
+                        f"LoRA selector downstream cycle detected after '{start}'"
+                    )
+                pending.append((target, path | {target}))
+        return False
+
+    selector_outcomes: dict[
+        str, tuple[set[str], set[tuple[str, str]]]
+    ] = {}
+    for node_id in selector_ids:
+        children: set[str] = set()
+        terminals: set[tuple[str, str]] = set()
+        for target_id, field_name in selector_consumers.get(node_id, []):
+            if target_id in selector_ids:
+                if selector_parent.get(target_id) != node_id:
+                    raise GraphTopologyError(
+                        f"LoRA selector '{node_id}' has competing order through "
+                        f"'{target_id}'"
+                    )
+                children.add(target_id)
+                continue
+            target = nodes_by_id[target_id]
+            applies_to_model = _is_model_loader(target) or bool(_model_links(target))
+            if applies_to_model and has_downstream_model_consumer(target_id):
+                terminals.add((target_id, field_name))
+        selector_outcomes[node_id] = (children, terminals)
+
+    selector_roots = sorted(
+        (node_id for node_id in selector_ids if node_id not in selector_parent),
+        key=_node_sort_key,
+    )
+
+    def walk_selector(node_id: str, path: tuple[str, ...]) -> None:
+        child_ids, terminals = selector_outcomes[node_id]
+        if not child_ids and not terminals:
+            raise GraphTopologyError(
+                f"LoRA selector '{node_id}' has no downstream model consumer"
+            )
+        next_path = path + (node_id,)
+        for consumer_id, field_name in sorted(terminals):
+            chains.append(
+                _LoraChain(
+                    bindings=expanded_bindings(next_path),
+                    consumer_node_id=consumer_id,
+                    consumer_field=field_name,
+                )
+            )
+        for child_id in sorted(child_ids, key=_node_sort_key):
+            walk_selector(child_id, next_path)
+
+    for root in selector_roots:
+        walk_selector(root, ())
+    if selector_ids and not selector_roots:
+        raise GraphTopologyError("LoRA selector cycle has no root")
+
+    chains_by_consumer: dict[tuple[str, str], list[_LoraChain]] = defaultdict(list)
+    for chain in chains:
+        chains_by_consumer[
+            (
+                chain.consumer_node_id,
+                _canonical_field_name(chain.consumer_field),
+            )
+        ].append(chain)
+    for consumer, consumer_chains in chains_by_consumer.items():
+        semantic_orders = {
+            tuple(
+                (
+                    nodes_by_id[binding.node_id].class_type,
+                    binding.field_name,
+                    json.dumps(
+                        thaw_json(binding.value),
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
+                for binding in chain.bindings
+            )
+            for chain in consumer_chains
+        }
+        if len(semantic_orders) > 1:
+            raise GraphTopologyError(
+                "competing LoRA orders reach model consumer "
+                f"'{consumer[0]}' field '{consumer[1]}'"
+            )
+
+    used = {
+        binding.node_id
+        for chain in chains
+        for binding in chain.bindings
+    }
+    if used != lora_ids:
+        missing = sorted(lora_ids - used, key=_node_sort_key)
+        raise GraphTopologyError(f"disconnected or unused LoRA nodes: {missing}")
+
+    def chain_key(chain: _LoraChain) -> tuple[Any, ...]:
+        return (
+            nodes_by_id[chain.consumer_node_id].class_type,
+            _canonical_field_name(chain.consumer_field),
+            tuple(
+                (
+                    nodes_by_id[binding.node_id].class_type,
+                    binding.field_name,
+                    json.dumps(
+                        thaw_json(binding.value),
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
+                for binding in chain.bindings
+            ),
+        )
+
+    return tuple(sorted(chains, key=chain_key))
+
+
+def _lora_order(
+    nodes_by_id: Mapping[str, NormalizedNode],
+    bindings: list[RoleBinding],
+) -> list[RoleBinding]:
+    ordered: list[RoleBinding] = []
+    seen: set[tuple[str, str]] = set()
+    for chain in _lora_chains(nodes_by_id, bindings):
+        for binding in chain.bindings:
+            key = (binding.node_id, binding.field_name)
+            if key not in seen:
+                seen.add(key)
+                ordered.append(binding)
     return ordered
 
 
@@ -540,11 +773,28 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
         elif _is_lora_node(node):
             for field_name in _LORA_NAME_FIELDS:
                 if _is_literal(node, field_name) and _nonblank_string(node.inputs[field_name]):
+                    value: Any = node.inputs[field_name]
+                    if not _model_links(node):
+                        selector_value: dict[str, Any] = {"name": value}
+                        for strength_field, strength in node.inputs.items():
+                            if not _canonical_field_name(strength_field).startswith(
+                                "strength"
+                            ):
+                                continue
+                            if isinstance(strength, (int, float)) and not isinstance(
+                                strength, bool
+                            ):
+                                selector_value[f"{strength_field}_bucket"] = (
+                                    strength_bucket(strength)
+                                )
+                            elif isinstance(strength, bool):
+                                selector_value[strength_field] = strength
+                        value = selector_value
                     grouped[SemanticRole.LORA].append(
                         _binding(
                             node,
                             field_name,
-                            node.inputs[field_name],
+                            value,
                             0.99,
                             f"{node.class_type} exposes LoRA input '{field_name}'",
                         )
@@ -554,7 +804,12 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
             token in compact
             for token in ("cliptext", "conditioning", "llm", "prompt", "string", "text")
         )
-        for field_name in _PROMPT_FIELDS:
+        prompt_fields = [
+            field_name
+            for field_name in node.inputs
+            if _canonical_field_name(field_name) in _PROMPT_FIELD_KEYS
+        ]
+        for field_name in prompt_fields:
             if not _is_literal(node, field_name):
                 continue
             value = node.inputs[field_name]
@@ -564,7 +819,7 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
                 (consumer, consumer_field)
                 for consumer, consumer_field in consumers[node.node_id]
                 if _canonical_field_name(consumer_field)
-                in {"prompt", "promptline", "text", "value"}
+                in _PROMPT_FIELD_KEYS
                 and any(
                     token in _compact_class(consumer.class_type)
                     for token in (
@@ -577,7 +832,7 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
                 )
             ]
             if (
-                field_name.casefold() not in {"prompt", "text"}
+                _canonical_field_name(field_name) not in {"prompt", "text"}
                 and not textish
                 and not prompt_consumers
             ):
@@ -586,7 +841,7 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
                 0.97
                 if prompt_consumers
                 else 0.95
-                if field_name.casefold() in {"prompt", "text"}
+                if _canonical_field_name(field_name) in {"prompt", "text"}
                 else 0.86
             )
             reason = (
@@ -605,7 +860,9 @@ def _role_bindings(nodes: tuple[NormalizedNode, ...]) -> tuple[RoleBindings, ...
             )
 
         linked_prompt_fields = [
-            field_name for field_name in _PROMPT_FIELDS if field_name in node.input_links
+            field_name
+            for field_name in node.input_links
+            if _canonical_field_name(field_name) in _PROMPT_FIELD_KEYS
         ]
         if "promptline" in compact or (textish and linked_prompt_fields):
             field_name = linked_prompt_fields[0] if linked_prompt_fields else "$class_type"

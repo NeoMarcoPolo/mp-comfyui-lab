@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unicodedata
+from collections.abc import Mapping
 from enum import StrEnum
 from math import isfinite
 from typing import Annotated, Any
@@ -34,6 +35,8 @@ _STRENGTH_LIMITS = (
     (1.25, "standard"),
     (2.0, "strong"),
 )
+MAX_SERIALIZABLE_JSON_DEPTH = 48
+MAX_SERIALIZABLE_JSON_VALUES = 100_000
 
 
 def strength_bucket(value: Any) -> str:
@@ -58,6 +61,52 @@ def _validate_node_id(value: Any) -> str:
         raise ValueError("node ID must not have leading or trailing whitespace")
     if any(unicodedata.category(character).startswith("C") for character in value):
         raise ValueError("node ID must not contain control or surrogate characters")
+    return value
+
+
+def validate_serializable_json(
+    value: Any,
+    path: str,
+    *,
+    max_depth: int = MAX_SERIALIZABLE_JSON_DEPTH,
+    max_values: int = MAX_SERIALIZABLE_JSON_VALUES,
+) -> Any:
+    stack = [(value, path, 0)]
+    value_count = 0
+    while stack:
+        item, item_path, depth = stack.pop()
+        value_count += 1
+        if value_count > max_values:
+            raise ValueError(f"JSON value limit of {max_values} exceeded")
+        if depth > max_depth:
+            raise ValueError(f"JSON depth limit of {max_depth} exceeded")
+        if item is None or isinstance(item, (bool, int)):
+            continue
+        if isinstance(item, str):
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in item):
+                raise ValueError(f"{item_path} contains a lone UTF-16 surrogate")
+            continue
+        if isinstance(item, float):
+            if not isfinite(item):
+                raise ValueError(f"{item_path} JSON numbers must be finite")
+            continue
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{item_path} object keys must be strings")
+                if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
+                    raise ValueError(
+                        f"{item_path} object key contains a lone UTF-16 surrogate"
+                    )
+                stack.append((nested, f"{item_path}.{key}", depth + 1))
+            continue
+        if isinstance(item, (list, tuple)):
+            for index, nested in enumerate(item):
+                stack.append((nested, f"{item_path}[{index}]", depth + 1))
+            continue
+        raise ValueError(
+            f"{item_path} has unsupported JSON value type {type(item).__name__}"
+        )
     return value
 
 
@@ -108,6 +157,11 @@ class NormalizedNode(_FrozenModel):
     inputs: FrozenJsonObject
     input_links: FrozenJsonObject
 
+    @field_validator("inputs", mode="before")
+    @classmethod
+    def validate_inputs_before_freezing(cls, value: Any) -> Any:
+        return validate_serializable_json(value, "normalized node inputs")
+
     @field_validator("input_links")
     @classmethod
     def validate_input_links(cls, links: FrozenJsonObject) -> FrozenJsonObject:
@@ -134,6 +188,11 @@ class RoleBinding(_FrozenModel):
     value: FrozenJsonValue
     confidence: float = Field(ge=0.0, le=1.0)
     reason: NonBlankStr
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def validate_value_before_freezing(cls, value: Any) -> Any:
+        return validate_serializable_json(value, "role binding value")
 
 
 class RoleBindings(_FrozenModel):

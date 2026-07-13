@@ -5,6 +5,7 @@ from pathlib import Path
 from pydantic import ValidationError
 import pytest
 
+import mp_comfyui_lab.graph.models as graph_models
 import mp_comfyui_lab.graph.normalize as graph_normalize
 from mp_comfyui_lab.graph.models import (
     AmbiguousRoleError,
@@ -58,6 +59,14 @@ def _lora_graph() -> dict:
         ),
         "output": _node("SaveImage", images=["sampler", 0], filename_prefix="x"),
     }
+
+
+def _nested_json(depth: int) -> dict:
+    value: object = "leaf"
+    for _ in range(depth):
+        value = {"nested": value}
+    assert isinstance(value, dict)
+    return value
 
 
 def test_qwen_graph_detects_golden_roles_in_topology_order(qwen_graph) -> None:
@@ -386,6 +395,30 @@ def test_primitive_literal_feeding_text_encoder_is_prompt_source() -> None:
     assert "consumer" in binding.reason
 
 
+@pytest.mark.parametrize(
+    "consumer_field",
+    ["positive_prompt", "negative_prompt", "Positive Prompt"],
+)
+def test_primitive_prompt_source_and_fanout_follow_normalized_linked_prompt_fields(
+    consumer_field,
+) -> None:
+    source = {
+        "source": _node("PrimitiveNode", value="portrait of a traveler"),
+        "consumer": _node(
+            "CLIPTextEncode",
+            **{consumer_field: ["source", 0]},
+        ),
+    }
+
+    graph = normalize_graph(source)
+
+    assert graph.require_one(SemanticRole.PROMPT_SOURCE).node_id == "source"
+    assert any(
+        binding.node_id == "consumer" and binding.field_name == consumer_field
+        for binding in graph.bindings(SemanticRole.PROMPT_FANOUT)
+    )
+
+
 def test_class_only_scheduler_node_gets_scheduler_binding() -> None:
     graph = normalize_graph({"schedule": _node("KarrasScheduler", steps=24)})
 
@@ -646,6 +679,143 @@ def test_final_lora_fanout_to_multiple_model_consumers_is_valid() -> None:
     ]
 
 
+def test_wan_video_selector_chain_follows_prev_lora_into_model_loader() -> None:
+    graph = normalize_graph(
+        {
+            "first": _node(
+                "WanVideoLoraSelect",
+                lora="first.safetensors",
+                strength=0.6,
+            ),
+            "second": _node(
+                "WanVideoLoraSelect",
+                lora="second.safetensors",
+                strength=1.0,
+                prev_lora=["first", 0],
+            ),
+            "loader": _node(
+                "WanVideoModelLoader",
+                model_name="wan.safetensors",
+                lora=["second", 0],
+            ),
+            "sampler": _node("WanVideoSampler", model=["loader", 0], seed=1),
+        }
+    )
+
+    assert [
+        (binding.value["name"], binding.value["strength_bucket"])
+        for binding in graph.bindings(SemanticRole.LORA)
+    ] == [
+        ("first.safetensors", "positive_light"),
+        ("second.safetensors", "positive_standard"),
+    ]
+
+
+def test_wan_video_selector_can_feed_model_transform_node() -> None:
+    graph = normalize_graph(
+        {
+            "loader": _node("UNETLoader", unet_name="base.safetensors"),
+            "selector": _node(
+                "WanVideoLoraSelect",
+                lora="motion.safetensors",
+                strength=1.0,
+            ),
+            "apply": _node(
+                "WanVideoSetLoRAs",
+                model=["loader", 0],
+                lora=["selector", 0],
+            ),
+            "sampler": _node("WanVideoSampler", model=["apply", 0], seed=1),
+        }
+    )
+
+    binding = graph.bindings(SemanticRole.LORA)[0]
+    assert binding.value["name"] == "motion.safetensors"
+
+
+def test_independent_model_lora_branches_are_valid_without_total_order() -> None:
+    graph = normalize_graph(
+        {
+            "high_loader": _node("UNETLoader", unet_name="high.safetensors"),
+            "low_loader": _node("UNETLoader", unet_name="low.safetensors"),
+            "high_lora": _node(
+                "LoraLoaderModelOnly",
+                model=["high_loader", 0],
+                lora_name="high-lora.safetensors",
+                strength_model=1.0,
+            ),
+            "low_lora": _node(
+                "LoraLoaderModelOnly",
+                model=["low_loader", 0],
+                lora_name="low-lora.safetensors",
+                strength_model=1.0,
+            ),
+            "high_sampler": _node("KSampler", model=["high_lora", 0], seed=1),
+            "low_sampler": _node("KSampler", model=["low_lora", 0], seed=2),
+        }
+    )
+
+    assert {binding.value for binding in graph.bindings(SemanticRole.LORA)} == {
+        "high-lora.safetensors",
+        "low-lora.safetensors",
+    }
+
+
+def test_lora_branches_with_competing_orders_merging_to_one_channel_are_rejected() -> None:
+    graph = {
+        "loader": _node("UNETLoader", unet_name="base.safetensors"),
+        "root": _node(
+            "LoraLoaderModelOnly",
+            model=["loader", 0],
+            lora_name="root.safetensors",
+            strength_model=1.0,
+        ),
+        "left": _node(
+            "LoraLoaderModelOnly",
+            model=["root", 0],
+            lora_name="left.safetensors",
+            strength_model=1.0,
+        ),
+        "right": _node(
+            "LoraLoaderModelOnly",
+            model=["root", 0],
+            lora_name="right.safetensors",
+            strength_model=1.0,
+        ),
+        "merge": _node(
+            "ModelMerge",
+            model=["left", 0],
+            unet=["right", 0],
+        ),
+        "sampler": _node("KSampler", model=["merge", 0], seed=1),
+    }
+
+    with pytest.raises(GraphTopologyError, match="competing LoRA orders"):
+        normalize_graph(graph)
+
+
+@pytest.mark.parametrize("mode", ["unused", "cycle"])
+def test_invalid_wan_selector_stacks_are_rejected(mode) -> None:
+    graph = {
+        "first": _node(
+            "WanVideoLoraSelect",
+            lora="first.safetensors",
+            strength=1.0,
+        ),
+        "second": _node(
+            "WanVideoLoraSelect",
+            lora="second.safetensors",
+            strength=1.0,
+            prev_lora=["first", 0],
+        ),
+    }
+    if mode == "cycle":
+        graph["first"]["inputs"]["prev_lora"] = ["second", 0]
+
+    with pytest.raises(GraphTopologyError, match="LoRA.*(consumer|cycle|unused)"):
+        normalize_graph(graph)
+
+
 @pytest.mark.parametrize("node_id", [" 1", "1 ", "1\x00", "1\ud800"])
 def test_node_ids_are_exact_safe_unicode_identifiers(node_id) -> None:
     with pytest.raises(GraphValidationError, match="node ID"):
@@ -676,6 +846,53 @@ def test_graph_depth_limit_precedes_recursive_model_validation() -> None:
 
     with pytest.raises(GraphValidationError, match="depth limit"):
         normalize_graph({"1": _node("PrimitiveNode", payload=value)})
+
+
+def test_normalized_model_json_depth_contract_is_direct_and_serializable() -> None:
+    max_depth = graph_models.MAX_SERIALIZABLE_JSON_DEPTH
+    accepted = _nested_json(max_depth)
+    rejected = _nested_json(max_depth + 1)
+
+    node = NormalizedNode(
+        node_id="node",
+        class_type="PrimitiveNode",
+        inputs=accepted,
+        input_links={},
+    )
+    binding = RoleBinding(
+        node_id="node",
+        field_name="value",
+        value=accepted,
+        confidence=1.0,
+        reason="depth boundary",
+    )
+
+    assert NormalizedNode.model_validate_json(node.model_dump_json()) == node
+    assert RoleBinding.model_validate_json(binding.model_dump_json()) == binding
+    assert node.model_dump(mode="json")["inputs"] == accepted
+    assert binding.model_dump(mode="json")["value"] == accepted
+    normalized = normalize_graph(
+        {"node": {"class_type": "PrimitiveNode", "inputs": accepted}}
+    )
+    assert normalized.nodes[0].model_dump(mode="json")["inputs"] == accepted
+
+    with pytest.raises(ValidationError, match="depth limit"):
+        NormalizedNode(
+            node_id="node",
+            class_type="PrimitiveNode",
+            inputs=rejected,
+            input_links={},
+        )
+    with pytest.raises(ValidationError, match="depth limit"):
+        RoleBinding(
+            node_id="node",
+            field_name="value",
+            value=rejected,
+            confidence=1.0,
+            reason="depth overflow",
+        )
+    with pytest.raises(GraphValidationError, match="depth limit"):
+        normalize_graph({"node": {"class_type": "PrimitiveNode", "inputs": rejected}})
 
 
 def test_graph_node_and_value_limits_are_enforced_before_freezing(monkeypatch) -> None:

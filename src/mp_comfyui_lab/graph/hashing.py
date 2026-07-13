@@ -12,11 +12,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from mp_comfyui_lab.graph.models import (
     NormalizedGraph,
     NormalizedNode,
+    RoleBinding,
     SemanticRole,
     strength_bucket,
 )
 from mp_comfyui_lab.graph.normalize import (
     GraphNormalizationError,
+    _lora_chains,
     normalize_graph,
     semantic_graph_projection,
 )
@@ -54,6 +56,7 @@ _PROMPT_FIELDS = frozenset(
 )
 _REFERENCE_FIELDS = frozenset({"filename", "image", "imagename", "path"})
 _OUTPUT_PREFIX_FIELDS = frozenset({"prefix", "saveprefix"})
+_POWER_LORA_SLOT = re.compile(r"^lora_\d+$", re.IGNORECASE)
 _SIGNED_CREDENTIAL_QUERY_KEYS = frozenset(
     {
         "awsaccesskeyid",
@@ -73,10 +76,10 @@ _SIGNED_CREDENTIAL_QUERY_KEYS = frozenset(
     }
     | CANONICAL_SECRET_KEYS
 )
-_MAX_HASH_JSON_DEPTH = 256
+_MAX_HASH_JSON_DEPTH = 48
 _MAX_HASH_JSON_VALUES = 100_000
-_MAX_CANONICALIZATION_STATES = 10_000
-_MAX_INDIVIDUALIZATION_BRANCHES = 12
+_MAX_CANONICALIZATION_STATES = 4_096
+_MAX_INDIVIDUALIZATION_BRANCHES = 8
 
 
 class GraphHashError(ValueError):
@@ -365,6 +368,13 @@ def _capability_inputs(
         if field_name in node.input_links or _is_operational_field(field_name):
             continue
         value = thaw_json(frozen_value)
+        if (
+            "powerloraloader" in compact_class
+            and _POWER_LORA_SLOT.fullmatch(field_name)
+            and isinstance(value, Mapping)
+            and value.get("on") is False
+        ):
+            continue
         canonical = _canonical_field_name(field_name)
         if is_output and canonical in _OUTPUT_PREFIX_FIELDS:
             continue
@@ -425,6 +435,97 @@ def _refine_partition(
         if next_partition == partition:
             return partition
         partition = next_partition
+
+
+def _dag_signature_partition(
+    node_ids: tuple[str, ...],
+    bases: Mapping[str, dict[str, Any]],
+    incoming: Mapping[str, tuple[tuple[str, int, str], ...]],
+    outgoing: Mapping[str, tuple[tuple[str, int, str], ...]],
+) -> tuple[tuple[str, ...], ...] | None:
+    indegree = {node_id: len(incoming[node_id]) for node_id in node_ids}
+    ready = [node_id for node_id in node_ids if indegree[node_id] == 0]
+    layers: list[tuple[str, ...]] = []
+    visited = 0
+    while ready:
+        layer = tuple(ready)
+        layers.append(layer)
+        visited += len(layer)
+        next_ready: list[str] = []
+        for node_id in layer:
+            for _, _, target_id in outgoing[node_id]:
+                indegree[target_id] -= 1
+                if indegree[target_id] == 0:
+                    next_ready.append(target_id)
+        ready = next_ready
+    if visited != len(node_ids):
+        return None
+
+    base_labels = {node_id: _canonical_json(bases[node_id]) for node_id in node_ids}
+
+    def assign_layer_colors(
+        layer: tuple[str, ...],
+        signatures: Mapping[str, tuple[Any, ...]],
+        offset: int,
+    ) -> tuple[dict[str, int], int]:
+        distinct = sorted({signatures[node_id] for node_id in layer})
+        colors_by_signature = {
+            signature: offset + index
+            for index, signature in enumerate(distinct)
+        }
+        return (
+            {
+                node_id: colors_by_signature[signatures[node_id]]
+                for node_id in layer
+            },
+            offset + len(distinct),
+        )
+
+    forward: dict[str, int] = {}
+    color_offset = 0
+    for layer in layers:
+        signatures = {
+            node_id: (
+                base_labels[node_id],
+                tuple(
+                    sorted(
+                        (field, output_index, forward[source_id])
+                        for field, output_index, source_id in incoming[node_id]
+                    )
+                ),
+            )
+            for node_id in layer
+        }
+        colors, color_offset = assign_layer_colors(layer, signatures, color_offset)
+        forward.update(colors)
+
+    backward: dict[str, int] = {}
+    color_offset = 0
+    for layer in reversed(layers):
+        signatures = {
+            node_id: (
+                base_labels[node_id],
+                tuple(
+                    sorted(
+                        (field, output_index, backward[target_id])
+                        for field, output_index, target_id in outgoing[node_id]
+                    )
+                ),
+            )
+            for node_id in layer
+        }
+        colors, color_offset = assign_layer_colors(layer, signatures, color_offset)
+        backward.update(colors)
+
+    groups: dict[tuple[str, int, int], list[str]] = defaultdict(list)
+    for node_id in node_ids:
+        groups[(base_labels[node_id], forward[node_id], backward[node_id])].append(
+            node_id
+        )
+    return tuple(
+        tuple(sorted(groups[signature]))
+        for signature in sorted(groups)
+    )
 
 
 def _are_exact_twins(
@@ -552,13 +653,20 @@ def _canonicalize_topology(
         endpoints: tuple(sorted(attributes))
         for endpoints, attributes in adjacency_lists.items()
     }
-    base_groups: dict[str, list[str]] = defaultdict(list)
-    for node_id in node_ids:
-        base_groups[_canonical_json(bases[node_id])].append(node_id)
-    initial = tuple(
-        tuple(sorted(base_groups[base]))
-        for base in sorted(base_groups)
+    initial = _dag_signature_partition(
+        node_ids,
+        bases,
+        incoming,
+        outgoing,
     )
+    if initial is None:
+        base_groups: dict[str, list[str]] = defaultdict(list)
+        for node_id in node_ids:
+            base_groups[_canonical_json(bases[node_id])].append(node_id)
+        initial = tuple(
+            tuple(sorted(base_groups[base]))
+            for base in sorted(base_groups)
+        )
 
     pending = [_refine_partition(initial, incoming, outgoing)]
     seen: set[tuple[tuple[str, ...], ...]] = set()
@@ -650,8 +758,7 @@ def _capability_projection(graph: NormalizedGraph) -> dict[str, Any]:
     }
     labels, edges, topology_nodes = _canonicalize_topology(graph, bases)
 
-    loras = []
-    for binding in graph.bindings(SemanticRole.LORA):
+    def lora_capability(binding: RoleBinding) -> dict[str, Any]:
         node = nodes_by_id[binding.node_id]
         binding_value = thaw_json(binding.value)
         if isinstance(binding_value, Mapping) and isinstance(
@@ -672,14 +779,33 @@ def _capability_projection(graph: NormalizedGraph) -> dict[str, Any]:
                 and isinstance(value, (int, float))
                 and not isinstance(value, bool)
             }
-        loras.append(
+        return {
+            "class_type": node.class_type,
+            "identity": _capability_value(identity),
+            "slot": binding.field_name,
+            "strengths": strengths,
+        }
+
+    loras = sorted(
+        [
             {
-                "class_type": node.class_type,
-                "identity": _capability_value(identity),
-                "slot": binding.field_name,
-                "strengths": strengths,
+                "chain": [
+                    lora_capability(binding)
+                    for binding in chain.bindings
+                ],
+                "consumer_topology": {
+                    "class_type": nodes_by_id[chain.consumer_node_id].class_type,
+                    "field": _canonical_field_name(chain.consumer_field),
+                    "node": labels[chain.consumer_node_id],
+                },
             }
-        )
+            for chain in _lora_chains(
+                nodes_by_id,
+                list(graph.bindings(SemanticRole.LORA)),
+            )
+        ],
+        key=_canonical_json,
+    )
 
     prompt_sources = sorted(
         [
