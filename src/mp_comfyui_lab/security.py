@@ -29,6 +29,8 @@ WINDOWS_RESERVED_BASENAMES = frozenset(
         "conout$",
         *(f"com{number}" for number in range(1, 10)),
         *(f"lpt{number}" for number in range(1, 10)),
+        *(f"com{number}" for number in ("\u00b9", "\u00b2", "\u00b3")),
+        *(f"lpt{number}" for number in ("\u00b9", "\u00b2", "\u00b3")),
     }
 )
 
@@ -50,7 +52,8 @@ def safe_filename(name: str) -> str:
         raise SafetyError("filename must not contain control characters")
     if name.endswith((".", " ")):
         raise SafetyError("filename must not end with a dot or space")
-    if name.partition(".")[0].casefold() in WINDOWS_RESERVED_BASENAMES:
+    normalized_basename = name.partition(".")[0].rstrip(" .").casefold()
+    if normalized_basename in WINDOWS_RESERVED_BASENAMES:
         raise SafetyError("filename uses a reserved Windows device basename")
     return name
 

@@ -24,6 +24,19 @@ EXPECTED_LAYOUT = {
     "comparisons",
     "export",
 }
+NORMALIZED_WINDOWS_DEVICE_NAMES = (
+    "NUL .json",
+    "CON .txt",
+    "PRN .txt",
+    "AUX .json",
+    "COM1 .txt",
+    "COM¹.json",
+    "COM².txt",
+    "COM³",
+    "LPT¹.json",
+    "LPT².txt",
+    "LPT³",
+)
 
 
 def test_store_creates_complete_layout_and_redacts_secrets(tmp_path):
@@ -186,6 +199,34 @@ def test_safe_filename_rejects_unsafe_names(name):
 
 def test_safe_filename_preserves_safe_unicode_name():
     assert safe_filename("comparison-日本語.json") == "comparison-日本語.json"
+
+
+@pytest.mark.parametrize("name", NORMALIZED_WINDOWS_DEVICE_NAMES)
+def test_safe_filename_rejects_normalized_windows_device_names(name):
+    with pytest.raises(SafetyError):
+        safe_filename(name)
+
+
+@pytest.mark.parametrize("name", NORMALIZED_WINDOWS_DEVICE_NAMES)
+def test_store_rejects_normalized_windows_device_name_before_write(
+    tmp_path,
+    monkeypatch,
+    name,
+):
+    store = ExperimentStore(tmp_path)
+    root = store.create("safe-001")
+    destination = root / "runs" / name
+    monkeypatch.setattr(
+        store,
+        "_atomic_write",
+        lambda *args: pytest.fail("unsafe name reached atomic write"),
+    )
+
+    with pytest.raises(SafetyError):
+        store.write_text("safe-001", Path("runs") / name, "unsafe")
+
+    assert destination.name not in {path.name for path in destination.parent.iterdir()}
+    assert not list(root.rglob("*.tmp"))
 
 
 @pytest.mark.parametrize(
