@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC
 from enum import StrEnum
 from pathlib import Path
@@ -47,6 +48,51 @@ class RunState(StrEnum):
     FAILED = "FAILED"
     INCOMPLETE = "INCOMPLETE"
     CANCELLED = "CANCELLED"
+
+
+_NORMAL_RUN_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
+    RunState.PLANNED: frozenset({RunState.SUBMITTED, RunState.INCOMPLETE}),
+    RunState.SUBMITTED: frozenset(
+        {
+            RunState.RUNNING,
+            RunState.SUCCESS,
+            RunState.FAILED,
+            RunState.INCOMPLETE,
+            RunState.CANCELLED,
+        }
+    ),
+    RunState.RUNNING: frozenset(
+        {
+            RunState.SUCCESS,
+            RunState.FAILED,
+            RunState.INCOMPLETE,
+            RunState.CANCELLED,
+        }
+    ),
+}
+_AMBIGUOUS_RECONCILIATION_STATES = frozenset(
+    {
+        RunState.SUBMITTED,
+        RunState.RUNNING,
+        RunState.SUCCESS,
+        RunState.FAILED,
+        RunState.CANCELLED,
+    }
+)
+_IMMUTABLE_TRANSITION_FIELDS = (
+    "run_id",
+    "experiment_id",
+    "variant_id",
+    "expected_output_count",
+    "created_at",
+)
+
+
+def _is_ambiguous_submission(error: Any) -> bool:
+    return (
+        isinstance(error, Mapping)
+        and error.get("kind") == "ambiguous_submission"
+    )
 
 
 class ResolvedFixture(_FrozenModel):
@@ -145,7 +191,73 @@ class RunRecord(_FrozenModel):
 
     def transition(self, new_state: RunState, **updates: Any) -> Self:
         """Revalidate a state change; never use model_copy(update=...) for transitions."""
+        if not isinstance(new_state, RunState):
+            raise ValueError("new state must be a RunState")
+        if new_state is self.state:
+            raise ValueError("same state transition is not allowed")
+
+        for field_name in _IMMUTABLE_TRANSITION_FIELDS:
+            if (
+                field_name in updates
+                and updates[field_name] != getattr(self, field_name)
+            ):
+                raise ValueError(f"transition cannot change {field_name}")
+
+        if (
+            self.provider_task_id is not None
+            and "provider_task_id" in updates
+            and updates["provider_task_id"] != self.provider_task_id
+        ):
+            raise ValueError("transition cannot replace provider_task_id")
+
+        if self.state is RunState.INCOMPLETE:
+            self._validate_ambiguous_reconciliation(new_state, updates)
+        else:
+            allowed_states = _NORMAL_RUN_TRANSITIONS.get(self.state, frozenset())
+            if new_state not in allowed_states:
+                raise ValueError(
+                    f"transition from {self.state.value} to {new_state.value} "
+                    "is not allowed"
+                )
+            if self.state is RunState.PLANNED and new_state is RunState.INCOMPLETE:
+                error = updates.get("error", self.error)
+                if not _is_ambiguous_submission(error):
+                    raise ValueError(
+                        "PLANNED to INCOMPLETE transition requires "
+                        "error.kind == 'ambiguous_submission'"
+                    )
+                if updates.get("provider_task_id", self.provider_task_id) is not None:
+                    raise ValueError(
+                        "provider_task_id must be absent for ambiguous submission"
+                    )
+
         values = self.model_dump()
         values.update(updates)
         values["state"] = new_state
         return type(self).model_validate(values)
+
+    def _validate_ambiguous_reconciliation(
+        self,
+        new_state: RunState,
+        updates: dict[str, Any],
+    ) -> None:
+        if new_state not in _AMBIGUOUS_RECONCILIATION_STATES:
+            raise ValueError(
+                f"transition from INCOMPLETE to {new_state.value} is not allowed"
+            )
+        if not _is_ambiguous_submission(self.error):
+            raise ValueError(
+                "INCOMPLETE transition requires "
+                "error.kind == 'ambiguous_submission'"
+            )
+        if self.provider_task_id is not None:
+            raise ValueError(
+                "provider_task_id must be absent before ambiguous reconciliation"
+            )
+
+        provider_task_id = updates.get("provider_task_id")
+        if not isinstance(provider_task_id, str) or not provider_task_id.strip():
+            raise ValueError(
+                "a nonblank provider_task_id must be attached during "
+                "ambiguous reconciliation"
+            )

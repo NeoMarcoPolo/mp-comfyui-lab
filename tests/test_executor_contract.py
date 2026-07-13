@@ -576,8 +576,280 @@ def test_run_transition_revalidates_complete_record():
     assert running.state is RunState.RUNNING
     assert success.state is RunState.SUCCESS
     assert success.actual_output_count == 1
-    with pytest.raises(ValidationError, match="provider_task_id"):
+    with pytest.raises(ValueError):
         planned.transition(RunState.RUNNING)
+
+
+def _run_for_transition(state: RunState, **updates) -> RunRecord:
+    values = {
+        "run_id": "run-1",
+        "experiment_id": "experiment-1",
+        "variant_id": "variant-1",
+        "state": state,
+        "expected_output_count": 1,
+    }
+    if state in {
+        RunState.SUBMITTED,
+        RunState.RUNNING,
+        RunState.SUCCESS,
+        RunState.CANCELLED,
+    }:
+        values["provider_task_id"] = "fake-task-1"
+    if state is RunState.SUCCESS:
+        values["actual_output_count"] = 1
+    values.update(updates)
+    return RunRecord(**values)
+
+
+@pytest.mark.parametrize(
+    ("source_state", "destination", "updates"),
+    [
+        (RunState.SUCCESS, RunState.RUNNING, {}),
+        (
+            RunState.FAILED,
+            RunState.SUBMITTED,
+            {"provider_task_id": "fake-task-1"},
+        ),
+    ],
+)
+def test_run_transition_rejects_reverse_edges(source_state, destination, updates):
+    record = _run_for_transition(source_state)
+
+    with pytest.raises(ValueError, match="transition"):
+        record.transition(destination, **updates)
+
+
+@pytest.mark.parametrize("source_state", [RunState.SUCCESS, RunState.CANCELLED])
+@pytest.mark.parametrize("destination", list(RunState))
+def test_success_and_cancelled_runs_are_terminal(source_state, destination):
+    record = _run_for_transition(source_state, actual_output_count=1)
+
+    with pytest.raises(ValueError, match="transition"):
+        record.transition(destination)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("run_id", "run-2"),
+        ("experiment_id", "experiment-2"),
+        ("variant_id", "variant-2"),
+        ("expected_output_count", 2),
+        ("created_at", datetime(2026, 7, 13, 12, 1, tzinfo=UTC)),
+    ],
+)
+def test_run_transition_cannot_change_durable_identity(field, replacement):
+    record = _run_for_transition(
+        RunState.PLANNED,
+        created_at=datetime(2026, 7, 13, 12, 0, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match=field):
+        record.transition(
+            RunState.SUBMITTED,
+            provider_task_id="fake-task-1",
+            **{field: replacement},
+        )
+
+
+def test_run_transition_cannot_replace_provider_task_id():
+    record = _run_for_transition(RunState.SUBMITTED)
+
+    with pytest.raises(ValueError, match="provider_task_id"):
+        record.transition(
+            RunState.RUNNING,
+            provider_task_id="fake-task-2",
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_state", "destination", "updates"),
+    [
+        (
+            RunState.PLANNED,
+            RunState.SUBMITTED,
+            {"provider_task_id": "fake-task-1"},
+        ),
+        (
+            RunState.PLANNED,
+            RunState.INCOMPLETE,
+            {"error": {"kind": "ambiguous_submission"}},
+        ),
+        (RunState.SUBMITTED, RunState.RUNNING, {}),
+        (RunState.SUBMITTED, RunState.SUCCESS, {"actual_output_count": 1}),
+        (RunState.SUBMITTED, RunState.FAILED, {}),
+        (RunState.SUBMITTED, RunState.INCOMPLETE, {}),
+        (RunState.SUBMITTED, RunState.CANCELLED, {}),
+        (RunState.RUNNING, RunState.SUCCESS, {"actual_output_count": 1}),
+        (RunState.RUNNING, RunState.FAILED, {}),
+        (RunState.RUNNING, RunState.INCOMPLETE, {}),
+        (RunState.RUNNING, RunState.CANCELLED, {}),
+    ],
+)
+def test_run_transition_accepts_normal_edges(source_state, destination, updates):
+    record = _run_for_transition(source_state)
+
+    transitioned = record.transition(destination, **updates)
+
+    assert transitioned.state is destination
+
+
+@pytest.mark.parametrize("error", [None, {"kind": "partial_outputs"}])
+def test_planned_to_incomplete_requires_ambiguous_submission_error(error):
+    record = _run_for_transition(RunState.PLANNED)
+
+    with pytest.raises(ValueError, match="ambiguous_submission"):
+        record.transition(RunState.INCOMPLETE, error=error)
+
+
+def test_planned_ambiguous_incomplete_rejects_known_task_id():
+    record = _run_for_transition(RunState.PLANNED)
+
+    with pytest.raises(ValueError, match="provider_task_id"):
+        record.transition(
+            RunState.INCOMPLETE,
+            provider_task_id="fake-task-1",
+            error={"kind": "ambiguous_submission"},
+        )
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        RunState.SUBMITTED,
+        RunState.RUNNING,
+        RunState.SUCCESS,
+        RunState.FAILED,
+        RunState.CANCELLED,
+    ],
+)
+def test_partial_output_incomplete_run_cannot_reopen(destination):
+    record = _run_for_transition(
+        RunState.INCOMPLETE,
+        provider_task_id="fake-task-1",
+        expected_output_count=2,
+        actual_output_count=1,
+        error={"kind": "partial_outputs"},
+    )
+    updates = {"actual_output_count": 2} if destination is RunState.SUCCESS else {}
+
+    with pytest.raises(ValueError, match="transition"):
+        record.transition(destination, **updates)
+
+
+@pytest.mark.parametrize(
+    ("destination", "updates"),
+    [
+        (RunState.SUBMITTED, {}),
+        (RunState.RUNNING, {}),
+        (RunState.SUCCESS, {"actual_output_count": 1}),
+        (RunState.FAILED, {}),
+        (RunState.CANCELLED, {}),
+    ],
+)
+def test_ambiguous_incomplete_run_can_reconcile(destination, updates):
+    record = _run_for_transition(
+        RunState.INCOMPLETE,
+        error={"kind": "ambiguous_submission"},
+    )
+
+    reconciled = record.transition(
+        destination,
+        provider_task_id="fake-task-1",
+        **updates,
+    )
+
+    assert reconciled.state is destination
+    assert reconciled.provider_task_id == "fake-task-1"
+
+
+@pytest.mark.parametrize("error", [None, {"kind": "partial_outputs"}])
+def test_incomplete_reconciliation_requires_ambiguous_submission_error(error):
+    record = _run_for_transition(RunState.INCOMPLETE, error=error)
+
+    with pytest.raises(ValueError, match="ambiguous_submission"):
+        record.transition(
+            RunState.RUNNING,
+            provider_task_id="fake-task-1",
+        )
+
+
+def test_ambiguous_incomplete_reconciliation_requires_attached_task_id():
+    record = _run_for_transition(
+        RunState.INCOMPLETE,
+        error={"kind": "ambiguous_submission"},
+    )
+
+    with pytest.raises(ValueError, match="provider_task_id"):
+        record.transition(RunState.FAILED)
+
+
+def test_identified_ambiguous_incomplete_run_cannot_reconcile_again():
+    record = _run_for_transition(
+        RunState.INCOMPLETE,
+        provider_task_id="fake-task-1",
+        error={"kind": "ambiguous_submission"},
+    )
+
+    with pytest.raises(ValueError, match="provider_task_id"):
+        record.transition(
+            RunState.RUNNING,
+            provider_task_id="fake-task-1",
+        )
+
+
+def test_ambiguous_incomplete_reconciliation_revalidates_destination():
+    record = _run_for_transition(
+        RunState.INCOMPLETE,
+        expected_output_count=2,
+        actual_output_count=1,
+        error={"kind": "ambiguous_submission"},
+    )
+
+    with pytest.raises(ValidationError, match="actual_output_count"):
+        record.transition(
+            RunState.SUCCESS,
+            provider_task_id="fake-task-1",
+        )
+
+
+@pytest.mark.parametrize("state", list(RunState))
+def test_run_transition_rejects_same_state(state):
+    record = _run_for_transition(state)
+
+    with pytest.raises(ValueError, match="same state"):
+        record.transition(state)
+
+
+def test_run_transition_allows_state_related_updates():
+    created_at = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+    record = _run_for_transition(RunState.PLANNED, created_at=created_at)
+
+    submitted = record.transition(
+        RunState.SUBMITTED,
+        provider_task_id="fake-task-1",
+        actual_output_count=1,
+        error={"kind": "accepted"},
+        submitted_at=created_at + timedelta(seconds=1),
+    )
+    running = submitted.transition(
+        RunState.RUNNING,
+        error=None,
+        started_at=created_at + timedelta(seconds=2),
+    )
+    failed = running.transition(
+        RunState.FAILED,
+        error={"kind": "provider_failure"},
+        completed_at=created_at + timedelta(seconds=3),
+    )
+
+    assert submitted.actual_output_count == 1
+    assert submitted.error == {"kind": "accepted"}
+    assert submitted.submitted_at == created_at + timedelta(seconds=1)
+    assert running.error is None
+    assert running.started_at == created_at + timedelta(seconds=2)
+    assert failed.error == {"kind": "provider_failure"}
+    assert failed.completed_at == created_at + timedelta(seconds=3)
 
 
 def test_state_changes_must_not_use_unvalidated_model_copy():
