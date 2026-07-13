@@ -74,6 +74,17 @@ def test_unknown_command_preserves_argparse_diagnostic(capsys):
     )
 
 
+def test_root_unknown_option_does_not_become_command(capsys):
+    result = main(["--bogus"])
+
+    document = _single_json_document(capsys.readouterr())
+    assert result == ExitCode.USAGE
+    assert document["command"] is None
+    assert document["error"]["message"] == (
+        "the following arguments are required: command"
+    )
+
+
 def test_entrypoint_exits_with_main_result(monkeypatch):
     monkeypatch.setattr(app, "main", lambda: ExitCode.SAFETY)
 

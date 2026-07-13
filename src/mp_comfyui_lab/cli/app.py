@@ -51,7 +51,7 @@ def main(argv: Sequence[str] | None = None) -> ExitCode:
         emit_success("help", {"text": str(error)})
         return ExitCode.OK
     except UsageError as error:
-        command = arguments[0] if arguments else None
+        command = arguments[0] if arguments and not arguments[0].startswith("-") else None
         emit_error(command, "usage", str(error))
         return ExitCode.USAGE
 
