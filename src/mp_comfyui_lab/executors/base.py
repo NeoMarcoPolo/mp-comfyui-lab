@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated
 
@@ -148,6 +149,20 @@ class ExecutorError(RuntimeError):
 
 class ProviderSchemaError(ExecutorError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderResponseError(ExecutorError):
+    endpoint: str
+    code: int
+    message: str
+    error_messages: tuple[str, ...] = ()
+
+    def __str__(self) -> str:
+        return (
+            f"Provider response from {self.endpoint} failed with code "
+            f"{self.code}"
+        )
 
 
 class UnsupportedCapabilityError(ExecutorError):

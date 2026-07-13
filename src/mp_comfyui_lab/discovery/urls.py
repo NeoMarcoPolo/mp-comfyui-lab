@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 import re
+import unicodedata
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict
@@ -12,7 +13,6 @@ _PUBLIC_PATH = re.compile(
     r"/(?:[a-z]{2}(?:-[a-z]{2})?/)?(?P<kind>post|workflow)/"
     r"(?P<workflow_id>[0-9]+)/?"
 )
-_FORBIDDEN_RAW_CHARACTER = re.compile(r"[\s\x00-\x1f\x7f]")
 _UNSUPPORTED_MESSAGE = (
     "RunningHub source must be an HTTPS public post or workflow URL"
 )
@@ -39,7 +39,11 @@ def parse_runninghub_url(url: str) -> ParsedRunningHubUrl:
     if (
         not isinstance(url, str)
         or not url
-        or _FORBIDDEN_RAW_CHARACTER.search(url) is not None
+        or any(
+            character.isspace()
+            or unicodedata.category(character) == "Cc"
+            for character in url
+        )
     ):
         raise UnsupportedSourceError(_UNSUPPORTED_MESSAGE)
 

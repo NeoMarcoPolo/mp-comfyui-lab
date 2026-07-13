@@ -1,6 +1,7 @@
 import importlib
 import json
 from collections.abc import Mapping
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
@@ -25,6 +26,8 @@ from mp_comfyui_lab.executors.base import (
     FetchedWorkflow,
     PollResult,
     ProviderOutput,
+    ProviderResponseError,
+    ProviderSchemaError,
     ProviderTaskState,
     SearchPage,
     SearchRequest,
@@ -82,6 +85,35 @@ def _candidate(**updates) -> WorkflowCandidate:
     }
     values.update(updates)
     return WorkflowCandidate(**values)
+
+
+def test_provider_response_error_is_structured_immutable_and_semantic() -> None:
+    error = ProviderResponseError(
+        endpoint="/api/provider/action",
+        code=429,
+        message="rate limited",
+        error_messages=("retry later",),
+    )
+
+    assert error.endpoint == "/api/provider/action"
+    assert error.code == 429
+    assert error.message == "rate limited"
+    assert error.error_messages == ("retry later",)
+    assert not isinstance(error, ProviderSchemaError)
+    assert "/api/provider/action" in str(error)
+    assert "429" in str(error)
+
+    with pytest.raises(FrozenInstanceError):
+        error.code = 0
+
+    unsafe_error = ProviderResponseError(
+        endpoint="/api/provider/action",
+        code=500,
+        message="apiKey=raw-secret",
+        error_messages=("cookie=session-secret",),
+    )
+    assert "raw-secret" not in str(unsafe_error)
+    assert "session-secret" not in str(unsafe_error)
 
 
 def _json_bearing_record(kind, value):

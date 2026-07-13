@@ -10,6 +10,7 @@ import pytest
 import requests
 import responses
 
+import mp_comfyui_lab.executors.runninghub as runninghub_module
 from mp_comfyui_lab.discovery.models import ContentClassification
 from mp_comfyui_lab.discovery.urls import (
     ParsedRunningHubUrl,
@@ -19,6 +20,7 @@ from mp_comfyui_lab.discovery.urls import (
 from mp_comfyui_lab.executors.base import (
     Executor,
     ExecutorError,
+    ProviderResponseError,
     ProviderSchemaError,
     SearchRequest,
     UnsupportedCapabilityError,
@@ -49,10 +51,22 @@ class GraphFetcherSpy:
         return self.value
 
 
+class FalseyGraphFetcher(GraphFetcherSpy):
+    def __bool__(self) -> bool:
+        return False
+
+
+class FalseySession(requests.Session):
+    def __bool__(self) -> bool:
+        return False
+
+
 def _executor(graph_fetcher: GraphFetcherSpy | None = None) -> RunningHubExecutor:
     return RunningHubExecutor(
         session=requests.Session(),
-        graph_fetcher=graph_fetcher or GraphFetcherSpy(),
+        graph_fetcher=(
+            graph_fetcher if graph_fetcher is not None else GraphFetcherSpy()
+        ),
     )
 
 
@@ -127,6 +141,8 @@ def test_parse_runninghub_url_accepts_exact_public_urls(
         f"\x00https://www.runninghub.ai/post/{WORKFLOW_ID}",
         f"https://www.runninghub.ai/post/\x1f{WORKFLOW_ID}",
         f"https://www.runninghub.ai/post/{WORKFLOW_ID}\x7f",
+        f"https://www.runninghub.ai/post/{WORKFLOW_ID}?from=search\u0080",
+        f"https://www.runninghub.ai/post/{WORKFLOW_ID}?from=search\u009f",
     ],
 )
 def test_parse_runninghub_url_rejects_nonpublic_or_malformed_urls(url: str) -> None:
@@ -174,6 +190,34 @@ def test_search_posts_exact_shape_and_maps_observed_response() -> None:
     assert first.content_classification is ContentClassification.UNKNOWN
     assert first.classification_reasons == ("no explicit classification evidence",)
     assert graph_fetcher.calls == []
+
+
+def test_constructor_retains_falsey_injected_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = FalseySession()
+    graph_fetcher = FalseyGraphFetcher(_load_fixture("qwen_graph.json"))
+    fallback_fetcher = GraphFetcherSpy(_load_fixture("qwen_graph.json"))
+    monkeypatch.setattr(
+        runninghub_module,
+        "get_workflow_json",
+        fallback_fetcher,
+    )
+    executor = RunningHubExecutor(
+        session=session,
+        graph_fetcher=graph_fetcher,
+    )
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.detail_url, _load_fixture("detail_next_scene.json"))
+        executor.fetch_workflow(
+            WorkflowRef(executor="runninghub", workflow_id=WORKFLOW_ID)
+        )
+
+    assert executor.session is session
+    assert executor.graph_fetcher is graph_fetcher
+    assert graph_fetcher.calls == [(None, WORKFLOW_ID)]
+    assert fallback_fetcher.calls == []
 
 
 def test_public_detail_maps_inventory_and_strips_executable_html() -> None:
@@ -228,6 +272,24 @@ def test_public_detail_maps_inventory_and_strips_executable_html() -> None:
             "SFW portrait workflow",
             "No explicit unsafe prose",
             ["portrait_nsfw_v1.safetensors"],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Not safe for work",
+            "A public workflow",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "UNSAFE-FOR-WORK",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "This is Not...SFW content",
+            [],
             ContentClassification.NSFW,
         ),
     ],
@@ -301,6 +363,25 @@ def test_fetch_workflow_rejects_malformed_or_nondict_graphs(
             match=r"openapi/getJsonApiFormat.*graph",
         ):
             executor.fetch_workflow(ref)
+
+
+def test_fetch_workflow_rejects_oversized_json_integer_as_provider_schema() -> None:
+    oversized_integer = "9" * 5_000
+    graph_value = '{"1":{"class_type":"KSampler","inputs":{"seed":' + (
+        oversized_integer + "}}}"
+    )
+    executor = _executor(GraphFetcherSpy(graph_value))
+    ref = WorkflowRef(executor="runninghub", workflow_id=WORKFLOW_ID)
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.detail_url, _load_fixture("detail_next_scene.json"))
+        with pytest.raises(ProviderSchemaError) as raised:
+            executor.fetch_workflow(ref)
+
+    message = str(raised.value)
+    assert "openapi/getJsonApiFormat" in message
+    assert "graph" in message
+    assert oversized_integer not in message
 
 
 @pytest.mark.parametrize("kind", ["post", "workflow"])
@@ -411,6 +492,70 @@ def test_inspect_capabilities_uses_only_deterministic_public_inventories() -> No
     }
 
 
+def test_used_model_urls_are_sanitized_before_detail_and_capability_models() -> None:
+    payload = _load_fixture("detail_next_scene.json")
+    aws_url = (
+        "https://models.example/loras/portrait.safetensors"
+        "?X-Amz-Credential=aws-secret&X-Amz-Signature=aws-signature"
+    )
+    azure_url = (
+        "https://models.example/checkpoints/base.safetensors"
+        "?sv=2025-01-05&sp=r&se=2030-01-01&sig=azure-secret"
+    )
+    payload["data"]["usedModels"] = [
+        aws_url,
+        azure_url,
+        "plain-model.safetensors",
+    ]
+    executor = _executor(GraphFetcherSpy(_load_fixture("qwen_graph.json")))
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.detail_url, payload)
+        fetched = executor.fetch_workflow(
+            WorkflowRef(executor="runninghub", workflow_id=WORKFLOW_ID)
+        )
+
+    report = executor.inspect_capabilities(fetched)
+    assert fetched.detail.used_models == (
+        "https://models.example/loras/portrait.safetensors",
+        "https://models.example/checkpoints/base.safetensors",
+        "plain-model.safetensors",
+    )
+    serialized = fetched.detail.model_dump_json() + report.model_dump_json()
+    for credential in (
+        "aws-secret",
+        "aws-signature",
+        "azure-secret",
+        "X-Amz-Credential",
+        "sig=",
+    ):
+        assert credential not in serialized
+
+
+def test_lora_inventory_detection_uses_token_and_path_boundaries() -> None:
+    payload = _load_fixture("detail_next_scene.json")
+    payload["data"]["usedModels"] = [
+        "FloraXL.safetensors",
+        "next-scene_lora_v1-3000.safetensors",
+        "https://models.example/loras/portrait.safetensors",
+        "next-scene_lora_v1-3000.safetensors",
+    ]
+    executor = _executor(GraphFetcherSpy(_load_fixture("qwen_graph.json")))
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.detail_url, payload)
+        fetched = executor.fetch_workflow(
+            WorkflowRef(executor="runninghub", workflow_id=WORKFLOW_ID)
+        )
+
+    report = executor.inspect_capabilities(fetched)
+    assert report.lora_names == (
+        "https://models.example/loras/portrait.safetensors",
+        "next-scene_lora_v1-3000.safetensors",
+    )
+    assert report.model_names == ("FloraXL.safetensors",)
+
+
 def test_non_json_public_body_names_search_endpoint() -> None:
     executor = _executor()
 
@@ -429,8 +574,12 @@ def test_non_json_public_body_names_search_endpoint() -> None:
             executor.search(SearchRequest(query="qwen", size=3))
 
 
-def test_nonzero_search_code_names_endpoint_and_code_field() -> None:
+def test_nonzero_search_code_raises_sanitized_provider_response_error() -> None:
     executor = _executor()
+    azure_diagnostic = (
+        "https://provider.example/error"
+        "?sv=2025-01-05&sp=r&sig=azure-secret"
+    )
 
     with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
         _add_json(
@@ -438,16 +587,36 @@ def test_nonzero_search_code_names_endpoint_and_code_field() -> None:
             executor.search_url,
             {
                 "code": 500,
-                "msg": "failed",
-                "errorMessages": ["provider failure"],
+                "msg": "failed apiKey=super-secret",
+                "errorMessages": [
+                    azure_diagnostic,
+                    "cookie=session-secret",
+                ],
                 "data": {},
             },
         )
-        with pytest.raises(
-            ProviderSchemaError,
-            match=r"api/search/workflow.*code",
-        ):
+        with pytest.raises(ProviderResponseError) as raised:
             executor.search(SearchRequest(query="qwen", size=3))
+
+    error = raised.value
+    assert error.endpoint == "/api/search/workflow"
+    assert error.code == 500
+    assert error.message == "failed apiKey=[REDACTED]"
+    assert error.error_messages == (
+        "https://provider.example/error",
+        "cookie=[REDACTED]",
+    )
+    assert not isinstance(error, ProviderSchemaError)
+    serialized = json.dumps(
+        {
+            "message": error.message,
+            "error_messages": error.error_messages,
+            "display": str(error),
+        }
+    )
+    assert "super-secret" not in serialized
+    assert "azure-secret" not in serialized
+    assert "session-secret" not in serialized
 
 
 def test_nonzero_detail_code_names_endpoint_and_code_field() -> None:
@@ -622,6 +791,43 @@ def test_search_rejects_wrong_provider_numeric_representations(
 
 
 @pytest.mark.parametrize(
+    ("mutation", "field"),
+    [
+        (
+            lambda body, value: body["data"]["records"][0].__setitem__(
+                "id", value
+            ),
+            "data.records[0].id",
+        ),
+        (
+            lambda body, value: body["data"]["records"][0][
+                "statisticsInfo"
+            ].__setitem__("useCount", value),
+            "data.records[0].statisticsInfo.useCount",
+        ),
+    ],
+)
+def test_search_rejects_overlong_provider_numeric_strings(
+    mutation: Any,
+    field: str,
+) -> None:
+    oversized = "9" * 5_000
+    payload = _load_fixture("search_qwen_reputation.json")
+    mutation(payload, oversized)
+    executor = _executor()
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.search_url, payload)
+        with pytest.raises(ProviderSchemaError) as raised:
+            executor.search(SearchRequest(query="qwen", size=3))
+
+    message = str(raised.value)
+    assert "api/search/workflow" in message
+    assert f"invalid field {field}:" in message
+    assert oversized not in message
+
+
+@pytest.mark.parametrize(
     "url",
     [
         " https://assets.example/image.png",
@@ -745,6 +951,23 @@ def test_detail_rejects_wrong_provider_numeric_representations(
     message = str(raised.value)
     assert "portal/workflow/detail" in message
     assert f"invalid field {field}:" in message
+
+
+def test_detail_rejects_timestamp_that_overflows_utc_normalization() -> None:
+    payload = _load_fixture("detail_next_scene.json")
+    extreme_timestamp = "9999-12-31T23:59:59.999999-23:59"
+    payload["data"]["publishTime"] = extreme_timestamp
+    executor = _executor()
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.detail_url, payload)
+        with pytest.raises(ProviderSchemaError) as raised:
+            executor.detail(WORKFLOW_ID)
+
+    message = str(raised.value)
+    assert "portal/workflow/detail" in message
+    assert "invalid field data.publishTime:" in message
+    assert extreme_timestamp not in message
 
 
 def test_detail_rejects_mismatched_workflow_id_before_graph_fetch() -> None:

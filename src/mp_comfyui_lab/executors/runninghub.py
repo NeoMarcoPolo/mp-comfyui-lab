@@ -33,6 +33,7 @@ from mp_comfyui_lab.executors.base import (
     FetchedWorkflow,
     PollResult,
     ProviderOutput,
+    ProviderResponseError,
     ProviderSchemaError,
     SearchPage,
     SearchRequest,
@@ -51,9 +52,34 @@ DETAIL_ENDPOINT = "/api/portal/workflow/detail"
 GRAPH_ENDPOINT = "/api/openapi/getJsonApiFormat"
 PUBLIC_REQUEST_TIMEOUT = (10, 60)
 PAID_EXECUTION_DISABLED = "runninghub paid execution is not enabled"
+PROVIDER_NUMERIC_STRING_MAX_LENGTH = 64
 
 NSFW_TERMS = frozenset({"nsfw", "nude", "nudity", "\u88f8\u4f53", "\u6210\u4eba", "\u8272\u60c5"})
 SFW_TERMS = frozenset({"sfw", "safe for work", "\u5b89\u5168"})
+NSFW_PHRASE_PATTERNS = (
+    (
+        "not safe for work",
+        re.compile(r"\bnot[\W_]+safe[\W_]+for[\W_]+work\b", re.IGNORECASE),
+    ),
+    (
+        "unsafe for work",
+        re.compile(r"\bunsafe[\W_]+for[\W_]+work\b", re.IGNORECASE),
+    ),
+    (
+        "not sfw",
+        re.compile(r"\bnot[\W_]+sfw\b", re.IGNORECASE),
+    ),
+)
+LORA_INVENTORY_TOKEN = re.compile(
+    r"(?:^|[\\/._\-\s])loras?(?=$|[\\/._\-\s])",
+    re.IGNORECASE,
+)
+DIAGNOSTIC_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+DIAGNOSTIC_SECRET = re.compile(
+    r"\b(api[_-]?key|authorization|cookie|token|access[_-]?token|"
+    r"refresh[_-]?token|credential|signature|sig)\s*[:=]\s*[^\s,;]+",
+    re.IGNORECASE,
+)
 
 
 GraphFetcher = Callable[[str | None, str], Any]
@@ -62,9 +88,10 @@ GraphFetcher = Callable[[str | None, str], Any]
 def _provider_aware_timestamp(value: str) -> str:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        offset = parsed.utcoffset()
+    except (ValueError, OverflowError):
         raise ValueError("expected an ISO-8601 timestamp") from None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
+    if parsed.tzinfo is None or offset is None:
         raise ValueError("timestamp must include a timezone")
     return value
 
@@ -119,7 +146,13 @@ def _provider_http_url(value: str) -> str:
     return value
 
 
-ProviderNumericString = Annotated[str, Field(pattern=r"^[0-9]+$")]
+ProviderNumericString = Annotated[
+    str,
+    Field(
+        pattern=r"^[0-9]+$",
+        max_length=PROVIDER_NUMERIC_STRING_MAX_LENGTH,
+    ),
+]
 ProviderNonnegativeInt = Annotated[int, Field(ge=0)]
 ProviderTimestamp = Annotated[str, AfterValidator(_provider_aware_timestamp)]
 ProviderHttpUrl = Annotated[str, AfterValidator(_provider_http_url)]
@@ -260,6 +293,7 @@ class _DetailEnvelope(_ProviderModel):
     data: _DetailData
 
 
+ProviderRecord = _SearchRecord | _DetailData
 ProviderSchema = TypeVar("ProviderSchema", bound=_ProviderModel)
 
 
@@ -336,26 +370,23 @@ def _validate_provider_schema(
         )
 
 
-def _required(mapping: dict[str, Any], key: str, endpoint: str, path: str) -> Any:
-    if key not in mapping:
-        _schema_error(endpoint, path, "field is missing")
-    return mapping[key]
+def _normalized_model_error(
+    endpoint: str,
+    field: str,
+    error: ValidationError,
+) -> NoReturn:
+    issue = error.errors(
+        include_url=False,
+        include_context=False,
+        include_input=False,
+    )[0]
+    location = _provider_field_path(issue["loc"])
+    path = f"{field}.{location}" if location != "response JSON" else field
+    _schema_error(endpoint, path, issue["msg"])
 
 
-def _mapping(value: Any, endpoint: str, field: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        _schema_error(endpoint, field, "expected an object")
-    return value
-
-
-def _list(value: Any, endpoint: str, field: str) -> list[Any]:
-    if not isinstance(value, list):
-        _schema_error(endpoint, field, "expected an array")
-    return value
-
-
-def _nonblank_string(value: Any, endpoint: str, field: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+def _nonblank_string(value: str, endpoint: str, field: str) -> str:
+    if not value.strip():
         _schema_error(endpoint, field, "expected a non-empty string")
     return value.strip()
 
@@ -371,62 +402,59 @@ def _workflow_id(value: Any, endpoint: str, field: str) -> str:
 
 
 def _integer(
-    value: Any,
+    value: str,
     endpoint: str,
     field: str,
     *,
     minimum: int | None = None,
 ) -> int:
-    if isinstance(value, bool):
-        _schema_error(endpoint, field, "expected an integer")
-    if isinstance(value, int):
-        parsed = value
-    elif isinstance(value, str) and re.fullmatch(r"-?[0-9]+", value):
+    try:
         parsed = int(value)
-    else:
-        _schema_error(endpoint, field, "expected an integer or numeric string")
+    except (ValueError, OverflowError):
+        _schema_error(endpoint, field, "numeric value cannot be normalized")
 
     if minimum is not None and parsed < minimum:
         _schema_error(endpoint, field, f"expected a value of at least {minimum}")
     return parsed
 
 
-def _boolean(value: Any, endpoint: str, field: str) -> bool:
-    if not isinstance(value, bool):
-        _schema_error(endpoint, field, "expected a boolean")
-    return value
-
-
-def _published_at(value: Any, endpoint: str, field: str) -> datetime:
-    if not isinstance(value, str):
-        _schema_error(endpoint, field, "expected an ISO-8601 timestamp")
+def _published_at(value: str, endpoint: str, field: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        _schema_error(endpoint, field, "expected an ISO-8601 timestamp")
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        _schema_error(endpoint, field, "timestamp must include a timezone")
-    return parsed.astimezone(UTC)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            _schema_error(endpoint, field, "timestamp must include a timezone")
+        return parsed.astimezone(UTC)
+    except (ValueError, OverflowError):
+        _schema_error(
+            endpoint,
+            field,
+            "timestamp cannot be normalized to UTC",
+        )
 
 
-def _optional_string(value: Any, endpoint: str, field: str) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        _schema_error(endpoint, field, "expected a string or null")
-    return value
+def _sanitize_url_string(value: str) -> str:
+    return sanitize_for_persistence({"url": value})["url"]
 
 
-def _optional_identifier(value: Any, endpoint: str, field: str) -> str | None:
-    if value is None:
-        return None
-    return _workflow_id(value, endpoint, field)
-
-
-def _safe_url(value: Any, endpoint: str, field: str) -> str:
+def _safe_url(value: str, endpoint: str, field: str) -> str:
     url = _nonblank_string(value, endpoint, field)
-    sanitized = sanitize_for_persistence({"url": url})
-    return sanitized["url"]
+    return _sanitize_url_string(url)
+
+
+def _sanitize_provider_diagnostic(value: str) -> str:
+    without_controls = "".join(
+        " " if unicodedata.category(character) == "Cc" else character
+        for character in value
+    )
+    normalized = re.sub(r"\s+", " ", without_controls).strip()
+    without_url_queries = DIAGNOSTIC_URL.sub(
+        lambda matched: _sanitize_url_string(matched.group(0)),
+        normalized,
+    )
+    return DIAGNOSTIC_SECRET.sub(
+        lambda matched: f"{matched.group(1)}=[REDACTED]",
+        without_url_queries,
+    )
 
 
 def _sanitize_provider_value(value: Any) -> Any:
@@ -460,40 +488,33 @@ def _validated_canonical_url(
     return parsed.canonical_url
 
 
-def _cover(value: Any, endpoint: str, field: str) -> CoverAsset:
-    item = _mapping(value, endpoint, field)
+def _cover(
+    value: _ProviderCover,
+    endpoint: str,
+    field: str,
+) -> CoverAsset:
     url = _safe_url(
-        _required(item, "url", endpoint, f"{field}.url"),
+        value.url,
         endpoint,
         f"{field}.url",
     )
-
-    thumbnail_value = item.get("thumbnailUri")
-    thumbnail_url = None
-    if thumbnail_value is not None:
-        thumbnail_url = _safe_url(
-            thumbnail_value,
-            endpoint,
-            f"{field}.thumbnailUri",
-        )
-
-    width = None
-    if "imageWidth" in item and item["imageWidth"] is not None:
-        width = _integer(
-            item["imageWidth"],
-            endpoint,
-            f"{field}.imageWidth",
-            minimum=1,
-        )
-
-    height = None
-    if "imageHeight" in item and item["imageHeight"] is not None:
-        height = _integer(
-            item["imageHeight"],
-            endpoint,
-            f"{field}.imageHeight",
-            minimum=1,
-        )
+    thumbnail_url = _safe_url(
+        value.thumbnailUri,
+        endpoint,
+        f"{field}.thumbnailUri",
+    )
+    width = _integer(
+        value.imageWidth,
+        endpoint,
+        f"{field}.imageWidth",
+        minimum=1,
+    )
+    height = _integer(
+        value.imageHeight,
+        endpoint,
+        f"{field}.imageHeight",
+        minimum=1,
+    )
 
     try:
         return CoverAsset(
@@ -502,80 +523,81 @@ def _cover(value: Any, endpoint: str, field: str) -> CoverAsset:
             width=width,
             height=height,
         )
-    except ValidationError:
-        _schema_error(endpoint, field, "cover metadata is malformed")
+    except ValidationError as error:
+        _normalized_model_error(endpoint, field, error)
 
 
-def _covers(value: Any, endpoint: str, field: str) -> tuple[CoverAsset, ...]:
-    items = _list(value, endpoint, field)
+def _covers(
+    values: list[_ProviderCover],
+    endpoint: str,
+    field: str,
+) -> tuple[CoverAsset, ...]:
     return tuple(
         _cover(item, endpoint, f"{field}[{index}]")
-        for index, item in enumerate(items)
+        for index, item in enumerate(values)
     )
 
 
-def _tags(value: Any, endpoint: str, field: str) -> tuple[str, ...]:
-    items = _list(value, endpoint, field)
+def _tags(
+    values: list[_ProviderTag],
+    endpoint: str,
+    field: str,
+) -> tuple[str, ...]:
+    return tuple(
+        _nonblank_string(
+            value.name,
+            endpoint,
+            f"{field}[{index}].name",
+        )
+        for index, value in enumerate(values)
+    )
+
+
+def _string_inventory(
+    values: list[str],
+    endpoint: str,
+    field: str,
+    *,
+    sanitize_urls: bool = False,
+) -> tuple[str, ...]:
     parsed: list[str] = []
-    for index, value in enumerate(items):
-        item_field = f"{field}[{index}]"
-        item = _mapping(value, endpoint, item_field)
+    for index, item in enumerate(values):
+        normalized = _nonblank_string(
+            item,
+            endpoint,
+            f"{field}[{index}]",
+        )
         parsed.append(
-            _nonblank_string(
-                _required(item, "name", endpoint, f"{item_field}.name"),
-                endpoint,
-                f"{item_field}.name",
-            )
+            _sanitize_url_string(normalized)
+            if sanitize_urls
+            else normalized
         )
     return tuple(parsed)
 
 
-def _string_inventory(value: Any, endpoint: str, field: str) -> tuple[str, ...]:
-    items = _list(value, endpoint, field)
-    return tuple(
-        _nonblank_string(item, endpoint, f"{field}[{index}]")
-        for index, item in enumerate(items)
-    )
-
-
-def _owner(
-    value: Any,
+def _engagement(
+    statistics: _ProviderStatistics,
     endpoint: str,
     field: str,
-) -> tuple[str, str]:
-    owner = _mapping(value, endpoint, field)
-    owner_id = _workflow_id(
-        _required(owner, "id", endpoint, f"{field}.id"),
-        endpoint,
-        f"{field}.id",
-    )
-    owner_name = _nonblank_string(
-        _required(owner, "name", endpoint, f"{field}.name"),
-        endpoint,
-        f"{field}.name",
-    )
-    return owner_id, owner_name
-
-
-def _engagement(value: Any, endpoint: str, field: str) -> Engagement:
-    statistics = _mapping(value, endpoint, field)
-
-    def count(key: str) -> int:
-        path = f"{field}.{key}"
+) -> Engagement:
+    def count(value: str, key: str) -> int:
         return _integer(
-            _required(statistics, key, endpoint, path),
+            value,
             endpoint,
-            path,
+            f"{field}.{key}",
             minimum=0,
         )
 
-    return Engagement(
-        likes=count("likeCount"),
-        uses=count("useCount"),
-        collects=count("collectCount"),
-        downloads=count("downloadCount"),
-        views=count("pv"),
-    )
+    try:
+        return Engagement(
+            likes=count(statistics.likeCount, "likeCount"),
+            uses=count(statistics.useCount, "useCount"),
+            collects=count(statistics.collectCount, "collectCount"),
+            downloads=count(statistics.downloadCount, "downloadCount"),
+            views=count(statistics.pv, "pv"),
+        )
+    except ValidationError as error:
+        _normalized_model_error(endpoint, field, error)
 
 
 def _classification(
@@ -604,7 +626,13 @@ def _classification(
                     reasons.append(f"{label} term '{term}' in {source}")
         return tuple(reasons)
 
-    nsfw_reasons = matches(NSFW_TERMS, "NSFW")
+    phrase_reasons = tuple(
+        f"NSFW phrase '{phrase}' in {source}"
+        for source, text in evidence
+        for phrase, pattern in NSFW_PHRASE_PATTERNS
+        if pattern.search(text) is not None
+    )
+    nsfw_reasons = phrase_reasons + matches(NSFW_TERMS, "NSFW")
     if nsfw_reasons:
         return ContentClassification.NSFW, nsfw_reasons
 
@@ -619,65 +647,44 @@ def _classification(
 
 
 def _candidate(
-    value: dict[str, Any],
+    value: ProviderRecord,
     *,
     endpoint: str,
     field: str,
     canonical_url: str,
     used_models: tuple[str, ...] = (),
-    require_labels: bool = False,
 ) -> WorkflowCandidate:
-    workflow_id = _workflow_id(
-        _required(value, "id", endpoint, f"{field}.id"),
-        endpoint,
-        f"{field}.id",
-    )
     name = _nonblank_string(
-        _required(value, "name", endpoint, f"{field}.name"),
+        value.name,
         endpoint,
         f"{field}.name",
     )
-    raw_description = _optional_string(
-        _required(value, "desc", endpoint, f"{field}.desc"),
-        endpoint,
-        f"{field}.desc",
-    )
-    description = None if raw_description is None else _plain_text(raw_description)
+    description = _plain_text(value.desc)
     published_at = _published_at(
-        _required(value, "publishTime", endpoint, f"{field}.publishTime"),
+        value.publishTime,
         endpoint,
         f"{field}.publishTime",
     )
-    owner_id, owner_name = _owner(
-        _required(value, "owner", endpoint, f"{field}.owner"),
+    owner_name = _nonblank_string(
+        value.owner.name,
         endpoint,
-        f"{field}.owner",
+        f"{field}.owner.name",
     )
     engagement = _engagement(
-        _required(
-            value,
-            "statisticsInfo",
-            endpoint,
-            f"{field}.statisticsInfo",
-        ),
+        value.statisticsInfo,
         endpoint,
         f"{field}.statisticsInfo",
     )
     tags = _tags(
-        _required(value, "tags", endpoint, f"{field}.tags"),
+        value.tags,
         endpoint,
         f"{field}.tags",
     )
     covers = _covers(
-        _required(value, "covers", endpoint, f"{field}.covers"),
+        value.covers,
         endpoint,
         f"{field}.covers",
     )
-
-    if require_labels:
-        labels = _required(value, "labels", endpoint, f"{field}.labels")
-        if labels is not None and not isinstance(labels, str):
-            _schema_error(endpoint, f"{field}.labels", "expected a string or null")
 
     classification, reasons = _classification(
         name=name,
@@ -689,11 +696,11 @@ def _candidate(
     try:
         return WorkflowCandidate(
             executor="runninghub",
-            workflow_id=workflow_id,
+            workflow_id=value.id,
             canonical_url=canonical_url,
             name=name,
             description=description,
-            author_id=owner_id,
+            author_id=value.owner.id,
             author_name=owner_name,
             published_at=published_at,
             tags=tags,
@@ -703,11 +710,13 @@ def _candidate(
             classification_reasons=reasons,
             provider_metadata={
                 "endpoint": endpoint,
-                "record": _sanitize_provider_value(value),
+                "record": _sanitize_provider_value(
+                    value.model_dump(mode="python")
+                ),
             },
         )
-    except (ValidationError, ValueError):
-        _schema_error(endpoint, field, "mapped candidate is malformed")
+    except ValidationError as error:
+        _normalized_model_error(endpoint, field, error)
 
 
 class RunningHubExecutor(Executor):
@@ -720,8 +729,10 @@ class RunningHubExecutor(Executor):
         session: requests.Session | None = None,
         graph_fetcher: GraphFetcher | None = None,
     ) -> None:
-        self.session = session or requests.Session()
-        self.graph_fetcher = graph_fetcher or get_workflow_json
+        self.session = requests.Session() if session is None else session
+        self.graph_fetcher = (
+            get_workflow_json if graph_fetcher is None else graph_fetcher
+        )
 
     @property
     def name(self) -> str:
@@ -747,7 +758,7 @@ class RunningHubExecutor(Executor):
 
         try:
             payload = response.json()
-        except (ValueError, requests.JSONDecodeError):
+        except ValueError:
             _schema_error(endpoint, "response JSON", "body is not valid JSON")
 
         envelope = _validate_provider_schema(
@@ -755,13 +766,16 @@ class RunningHubExecutor(Executor):
             payload,
             endpoint,
         )
-        code = _integer(
-            envelope.code,
-            endpoint,
-            "code",
-        )
-        if code != 0:
-            _schema_error(endpoint, "code", f"expected 0, received {code}")
+        if envelope.code != 0:
+            raise ProviderResponseError(
+                endpoint=endpoint,
+                code=envelope.code,
+                message=_sanitize_provider_diagnostic(envelope.msg),
+                error_messages=tuple(
+                    _sanitize_provider_diagnostic(message)
+                    for message in (envelope.errorMessages or ())
+                ),
+            )
         return _validate_provider_schema(schema, payload, endpoint)
 
     def search(self, request: SearchRequest) -> SearchPage:
@@ -777,102 +791,54 @@ class RunningHubExecutor(Executor):
             },
             schema=_SearchEnvelope,
         )
-        data = envelope.data.model_dump(mode="python")
-        records_value = _required(data, "records", SEARCH_ENDPOINT, "data.records")
-        records = _list(records_value, SEARCH_ENDPOINT, "data.records")
+        data = envelope.data
         candidates = tuple(
             _candidate(
-                _mapping(
-                    record,
-                    SEARCH_ENDPOINT,
-                    f"data.records[{index}]",
-                ),
+                record,
                 endpoint=SEARCH_ENDPOINT,
                 field=f"data.records[{index}]",
                 canonical_url=(
-                    "https://www.runninghub.ai/post/"
-                    + _workflow_id(
-                        _required(
-                            _mapping(
-                                record,
-                                SEARCH_ENDPOINT,
-                                f"data.records[{index}]",
-                            ),
-                            "id",
-                            SEARCH_ENDPOINT,
-                            f"data.records[{index}].id",
-                        ),
-                        SEARCH_ENDPOINT,
-                        f"data.records[{index}].id",
-                    )
+                    f"https://www.runninghub.ai/post/{record.id}"
                 ),
-                require_labels=True,
             )
-            for index, record in enumerate(records)
+            for index, record in enumerate(data.records)
         )
 
         size = _integer(
-            _required(data, "size", SEARCH_ENDPOINT, "data.size"),
+            data.size,
             SEARCH_ENDPOINT,
             "data.size",
             minimum=1,
         )
         current = _integer(
-            _required(data, "current", SEARCH_ENDPOINT, "data.current"),
+            data.current,
             SEARCH_ENDPOINT,
             "data.current",
             minimum=1,
         )
         total = _integer(
-            _required(data, "total", SEARCH_ENDPOINT, "data.total"),
+            data.total,
             SEARCH_ENDPOINT,
             "data.total",
             minimum=0,
         )
         _integer(
-            _required(data, "pages", SEARCH_ENDPOINT, "data.pages"),
+            data.pages,
             SEARCH_ENDPOINT,
             "data.pages",
             minimum=0,
         )
-        has_next = _boolean(
-            _required(data, "hasNext", SEARCH_ENDPOINT, "data.hasNext"),
-            SEARCH_ENDPOINT,
-            "data.hasNext",
-        )
-        _boolean(
-            _required(
-                data,
-                "hasPrevious",
-                SEARCH_ENDPOINT,
-                "data.hasPrevious",
-            ),
-            SEARCH_ENDPOINT,
-            "data.hasPrevious",
-        )
-        next_cursor = _required(
-            data,
-            "nextCursor",
-            SEARCH_ENDPOINT,
-            "data.nextCursor",
-        )
-        if next_cursor is not None and (
-            isinstance(next_cursor, bool)
-            or not isinstance(next_cursor, (str, int))
-        ):
-            _schema_error(
-                SEARCH_ENDPOINT,
-                "data.nextCursor",
-                "expected a string, integer, or null",
-            )
 
-        return SearchPage(
-            records=candidates,
-            total=total,
-            page=current,
-            size=size,
-            has_next=has_next,
-        )
+        try:
+            return SearchPage(
+                records=candidates,
+                total=total,
+                page=current,
+                size=size,
+                has_next=data.hasNext,
+            )
+        except ValidationError as error:
+            _normalized_model_error(SEARCH_ENDPOINT, "data", error)
 
     def detail(
         self,
@@ -892,13 +858,8 @@ class RunningHubExecutor(Executor):
             body={"workflowId": requested_id},
             schema=_DetailEnvelope,
         )
-        data = envelope.data.model_dump(mode="python")
-        returned_id = _workflow_id(
-            _required(data, "id", DETAIL_ENDPOINT, "data.id"),
-            DETAIL_ENDPOINT,
-            "data.id",
-        )
-        if returned_id != requested_id:
+        data = envelope.data
+        if data.id != requested_id:
             _schema_error(
                 DETAIL_ENDPOINT,
                 "data.id",
@@ -906,56 +867,25 @@ class RunningHubExecutor(Executor):
             )
 
         primitive_nodes = _string_inventory(
-            _required(
-                data,
-                "primitiveNodes",
-                DETAIL_ENDPOINT,
-                "data.primitiveNodes",
-            ),
+            data.primitiveNodes,
             DETAIL_ENDPOINT,
             "data.primitiveNodes",
         )
         custom_nodes = _string_inventory(
-            _required(
-                data,
-                "customNodes",
-                DETAIL_ENDPOINT,
-                "data.customNodes",
-            ),
+            data.customNodes,
             DETAIL_ENDPOINT,
             "data.customNodes",
         )
         used_models = _string_inventory(
-            _required(
-                data,
-                "usedModels",
-                DETAIL_ENDPOINT,
-                "data.usedModels",
-            ),
+            data.usedModels,
             DETAIL_ENDPOINT,
             "data.usedModels",
+            sanitize_urls=True,
         )
-        node_count = _integer(
-            _required(data, "nodeCount", DETAIL_ENDPOINT, "data.nodeCount"),
-            DETAIL_ENDPOINT,
-            "data.nodeCount",
-            minimum=0,
-        )
-        preview_value = _required(
-            data,
-            "preview",
+        preview = _cover(
+            data.preview,
             DETAIL_ENDPOINT,
             "data.preview",
-        )
-        preview = (
-            None
-            if preview_value is None
-            else _cover(preview_value, DETAIL_ENDPOINT, "data.preview")
-        )
-        webapp_id = _optional_identifier(
-            _required(data, "webappId", DETAIL_ENDPOINT, "data.webappId"),
-            DETAIL_ENDPOINT,
-            "data.webappId",
         )
         candidate = _candidate(
             data,
@@ -968,15 +898,15 @@ class RunningHubExecutor(Executor):
         try:
             return WorkflowDetail(
                 candidate=candidate,
-                node_count=node_count,
+                node_count=data.nodeCount,
                 primitive_nodes=primitive_nodes,
                 custom_nodes=custom_nodes,
                 used_models=used_models,
                 preview=preview,
-                webapp_id=webapp_id,
+                webapp_id=data.webappId,
             )
-        except ValidationError:
-            _schema_error(DETAIL_ENDPOINT, "data", "mapped detail is malformed")
+        except ValidationError as error:
+            _normalized_model_error(DETAIL_ENDPOINT, "data", error)
 
     def fetch_workflow(self, ref: WorkflowRef) -> FetchedWorkflow:
         if ref.executor != self.name:
@@ -1009,7 +939,7 @@ class RunningHubExecutor(Executor):
         if isinstance(raw_graph, str):
             try:
                 graph = json.loads(raw_graph)
-            except json.JSONDecodeError:
+            except ValueError:
                 _schema_error(GRAPH_ENDPOINT, "graph", "expected a JSON object")
         if not isinstance(graph, dict):
             _schema_error(GRAPH_ENDPOINT, "graph", "expected a JSON object")
@@ -1028,11 +958,20 @@ class RunningHubExecutor(Executor):
         required_nodes = tuple(
             sorted(set(detail.primitive_nodes + detail.custom_nodes))
         )
+        unique_models = set(detail.used_models)
         lora_names = tuple(
-            sorted({name for name in detail.used_models if "lora" in name.casefold()})
+            sorted(
+                name
+                for name in unique_models
+                if LORA_INVENTORY_TOKEN.search(name) is not None
+            )
         )
         model_names = tuple(
-            sorted(set(detail.used_models).difference(lora_names))
+            sorted(
+                name
+                for name in unique_models
+                if LORA_INVENTORY_TOKEN.search(name) is None
+            )
         )
         output_hints = tuple(
             sorted(
