@@ -3,13 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 from html.parser import HTMLParser
+from ipaddress import ip_address
 import json
 import re
 from typing import Annotated, Any, NoReturn, TypeVar
 from urllib.parse import urlsplit
 
 from mp_runninghub_api.runninghub import get_workflow_json
-from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 import requests
 
 from mp_comfyui_lab.discovery.models import (
@@ -57,18 +58,6 @@ SFW_TERMS = frozenset({"sfw", "safe for work", "\u5b89\u5168"})
 GraphFetcher = Callable[[str | None, str], Any]
 
 
-def _provider_nonnegative_number(value: int | str) -> int | str:
-    if isinstance(value, bool):
-        raise ValueError("expected a non-negative integer or numeric string")
-    if isinstance(value, int):
-        if value < 0:
-            raise ValueError("expected a non-negative integer or numeric string")
-        return value
-    if re.fullmatch(r"[0-9]+", value) is None:
-        raise ValueError("expected a non-negative integer or numeric string")
-    return value
-
-
 def _provider_aware_timestamp(value: str) -> str:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -80,19 +69,58 @@ def _provider_aware_timestamp(value: str) -> str:
 
 
 def _provider_http_url(value: str) -> str:
+    if any(
+        character.isspace()
+        or ord(character) < 0x20
+        or ord(character) == 0x7F
+        for character in value
+    ):
+        raise ValueError("URL must not contain whitespace or control characters")
+
     try:
         parsed = urlsplit(value)
-    except ValueError:
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError):
         raise ValueError("expected a valid HTTP(S) URL") from None
-    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+    ):
         raise ValueError("expected a valid HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL credentials are not allowed")
+    if parsed.netloc.endswith(":") or port == 0:
+        raise ValueError("expected a valid HTTP(S) URL port")
+
+    try:
+        ip_address(hostname)
+    except ValueError:
+        try:
+            ascii_hostname = hostname.encode("idna").decode("ascii").rstrip(".")
+        except UnicodeError:
+            raise ValueError("expected a valid hostname") from None
+        labels = ascii_hostname.split(".")
+        if (
+            not ascii_hostname
+            or len(ascii_hostname) > 253
+            or any(
+                re.fullmatch(
+                    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                    label,
+                )
+                is None
+                for label in labels
+            )
+        ):
+            raise ValueError("expected a valid hostname")
     return value
 
 
-ProviderNumber = Annotated[
-    int | str,
-    AfterValidator(_provider_nonnegative_number),
-]
+ProviderNumericString = Annotated[str, Field(pattern=r"^[0-9]+$")]
+ProviderNonnegativeInt = Annotated[int, Field(ge=0)]
 ProviderTimestamp = Annotated[str, AfterValidator(_provider_aware_timestamp)]
 ProviderHttpUrl = Annotated[str, AfterValidator(_provider_http_url)]
 
@@ -107,102 +135,102 @@ class _ProviderModel(BaseModel):
 
 
 class _ProviderOwner(_ProviderModel):
-    id: ProviderNumber
+    id: ProviderNumericString
     avatar: ProviderHttpUrl
     name: str
 
 
 class _ProviderStatistics(_ProviderModel):
-    likeCount: ProviderNumber
-    downloadCount: ProviderNumber
-    useCount: ProviderNumber
-    pv: ProviderNumber
-    collectCount: ProviderNumber
+    likeCount: ProviderNumericString
+    downloadCount: ProviderNumericString
+    useCount: ProviderNumericString
+    pv: ProviderNumericString
+    collectCount: ProviderNumericString
 
 
 class _ProviderTag(_ProviderModel):
-    id: ProviderNumber
+    id: ProviderNumericString
     name: str
     nameEn: str
     labels: None
 
 
 class _ProviderCover(_ProviderModel):
-    id: ProviderNumber
+    id: ProviderNumericString
     objName: str | None
     url: ProviderHttpUrl
     thumbnailUri: ProviderHttpUrl
-    imageWidth: ProviderNumber
-    imageHeight: ProviderNumber
+    imageWidth: ProviderNumericString
+    imageHeight: ProviderNumericString
 
 
 class _ProviderEnvelope(_ProviderModel):
-    code: ProviderNumber
+    code: ProviderNonnegativeInt
     msg: str
     errorMessages: list[str] | None
     data: Any
 
 
 class _SearchRecord(_ProviderModel):
-    id: ProviderNumber
+    id: ProviderNumericString
     name: str
     desc: str
     systemWorkflow: bool
     publishTime: ProviderTimestamp
-    timestamp: ProviderNumber
-    preview: _ProviderCover | None
+    timestamp: ProviderNumericString
+    preview: None
     owner: _ProviderOwner
     statisticsInfo: _ProviderStatistics
-    nodeCount: ProviderNumber | None
-    liked: int
+    nodeCount: None
+    liked: ProviderNonnegativeInt
     covers: list[_ProviderCover]
     tags: list[_ProviderTag]
     labels: str
-    seq: ProviderNumber
+    seq: ProviderNumericString
     homeShow: None
 
 
 class _SearchData(_ProviderModel):
     records: list[_SearchRecord]
-    size: ProviderNumber
-    current: ProviderNumber
-    total: ProviderNumber
-    pages: ProviderNumber
+    size: ProviderNumericString
+    current: ProviderNumericString
+    total: ProviderNumericString
+    pages: ProviderNumericString
     hasNext: bool
     hasPrevious: bool
-    nextCursor: ProviderNumber | None
+    nextCursor: None
 
 
 class _SearchEnvelope(_ProviderModel):
-    code: ProviderNumber
+    code: ProviderNonnegativeInt
     msg: str
     errorMessages: list[str] | None
     data: _SearchData
 
 
 class _ProviderPublishAccess(_ProviderModel):
-    accessType: int
-    publishScope: int
+    accessType: ProviderNonnegativeInt
+    publishScope: ProviderNonnegativeInt
     encrypted: bool
     granted: bool
     needPassword: bool
     owner: bool
-    visibleUsers: list[ProviderNumber]
+    visibleUsers: Annotated[list[Any], Field(max_length=0)]
 
 
 class _DetailData(_ProviderModel):
-    id: ProviderNumber
+    id: ProviderNumericString
     name: str
     desc: str
     systemWorkflow: bool
     publishTime: ProviderTimestamp
-    timestamp: ProviderNumber
+    timestamp: ProviderNumericString
     md5: None
     imageSize: None
     preview: _ProviderCover
     owner: _ProviderOwner
     workflowContent: None
-    nodeCount: ProviderNumber
+    nodeCount: ProviderNonnegativeInt
     statisticsInfo: _ProviderStatistics
     labels: str
     tags: list[_ProviderTag]
@@ -213,20 +241,20 @@ class _DetailData(_ProviderModel):
     customNodes: list[str]
     usedModels: list[str]
     liked: bool
-    likeCount: ProviderNumber
+    likeCount: ProviderNumericString
     collect: bool
-    collectCount: ProviderNumber
-    webappId: ProviderNumber
-    status: int
-    workflowState: int
-    webappState: int
+    collectCount: ProviderNumericString
+    webappId: ProviderNumericString
+    status: ProviderNonnegativeInt
+    workflowState: ProviderNonnegativeInt
+    webappState: ProviderNonnegativeInt
     publishAccess: _ProviderPublishAccess
     canModifyPublishType: bool
     canModifyPublishScope: bool
 
 
 class _DetailEnvelope(_ProviderModel):
-    code: ProviderNumber
+    code: ProviderNonnegativeInt
     msg: str
     errorMessages: list[str] | None
     data: _DetailData

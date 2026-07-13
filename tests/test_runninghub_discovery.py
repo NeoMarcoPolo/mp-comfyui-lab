@@ -474,6 +474,7 @@ def test_nonzero_detail_code_names_endpoint_and_code_field() -> None:
 @pytest.mark.parametrize(
     ("mutation", "field"),
     [
+        (lambda body: body.__setitem__("code", "0"), "code"),
         (lambda body: body.pop("msg"), "msg"),
         (lambda body: body.__setitem__("msg", 1), "msg"),
         (lambda body: body.pop("errorMessages"), "errorMessages"),
@@ -500,7 +501,7 @@ def test_search_envelope_drift_names_endpoint_and_failing_field(
 
     message = str(raised.value)
     assert "api/search/workflow" in message
-    assert field in message
+    assert f"invalid field {field}:" in message
 
 
 @pytest.mark.parametrize(
@@ -508,17 +509,20 @@ def test_search_envelope_drift_names_endpoint_and_failing_field(
     [
         (lambda body: body["data"].pop("records"), "data.records"),
         (lambda body: body["data"].__setitem__("records", {}), "data.records"),
-        (lambda body: body["data"]["records"][0].pop("name"), "records[0].name"),
+        (
+            lambda body: body["data"]["records"][0].pop("name"),
+            "data.records[0].name",
+        ),
         (
             lambda body: body["data"]["records"][0]["statisticsInfo"].__setitem__(
                 "useCount", "many"
             ),
-            "records[0].statisticsInfo.useCount",
+            "data.records[0].statisticsInfo.useCount",
         ),
         (lambda body: body["data"].__setitem__("total", "many"), "data.total"),
         (
             lambda body: body["data"]["records"][0].__setitem__("tags", "tag"),
-            "records[0].tags",
+            "data.records[0].tags",
         ),
         (
             lambda body: body["data"]["records"][0]["owner"].__setitem__(
@@ -571,7 +575,81 @@ def test_search_schema_drift_names_endpoint_and_failing_field(
 
     message = str(raised.value)
     assert "api/search/workflow" in message
-    assert field in message
+    assert f"invalid field {field}:" in message
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field"),
+    [
+        (
+            lambda body: body["data"]["records"][0].__setitem__(
+                "id", 2004195228674387969
+            ),
+            "data.records[0].id",
+        ),
+        (
+            lambda body: body["data"]["records"][0]["statisticsInfo"].__setitem__(
+                "useCount", 11977
+            ),
+            "data.records[0].statisticsInfo.useCount",
+        ),
+        (
+            lambda body: body["data"]["records"][0]["covers"][0].__setitem__(
+                "id", 2004197847220318209
+            ),
+            "data.records[0].covers[0].id",
+        ),
+        (lambda body: body["data"].__setitem__("size", 3), "data.size"),
+        (lambda body: body["data"].__setitem__("nextCursor", 1), "data.nextCursor"),
+    ],
+)
+def test_search_rejects_wrong_provider_numeric_representations(
+    mutation: Any,
+    field: str,
+) -> None:
+    payload = _load_fixture("search_qwen_reputation.json")
+    mutation(payload)
+    executor = _executor()
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.search_url, payload)
+        with pytest.raises(ProviderSchemaError) as raised:
+            executor.search(SearchRequest(query="qwen", size=3))
+
+    message = str(raised.value)
+    assert "api/search/workflow" in message
+    assert f"invalid field {field}:" in message
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        " https://assets.example/image.png",
+        "https://bad host.example/image.png",
+        "https://assets.example/image name.png",
+        "https://assets.example/image.png\n?token=secret",
+        "https://assets.\texample/image.png",
+        "https://assets.example/image\x01.png",
+        "https://user:password@assets.example/image.png",
+        "https:///image.png",
+        "https://-bad.example/image.png",
+        "https://assets.example:not-a-port/image.png",
+        "https://assets.example:70000/image.png",
+    ],
+)
+def test_search_rejects_malformed_provider_http_urls(url: str) -> None:
+    payload = _load_fixture("search_qwen_reputation.json")
+    payload["data"]["records"][0]["owner"]["avatar"] = url
+    executor = _executor()
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.search_url, payload)
+        with pytest.raises(ProviderSchemaError) as raised:
+            executor.search(SearchRequest(query="qwen", size=3))
+
+    message = str(raised.value)
+    assert "api/search/workflow" in message
+    assert "invalid field data.records[0].owner.avatar:" in message
 
 
 @pytest.mark.parametrize(
@@ -618,7 +696,47 @@ def test_detail_schema_drift_names_endpoint_and_failing_field(
 
     message = str(raised.value)
     assert "portal/workflow/detail" in message
-    assert field in message
+    assert f"invalid field {field}:" in message
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field"),
+    [
+        (
+            lambda body: body["data"].__setitem__(
+                "id", 1980860923768426497
+            ),
+            "data.id",
+        ),
+        (
+            lambda body: body["data"].__setitem__("nodeCount", "148"),
+            "data.nodeCount",
+        ),
+        (lambda body: body["data"].__setitem__("status", "1"), "data.status"),
+        (
+            lambda body: body["data"]["publishAccess"].__setitem__(
+                "accessType", "0"
+            ),
+            "data.publishAccess.accessType",
+        ),
+    ],
+)
+def test_detail_rejects_wrong_provider_numeric_representations(
+    mutation: Any,
+    field: str,
+) -> None:
+    payload = _load_fixture("detail_next_scene.json")
+    mutation(payload)
+    executor = _executor()
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.detail_url, payload)
+        with pytest.raises(ProviderSchemaError) as raised:
+            executor.detail(WORKFLOW_ID)
+
+    message = str(raised.value)
+    assert "portal/workflow/detail" in message
+    assert f"invalid field {field}:" in message
 
 
 def test_detail_rejects_mismatched_workflow_id_before_graph_fetch() -> None:
