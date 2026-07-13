@@ -482,6 +482,7 @@ def test_nonzero_detail_code_names_endpoint_and_code_field() -> None:
             "errorMessages",
         ),
         (lambda body: body.__setitem__("errorMessages", [1]), "errorMessages[0]"),
+        (lambda body: body.__setitem__("unexpected", True), "unexpected"),
     ],
 )
 def test_search_envelope_drift_names_endpoint_and_failing_field(
@@ -519,6 +520,40 @@ def test_search_envelope_drift_names_endpoint_and_failing_field(
             lambda body: body["data"]["records"][0].__setitem__("tags", "tag"),
             "records[0].tags",
         ),
+        (
+            lambda body: body["data"]["records"][0]["owner"].__setitem__(
+                "avatar", 123
+            ),
+            "data.records[0].owner.avatar",
+        ),
+        (
+            lambda body: body["data"]["records"][0]["tags"][0].__setitem__(
+                "nameEn", 123
+            ),
+            "data.records[0].tags[0].nameEn",
+        ),
+        (
+            lambda body: body["data"]["records"][0]["covers"][0].__setitem__(
+                "id", "not-an-id"
+            ),
+            "data.records[0].covers[0].id",
+        ),
+        (
+            lambda body: body["data"]["records"][0].pop("systemWorkflow"),
+            "data.records[0].systemWorkflow",
+        ),
+        (
+            lambda body: body["data"]["records"][0]["owner"].__setitem__(
+                "unexpected", True
+            ),
+            "data.records[0].owner.unexpected",
+        ),
+        (
+            lambda body: body["data"]["records"][0].__setitem__(
+                "apiKey", "must-not-normalize"
+            ),
+            "data.records[0].apiKey",
+        ),
     ],
 )
 def test_search_schema_drift_names_endpoint_and_failing_field(
@@ -555,6 +590,17 @@ def test_search_schema_drift_names_endpoint_and_failing_field(
             "data.preview.imageWidth",
         ),
         (lambda body: body["data"].pop("owner"), "data.owner"),
+        (
+            lambda body: body["data"].__setitem__("labels", 123),
+            "data.labels",
+        ),
+        (lambda body: body["data"].pop("status"), "data.status"),
+        (
+            lambda body: body["data"]["publishAccess"].__setitem__(
+                "unexpected", True
+            ),
+            "data.publishAccess.unexpected",
+        ),
     ],
 )
 def test_detail_schema_drift_names_endpoint_and_failing_field(
@@ -614,21 +660,16 @@ def test_network_errors_become_provider_errors_without_credentials() -> None:
     assert "session-secret" not in message
 
 
-def test_provider_metadata_is_frozen_and_redacts_credentials() -> None:
+def test_provider_metadata_is_frozen_and_sanitizes_validated_url_credentials() -> None:
     payload = _load_fixture("search_qwen_reputation.json")
     first_record = payload["data"]["records"][0]
     signed_url = (
         "https://assets.example/image.png"
         "?X-Amz-Credential=url-secret&X-Amz-Signature=signed-secret"
     )
-    first_record["apiKey"] = "super-secret"
-    first_record["cookie"] = "session-secret"
-    first_record["assetUrl"] = (
-        "https://assets.example/image.png?X-Amz-Credential=super-secret"
-    )
     first_record["owner"]["avatar"] = signed_url
+    first_record["covers"][0]["url"] = signed_url
     first_record["covers"][0]["thumbnailUri"] = signed_url
-    first_record["gallery"] = [signed_url, {"href": signed_url}]
     executor = _executor()
 
     with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
@@ -638,23 +679,19 @@ def test_provider_metadata_is_frozen_and_redacts_credentials() -> None:
     metadata = thaw_json(candidate.provider_metadata)
     serialized = json.dumps(metadata)
     assert isinstance(candidate.provider_metadata, FrozenDict)
-    assert "super-secret" not in serialized
-    assert "session-secret" not in serialized
     assert "url-secret" not in serialized
     assert "signed-secret" not in serialized
-    assert metadata["record"]["apiKey"] == "[REDACTED]"
-    assert metadata["record"]["cookie"] == "[REDACTED]"
-    assert metadata["record"]["assetUrl"] == "https://assets.example/image.png"
     assert metadata["record"]["owner"]["avatar"] == (
+        "https://assets.example/image.png"
+    )
+    assert metadata["record"]["covers"][0]["url"] == (
         "https://assets.example/image.png"
     )
     assert metadata["record"]["covers"][0]["thumbnailUri"] == (
         "https://assets.example/image.png"
     )
-    assert metadata["record"]["gallery"] == [
-        "https://assets.example/image.png",
-        {"href": "https://assets.example/image.png"},
-    ]
+    assert candidate.covers[0].url == "https://assets.example/image.png"
+    assert candidate.covers[0].thumbnail_url == "https://assets.example/image.png"
 
 
 def test_graph_fetch_errors_do_not_expose_provider_credentials() -> None:

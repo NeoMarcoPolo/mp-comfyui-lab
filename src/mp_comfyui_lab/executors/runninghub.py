@@ -5,10 +5,11 @@ from datetime import UTC, datetime
 from html.parser import HTMLParser
 import json
 import re
-from typing import Any, NoReturn
+from typing import Annotated, Any, NoReturn, TypeVar
+from urllib.parse import urlsplit
 
 from mp_runninghub_api.runninghub import get_workflow_json
-from pydantic import ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationError
 import requests
 
 from mp_comfyui_lab.discovery.models import (
@@ -56,6 +57,184 @@ SFW_TERMS = frozenset({"sfw", "safe for work", "\u5b89\u5168"})
 GraphFetcher = Callable[[str | None, str], Any]
 
 
+def _provider_nonnegative_number(value: int | str) -> int | str:
+    if isinstance(value, bool):
+        raise ValueError("expected a non-negative integer or numeric string")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("expected a non-negative integer or numeric string")
+        return value
+    if re.fullmatch(r"[0-9]+", value) is None:
+        raise ValueError("expected a non-negative integer or numeric string")
+    return value
+
+
+def _provider_aware_timestamp(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("expected an ISO-8601 timestamp") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp must include a timezone")
+    return value
+
+
+def _provider_http_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        raise ValueError("expected a valid HTTP(S) URL") from None
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("expected a valid HTTP(S) URL")
+    return value
+
+
+ProviderNumber = Annotated[
+    int | str,
+    AfterValidator(_provider_nonnegative_number),
+]
+ProviderTimestamp = Annotated[str, AfterValidator(_provider_aware_timestamp)]
+ProviderHttpUrl = Annotated[str, AfterValidator(_provider_http_url)]
+
+
+class _ProviderModel(BaseModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        allow_inf_nan=False,
+    )
+
+
+class _ProviderOwner(_ProviderModel):
+    id: ProviderNumber
+    avatar: ProviderHttpUrl
+    name: str
+
+
+class _ProviderStatistics(_ProviderModel):
+    likeCount: ProviderNumber
+    downloadCount: ProviderNumber
+    useCount: ProviderNumber
+    pv: ProviderNumber
+    collectCount: ProviderNumber
+
+
+class _ProviderTag(_ProviderModel):
+    id: ProviderNumber
+    name: str
+    nameEn: str
+    labels: None
+
+
+class _ProviderCover(_ProviderModel):
+    id: ProviderNumber
+    objName: str | None
+    url: ProviderHttpUrl
+    thumbnailUri: ProviderHttpUrl
+    imageWidth: ProviderNumber
+    imageHeight: ProviderNumber
+
+
+class _ProviderEnvelope(_ProviderModel):
+    code: ProviderNumber
+    msg: str
+    errorMessages: list[str] | None
+    data: Any
+
+
+class _SearchRecord(_ProviderModel):
+    id: ProviderNumber
+    name: str
+    desc: str
+    systemWorkflow: bool
+    publishTime: ProviderTimestamp
+    timestamp: ProviderNumber
+    preview: _ProviderCover | None
+    owner: _ProviderOwner
+    statisticsInfo: _ProviderStatistics
+    nodeCount: ProviderNumber | None
+    liked: int
+    covers: list[_ProviderCover]
+    tags: list[_ProviderTag]
+    labels: str
+    seq: ProviderNumber
+    homeShow: None
+
+
+class _SearchData(_ProviderModel):
+    records: list[_SearchRecord]
+    size: ProviderNumber
+    current: ProviderNumber
+    total: ProviderNumber
+    pages: ProviderNumber
+    hasNext: bool
+    hasPrevious: bool
+    nextCursor: ProviderNumber | None
+
+
+class _SearchEnvelope(_ProviderModel):
+    code: ProviderNumber
+    msg: str
+    errorMessages: list[str] | None
+    data: _SearchData
+
+
+class _ProviderPublishAccess(_ProviderModel):
+    accessType: int
+    publishScope: int
+    encrypted: bool
+    granted: bool
+    needPassword: bool
+    owner: bool
+    visibleUsers: list[ProviderNumber]
+
+
+class _DetailData(_ProviderModel):
+    id: ProviderNumber
+    name: str
+    desc: str
+    systemWorkflow: bool
+    publishTime: ProviderTimestamp
+    timestamp: ProviderNumber
+    md5: None
+    imageSize: None
+    preview: _ProviderCover
+    owner: _ProviderOwner
+    workflowContent: None
+    nodeCount: ProviderNumber
+    statisticsInfo: _ProviderStatistics
+    labels: str
+    tags: list[_ProviderTag]
+    covers: list[_ProviderCover]
+    chineseCovers: list[_ProviderCover]
+    englishCovers: list[_ProviderCover]
+    primitiveNodes: list[str]
+    customNodes: list[str]
+    usedModels: list[str]
+    liked: bool
+    likeCount: ProviderNumber
+    collect: bool
+    collectCount: ProviderNumber
+    webappId: ProviderNumber
+    status: int
+    workflowState: int
+    webappState: int
+    publishAccess: _ProviderPublishAccess
+    canModifyPublishType: bool
+    canModifyPublishScope: bool
+
+
+class _DetailEnvelope(_ProviderModel):
+    code: ProviderNumber
+    msg: str
+    errorMessages: list[str] | None
+    data: _DetailData
+
+
+ProviderSchema = TypeVar("ProviderSchema", bound=_ProviderModel)
+
+
 class _PlainTextParser(HTMLParser):
     _HIDDEN_TAGS = frozenset({"script", "style"})
 
@@ -99,6 +278,36 @@ def _schema_error(endpoint: str, field: str, reason: str) -> NoReturn:
     )
 
 
+def _provider_field_path(location: tuple[int | str, ...]) -> str:
+    path = ""
+    for part in location:
+        if isinstance(part, int):
+            path += f"[{part}]"
+        else:
+            path += f".{part}" if path else part
+    return path or "response JSON"
+
+
+def _validate_provider_schema(
+    schema: type[ProviderSchema],
+    value: Any,
+    endpoint: str,
+) -> ProviderSchema:
+    try:
+        return schema.model_validate(value)
+    except ValidationError as error:
+        issue = error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )[0]
+        _schema_error(
+            endpoint,
+            _provider_field_path(issue["loc"]),
+            issue["msg"],
+        )
+
+
 def _required(mapping: dict[str, Any], key: str, endpoint: str, path: str) -> Any:
     if key not in mapping:
         _schema_error(endpoint, path, "field is missing")
@@ -121,20 +330,6 @@ def _nonblank_string(value: Any, endpoint: str, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         _schema_error(endpoint, field, "expected a non-empty string")
     return value.strip()
-
-
-def _string(value: Any, endpoint: str, field: str) -> str:
-    if not isinstance(value, str):
-        _schema_error(endpoint, field, "expected a string")
-    return value
-
-
-def _error_messages(value: Any, endpoint: str, field: str) -> None:
-    if value is None:
-        return
-    messages = _list(value, endpoint, field)
-    for index, message in enumerate(messages):
-        _string(message, endpoint, f"{field}[{index}]")
 
 
 def _workflow_id(value: Any, endpoint: str, field: str) -> str:
@@ -510,7 +705,8 @@ class RunningHubExecutor(Executor):
         url: str,
         endpoint: str,
         body: dict[str, Any],
-    ) -> dict[str, Any]:
+        schema: type[ProviderSchema],
+    ) -> ProviderSchema:
         try:
             response = self.session.post(
                 url,
@@ -526,34 +722,22 @@ class RunningHubExecutor(Executor):
         except (ValueError, requests.JSONDecodeError):
             _schema_error(endpoint, "response JSON", "body is not valid JSON")
 
-        envelope = _mapping(payload, endpoint, "response JSON")
+        envelope = _validate_provider_schema(
+            _ProviderEnvelope,
+            payload,
+            endpoint,
+        )
         code = _integer(
-            _required(envelope, "code", endpoint, "code"),
+            envelope.code,
             endpoint,
             "code",
         )
-        _string(
-            _required(envelope, "msg", endpoint, "msg"),
-            endpoint,
-            "msg",
-        )
-        _error_messages(
-            _required(
-                envelope,
-                "errorMessages",
-                endpoint,
-                "errorMessages",
-            ),
-            endpoint,
-            "errorMessages",
-        )
-        data = _required(envelope, "data", endpoint, "data")
         if code != 0:
             _schema_error(endpoint, "code", f"expected 0, received {code}")
-        return _mapping(data, endpoint, "data")
+        return _validate_provider_schema(schema, payload, endpoint)
 
     def search(self, request: SearchRequest) -> SearchPage:
-        data = self._post_public(
+        envelope = self._post_public(
             url=self.search_url,
             endpoint=SEARCH_ENDPOINT,
             body={
@@ -563,7 +747,9 @@ class RunningHubExecutor(Executor):
                 "tags": [],
                 "sort": request.sort,
             },
+            schema=_SearchEnvelope,
         )
+        data = envelope.data.model_dump(mode="python")
         records_value = _required(data, "records", SEARCH_ENDPOINT, "data.records")
         records = _list(records_value, SEARCH_ENDPOINT, "data.records")
         candidates = tuple(
@@ -672,11 +858,13 @@ class RunningHubExecutor(Executor):
             "request.workflowId",
         )
         candidate_url = _validated_canonical_url(canonical_url, requested_id)
-        data = self._post_public(
+        envelope = self._post_public(
             url=self.detail_url,
             endpoint=DETAIL_ENDPOINT,
             body={"workflowId": requested_id},
+            schema=_DetailEnvelope,
         )
+        data = envelope.data.model_dump(mode="python")
         returned_id = _workflow_id(
             _required(data, "id", DETAIL_ENDPOINT, "data.id"),
             DETAIL_ENDPOINT,
