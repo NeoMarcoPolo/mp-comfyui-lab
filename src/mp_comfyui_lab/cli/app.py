@@ -1,8 +1,6 @@
 import argparse
 import sys
-from contextlib import redirect_stderr, redirect_stdout
 from enum import IntEnum
-from io import StringIO
 from typing import NoReturn, Sequence
 
 from mp_comfyui_lab import __version__
@@ -21,8 +19,24 @@ class ExitCode(IntEnum):
     SAFETY = 9
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mp-comfy-lab")
+class HelpRequested(Exception):
+    pass
+
+
+class UsageError(Exception):
+    pass
+
+
+class StructuredArgumentParser(argparse.ArgumentParser):
+    def print_help(self, file=None) -> NoReturn:
+        raise HelpRequested(self.format_help())
+
+    def error(self, message: str) -> NoReturn:
+        raise UsageError(message)
+
+
+def _build_parser() -> StructuredArgumentParser:
+    parser = StructuredArgumentParser(prog="mp-comfy-lab")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("version")
     return parser
@@ -32,11 +46,13 @@ def main(argv: Sequence[str] | None = None) -> ExitCode:
     arguments = list(sys.argv[1:] if argv is None else argv)
 
     try:
-        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
-            parsed = _build_parser().parse_args(arguments)
-    except SystemExit:
+        parsed = _build_parser().parse_args(arguments)
+    except HelpRequested as error:
+        emit_success("help", {"text": str(error)})
+        return ExitCode.OK
+    except UsageError as error:
         command = arguments[0] if arguments else None
-        emit_error(command, "usage", "invalid command line")
+        emit_error(command, "usage", str(error))
         return ExitCode.USAGE
 
     if parsed.command == "version":
