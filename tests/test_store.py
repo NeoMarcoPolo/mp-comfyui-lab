@@ -246,6 +246,16 @@ def test_sanitize_for_persistence_leaves_non_url_strings_unchanged():
             "first=https://one.example/a;second=https://two.example/b",
         ),
         (
+            "redirect=https://one.example/path"
+            "?next=https://two.example/callback?sig=two",
+            "redirect=https://one.example/path",
+        ),
+        (
+            "redirect=https://one.example/path"
+            "?mode=public&next=https://two.example/callback?sig=two",
+            "redirect=https://one.example/path",
+        ),
+        (
             "query-free [model](https://cdn.example/model.safetensors#card), "
             "plain text",
             "query-free [model](https://cdn.example/model.safetensors#card), "
@@ -288,8 +298,12 @@ def test_sanitize_for_persistence_strips_urls_embedded_in_plain_text():
     }
 
 
-def test_sanitize_for_persistence_redacts_only_exact_secret_key_aliases():
+def test_sanitize_for_persistence_redacts_canonical_secret_key_aliases():
     value = {
+        "Access-Token": "access-secret",
+        "refresh_token": "refresh-secret",
+        "clientSecret": "client-secret",
+        "signedUrl": "https://cdn.example/model?sig=signed-secret",
         "SiGnAtUrE": "signature-secret",
         "credential": "credential-secret",
         "sig": "sig-secret",
@@ -298,7 +312,11 @@ def test_sanitize_for_persistence_redacts_only_exact_secret_key_aliases():
         "apikey": "compact-secret",
         "X-API-KEY": "header-dash-secret",
         "x_api_key": "header-underscore-secret",
-        "client_secret": "client-secret",
+        "X-Amz-Credential": "aws-credential-secret",
+        "x_amz_signature": "aws-signature-secret",
+        "Authorization": "Basic authorization-secret",
+        "Cookies": "cookie-secret",
+        "TOKEN": "token-secret",
         "signatureVersion": "v4",
         "client_secret_hint": "public-name",
     }
@@ -339,6 +357,10 @@ def test_sanitize_for_persistence_redacts_only_exact_secret_key_aliases():
             "upstream rejected Bearer [REDACTED]",
         ),
         (
+            'Bearer "bearer-secret"; Basic \'basic-secret\'; Token token-secret',
+            'Bearer "[REDACTED]"; Basic \'[REDACTED]\'; Token [REDACTED]',
+        ),
+        (
             "cookie='session-secret'; token=token-secret; provider unavailable",
             "cookie='[REDACTED]'; token=[REDACTED]; provider unavailable",
         ),
@@ -347,6 +369,13 @@ def test_sanitize_for_persistence_redacts_only_exact_secret_key_aliases():
             'X-API-KEY="header-secret"; client_secret=client-secret; retry later',
             "SiGnAtUrE='[REDACTED]'; CREDENTIAL=[REDACTED]; "
             'X-API-KEY="[REDACTED]"; client_secret=[REDACTED]; retry later',
+        ),
+        (
+            "xAmzCredential=aws-credential-secret; "
+            "X_AMZ_SIGNATURE='aws-signature-secret'; "
+            "Access-Token=access-secret; RefreshToken=refresh-secret",
+            "xAmzCredential=[REDACTED]; X_AMZ_SIGNATURE='[REDACTED]'; "
+            "Access-Token=[REDACTED]; RefreshToken=[REDACTED]",
         ),
         (
             "asset=https://cdn.example/failure?sv=1&sig=query-secret, retry later",
@@ -368,6 +397,10 @@ def test_sanitize_untrusted_diagnostic_redacts_credentials(value, expected):
 
 def test_sanitize_untrusted_diagnostic_redacts_exact_json_aliases_stably():
     value = {
+        "accessToken": "access-secret",
+        "Refresh-Token": "refresh-secret",
+        "clientSecret": "client-secret",
+        "signedUrl": "https://cdn.example/model?sig=signed-secret",
         "SiGnAtUrE": "signature-secret",
         "credential": "credential-secret",
         "sig": "sig-secret",
@@ -376,7 +409,11 @@ def test_sanitize_untrusted_diagnostic_redacts_exact_json_aliases_stably():
         "apikey": "compact-secret",
         "X-API-KEY": "header-dash-secret",
         "x_api_key": "header-underscore-secret",
-        "client_secret": "client-secret",
+        "X-Amz-Credential": "aws-credential-secret",
+        "x_amz_signature": "aws-signature-secret",
+        "Authorization": "Token authorization-secret",
+        "Cookies": "cookie-secret",
+        "TOKEN": "token-secret",
         "signatureVersion": "v4",
         "message": "provider unavailable",
     }

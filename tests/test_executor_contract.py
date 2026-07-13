@@ -109,16 +109,18 @@ def test_provider_response_error_is_structured_immutable_and_semantic() -> None:
     unsafe_error = ProviderResponseError(
         endpoint="/api/provider/action",
         code=500,
-        message="aUtHoRiZaTiOn: Basic basic-secret; provider failed",
+        message='Bearer "message-secret"; provider failed',
         error_messages=(
-            '{"X-API-KEY":"json-secret","message":"provider failed"}',
-            "SiGnAtUrE=signature-secret client_secret=client-secret",
+            '{"xAmzCredential":"json-secret","message":"provider failed"}',
+            "Basic 'basic-secret'; Token token-secret; "
+            "X_AMZ_SIGNATURE=signature-secret",
         ),
     )
-    assert unsafe_error.message == "aUtHoRiZaTiOn: [REDACTED]; provider failed"
+    assert unsafe_error.message == 'Bearer "[REDACTED]"; provider failed'
     assert unsafe_error.error_messages == (
-        '{"X-API-KEY":"[REDACTED]","message":"provider failed"}',
-        "SiGnAtUrE=[REDACTED] client_secret=[REDACTED]",
+        '{"message":"provider failed","xAmzCredential":"[REDACTED]"}',
+        "Basic '[REDACTED]'; Token [REDACTED]; "
+        "X_AMZ_SIGNATURE=[REDACTED]",
     )
     assert unsafe_error.args == ()
     serialized_error = repr(
@@ -131,10 +133,11 @@ def test_provider_response_error_is_structured_immutable_and_semantic() -> None:
         )
     )
     for secret in (
-        "basic-secret",
+        "message-secret",
         "json-secret",
+        "basic-secret",
+        "token-secret",
         "signature-secret",
-        "client-secret",
     ):
         assert secret not in serialized_error
 
@@ -1348,7 +1351,7 @@ def test_error_and_provider_metadata_serialize_sanitized_and_persist_safely(
 
     assert json.loads(output.model_dump_json())["provider_metadata"] == {
         "api_key": "[REDACTED]",
-        "signedUrl": "https://cdn.test/output.png",
+        "signedUrl": "[REDACTED]",
     }
     assert json.loads(run.model_dump_json())["error"] == {
         "Authorization": "[REDACTED]",
@@ -1371,7 +1374,7 @@ def test_error_and_provider_metadata_serialize_sanitized_and_persist_safely(
     }
     assert persisted["output"]["provider_metadata"] == {
         "api_key": "[REDACTED]",
-        "signedUrl": "https://cdn.test/output.png",
+        "signedUrl": "[REDACTED]",
     }
 
 

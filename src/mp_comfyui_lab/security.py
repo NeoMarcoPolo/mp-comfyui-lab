@@ -5,24 +5,23 @@ import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
 
-SECRET_KEYS = frozenset(
+CANONICAL_SECRET_KEYS = frozenset(
     {
+        "accesstoken",
         "apikey",
-        "api-key",
-        "api_key",
         "authorization",
-        "client_secret",
+        "clientsecret",
         "cookie",
         "cookies",
         "credential",
+        "refreshtoken",
         "sig",
         "signature",
+        "signedurl",
         "token",
-        "access_token",
-        "refresh_token",
-        "signed_url",
-        "x-api-key",
-        "x_api_key",
+        "xamzcredential",
+        "xamzsignature",
+        "xapikey",
     }
 )
 REDACTED = "[REDACTED]"
@@ -49,12 +48,14 @@ TRAILING_URL_BRACKETS = ((")", "("), ("]", "["), ("}", "{"))
 DIAGNOSTIC_ASSIGNMENT_START = re.compile(
     r"(?<![A-Za-z0-9_-])"
     r"(?P<key_quote>[\"']?)"
-    r"(?P<key>[A-Za-z][A-Za-z0-9_-]*)"
+    r"(?P<key>[A-Za-z][A-Za-z0-9_.\-/]*)"
     r"(?P=key_quote)"
     r"(?P<separator>\s*[:=]\s*)",
 )
-DIAGNOSTIC_BEARER = re.compile(
-    r"\bBearer\s+(?!\[REDACTED\])[^\s,;\"'}\]]+",
+DIAGNOSTIC_AUTHORIZATION_SCHEME = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"(?P<scheme>Bearer|Basic|Token|Digest|ApiKey|AWS4-HMAC-SHA256)"
+    r"(?P<separator>\s+)",
     re.IGNORECASE,
 )
 
@@ -63,8 +64,16 @@ class SafetyError(ValueError):
     pass
 
 
+def _canonical_key(value: str) -> str:
+    return "".join(
+        character.casefold()
+        for character in value
+        if character.isalnum()
+    )
+
+
 def _is_secret_key(value: str) -> bool:
-    return value.casefold() in SECRET_KEYS
+    return _canonical_key(value) in CANONICAL_SECRET_KEYS
 
 
 def safe_filename(name: str) -> str:
@@ -144,9 +153,6 @@ def _embedded_url_end(value: str, start: int) -> int:
     index = start + len(HTTP_URL_START.match(value, start).group(0))
 
     while index < len(value):
-        if index > start and HTTP_URL_START.match(value, index) is not None:
-            break
-
         character = value[index]
         if character.isspace() or character in "<>\"'":
             break
@@ -236,8 +242,28 @@ def _redact_diagnostic_assignments(value: str) -> str:
             value,
             match.end(),
             authorization=(
-                match.group("key").casefold() == "authorization"
+                _canonical_key(match.group("key")) == "authorization"
             ),
+        )
+        sanitized.append(value[cursor : match.end()])
+        sanitized.append(replacement)
+        cursor = value_end
+        search_from = value_end
+
+    sanitized.append(value[cursor:])
+    return "".join(sanitized)
+
+
+def _redact_authorization_schemes(value: str) -> str:
+    sanitized: list[str] = []
+    cursor = 0
+    search_from = 0
+
+    while match := DIAGNOSTIC_AUTHORIZATION_SCHEME.search(value, search_from):
+        value_end, replacement = _diagnostic_value_replacement(
+            value,
+            match.end(),
+            authorization=False,
         )
         sanitized.append(value[cursor : match.end()])
         sanitized.append(replacement)
@@ -256,7 +282,7 @@ def _sanitize_diagnostic_text(value: str) -> str:
     normalized = re.sub(r"\s+", " ", without_controls).strip()
     without_url_queries = sanitize_embedded_urls(normalized)
     without_assignments = _redact_diagnostic_assignments(without_url_queries)
-    return DIAGNOSTIC_BEARER.sub("Bearer [REDACTED]", without_assignments)
+    return _redact_authorization_schemes(without_assignments)
 
 
 def _sanitize_diagnostic_json(value: Any) -> Any:

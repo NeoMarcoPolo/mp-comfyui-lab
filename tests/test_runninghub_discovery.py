@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import UTC
 import json
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pytest
@@ -356,6 +357,60 @@ def test_public_detail_maps_inventory_and_strips_executable_html() -> None:
             [],
             ContentClassification.SFW,
         ),
+        (
+            "Portrait workflow",
+            "This workflow is anything but SFW.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "This workflow is hardly SFW.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "This workflow is nowhere near SFW.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "This workflow is SFW... absolutely not.",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "portrait_no_longer_sfw_v2",
+            "A public workflow",
+            [],
+            ContentClassification.NSFW,
+        ),
+        (
+            "Portrait workflow",
+            "Not a problem, this workflow is SFW.",
+            [],
+            ContentClassification.SFW,
+        ),
+        (
+            "Portrait workflow",
+            "Non-commercial but SFW.",
+            [],
+            ContentClassification.SFW,
+        ),
+        (
+            "Portrait workflow",
+            "This workflow could not be more SFW.",
+            [],
+            ContentClassification.SFW,
+        ),
+        (
+            "Portrait workflow",
+            "Not sure whether this workflow is SFW.",
+            [],
+            ContentClassification.UNKNOWN,
+        ),
     ],
 )
 def test_content_classification_uses_explicit_evidence_with_nsfw_precedence(
@@ -385,6 +440,23 @@ def test_content_classification_uses_explicit_evidence_with_nsfw_precedence(
     else:
         assert candidate.classification_reasons
         assert any(expected.value in reason for reason in candidate.classification_reasons)
+
+
+def test_content_classification_is_near_linear_for_many_sfw_tokens() -> None:
+    evidence = " ".join(["sfw"] * 4_000)
+
+    started_at = perf_counter()
+    classification, reasons = runninghub_module._classification(
+        name=evidence,
+        description=None,
+        tags=(),
+        used_models=(),
+    )
+    elapsed = perf_counter() - started_at
+
+    assert classification is ContentClassification.SFW
+    assert reasons
+    assert elapsed < 2.0
 
 
 @pytest.mark.parametrize("as_string", [True, False])

@@ -57,11 +57,18 @@ MAX_GRAPH_DEPTH = 256
 MAX_GRAPH_NODES = 100_000
 
 NSFW_TERMS = frozenset({"nsfw", "nude", "nudity", "\u88f8\u4f53", "\u6210\u4eba", "\u8272\u60c5"})
-SFW_TERMS = frozenset({"sfw", "safe for work", "\u5b89\u5168"})
-SFW_NEGATION_TOKENS = ("not", "never", "non", "unsafe")
-SFW_NEGATION_PAIRS = (
+SFW_CONTEXT_WINDOW = 8
+SFW_CONTRAST_TOKENS = frozenset({"although", "but", "however", "though", "yet"})
+SFW_NEGATIVE_IDIOMS = (
+    ("anything", "but"),
+    ("nowhere", "near"),
     ("no", "longer"),
     ("far", "from"),
+)
+SFW_AFTER_NEGATIVE_IDIOMS = (
+    ("absolutely", "not"),
+    ("certainly", "not"),
+    ("definitely", "not"),
 )
 LORA_INVENTORY_TOKEN = re.compile(
     r"(?<![A-Za-z0-9])loras?(?![A-Za-z0-9])",
@@ -652,55 +659,147 @@ def _alphanumeric_tokens(value: str) -> tuple[str, ...]:
     return tuple(tokens)
 
 
-def _contains_token_pair(
+def _contains_token_sequence(
     tokens: tuple[str, ...],
-    pair: tuple[str, str],
+    sequence: tuple[str, ...],
 ) -> bool:
     return any(
-        tokens[index : index + 2] == pair
-        for index in range(len(tokens) - 1)
+        tokens[index : index + len(sequence)] == sequence
+        for index in range(len(tokens) - len(sequence) + 1)
     )
 
 
-def _negative_sfw_reasons(value: str) -> tuple[str, ...]:
-    reasons: list[str] = []
+def _sfw_target_length(tokens: tuple[str, ...], index: int) -> int:
+    if tokens[index] in {"sfw", "\u5b89\u5168"}:
+        return 1
+    if tokens[index : index + 3] == ("safe", "for", "work"):
+        return 3
+    return 0
+
+
+def _not_context(
+    tokens: tuple[str, ...],
+    before_start: int,
+    target_index: int,
+) -> str | None:
+    not_index = next(
+        (
+            index
+            for index in range(target_index - 1, before_start - 1, -1)
+            if tokens[index] == "not"
+        ),
+        None,
+    )
+    if not_index is None:
+        return None
+
+    following = tokens[not_index + 1 : target_index]
+    if following[:2] == ("a", "problem") or following[:1] == ("only",):
+        return "affirmative"
+    if following[:1] in (("sure",), ("certain",), ("necessarily",)):
+        return "ambiguous"
+    return "negative"
+
+
+def _sfw_evidence(value: str) -> tuple[tuple[str, ...], bool, bool]:
+    negative_reasons: list[str] = []
+    affirmative = False
+    suppressed = False
+
     for segment in _classification_segments(value):
         tokens = _alphanumeric_tokens(segment)
-        if any(
-            tokens[index : index + 3] == ("unsafe", "for", "work")
-            for index in range(len(tokens) - 2)
-        ):
-            reasons.append("unsafe for work")
+        clause_start = 0
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token in SFW_CONTRAST_TOKENS:
+                if not (
+                    token == "but"
+                    and index > 0
+                    and tokens[index - 1] == "anything"
+                ):
+                    clause_start = index + 1
+                index += 1
+                continue
 
-        target_indexes = tuple(
-            index
-            for index, token in enumerate(tokens)
-            if token == "sfw"
-            or tokens[index : index + 3] == ("safe", "for", "work")
-        )
-        for target_index in target_indexes:
-            preceding = tokens[:target_index]
-            matched_reason = next(
+            if tokens[index : index + 3] == ("unsafe", "for", "work"):
+                negative_reasons.append("unsafe for work")
+
+            target_length = _sfw_target_length(tokens, index)
+            if target_length == 0:
+                index += 1
+                continue
+
+            before_start = max(clause_start, index - SFW_CONTEXT_WINDOW)
+            before = tokens[before_start:index]
+            after_end = min(
+                len(tokens),
+                index + target_length + SFW_CONTEXT_WINDOW,
+            )
+            after = tokens[index + target_length : after_end]
+            contrast_index = next(
                 (
-                    f"{token} before SFW"
-                    for token in SFW_NEGATION_TOKENS
-                    if token in preceding
+                    offset
+                    for offset, after_token in enumerate(after)
+                    if after_token in SFW_CONTRAST_TOKENS
                 ),
                 None,
             )
-            if matched_reason is None:
-                matched_reason = next(
-                    (
-                        f"{' '.join(pair)} before SFW"
-                        for pair in SFW_NEGATION_PAIRS
-                        if _contains_token_pair(preceding, pair)
-                    ),
-                    None,
-                )
-            if matched_reason is not None:
-                reasons.append(matched_reason)
+            if contrast_index is not None:
+                after = after[:contrast_index]
 
-    return tuple(dict.fromkeys(reasons))
+            after_negative = next(
+                (
+                    " ".join(idiom)
+                    for idiom in SFW_AFTER_NEGATIVE_IDIOMS
+                    if _contains_token_sequence(after, idiom)
+                ),
+                None,
+            )
+            before_negative = next(
+                (
+                    " ".join(idiom)
+                    for idiom in SFW_NEGATIVE_IDIOMS
+                    if _contains_token_sequence(before, idiom)
+                ),
+                None,
+            )
+            if after_negative is not None or before_negative is not None:
+                negative_reasons.append(
+                    f"{after_negative or before_negative} around SFW"
+                )
+                index += target_length
+                continue
+            if "hardly" in before or "never" in before:
+                negative_reasons.append("explicit negation before SFW")
+                index += target_length
+                continue
+            if before[-1:] == ("non",):
+                negative_reasons.append("non before SFW")
+                index += target_length
+                continue
+
+            if before[-4:] == ("could", "not", "be", "more"):
+                affirmative = True
+                index += target_length
+                continue
+
+            not_context = _not_context(tokens, before_start, index)
+            if not_context == "negative":
+                negative_reasons.append("not before SFW")
+            elif not_context == "ambiguous":
+                suppressed = True
+            elif not_context == "affirmative":
+                affirmative = True
+            elif any(token in before for token in ("no", "non", "unsafe")):
+                suppressed = True
+            elif "not" in after:
+                suppressed = True
+            else:
+                affirmative = True
+            index += target_length
+
+    return tuple(dict.fromkeys(negative_reasons)), affirmative, suppressed
 
 
 def _classification(
@@ -729,16 +828,24 @@ def _classification(
                     reasons.append(f"{label} term '{term}' in {source}")
         return tuple(reasons)
 
+    sfw_evidence = tuple(
+        (source, *_sfw_evidence(text))
+        for source, text in evidence
+    )
     phrase_reasons = tuple(
         f"NSFW phrase '{reason}' in {source}"
-        for source, text in evidence
-        for reason in _negative_sfw_reasons(text)
+        for source, negative_reasons, _, _ in sfw_evidence
+        for reason in negative_reasons
     )
     nsfw_reasons = phrase_reasons + matches(NSFW_TERMS, "NSFW")
     if nsfw_reasons:
         return ContentClassification.NSFW, nsfw_reasons
 
-    sfw_reasons = matches(SFW_TERMS, "SFW")
+    sfw_reasons = tuple(
+        f"SFW evidence in {source}"
+        for source, _, affirmative, _ in sfw_evidence
+        if affirmative
+    )
     if sfw_reasons:
         return ContentClassification.SFW, sfw_reasons
 
