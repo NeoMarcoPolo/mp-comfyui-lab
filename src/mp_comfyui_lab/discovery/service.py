@@ -392,16 +392,23 @@ class DiscoveryService:
             if source.normalized is not None
             else ()
         )
+        fanout_bindings = (
+            source.normalized.bindings(SemanticRole.PROMPT_FANOUT)
+            if source.normalized is not None
+            else ()
+        )
+        conditioning_bindings = (
+            source.normalized.bindings(SemanticRole.CONDITIONING)
+            if source.normalized is not None
+            else ()
+        )
         prompts = tuple(
             value
             for binding in prompt_bindings
             if isinstance((value := thaw_json(binding.value)), str)
         )
-        fanout_count = (
-            len(source.normalized.bindings(SemanticRole.PROMPT_FANOUT))
-            if source.normalized is not None
-            else 0
-        )
+        fanout_count = len(fanout_bindings)
+        conditioning_count = len(conditioning_bindings)
         line_count = max(
             (len(value.splitlines()) or 1 for value in prompts),
             default=0,
@@ -412,15 +419,28 @@ class DiscoveryService:
             (len(placeholder_pattern.findall(value)) for value in prompts),
             default=0,
         )
-        candidates.append(
+        has_prompt_evidence = bool(
+            prompt_bindings or fanout_bindings or conditioning_bindings
+        )
+        has_grammar_features = any(
             (
-                "prompt_grammar",
-                "prompt grammar "
-                f"lines {line_count} commas {comma_count} "
-                f"placeholders {placeholder_count} "
-                f"fanout {fanout_count}",
+                line_count,
+                comma_count,
+                placeholder_count,
+                fanout_count,
+                conditioning_count,
             )
         )
+        if has_prompt_evidence or has_grammar_features:
+            candidates.append(
+                (
+                    "prompt_grammar",
+                    "prompt grammar "
+                    f"lines {line_count} commas {comma_count} "
+                    f"placeholders {placeholder_count} "
+                    f"fanout {fanout_count} conditioning {conditioning_count}",
+                )
+            )
         if source.normalized is not None:
             candidates.extend(
                 ("capability_role", group.role.value)

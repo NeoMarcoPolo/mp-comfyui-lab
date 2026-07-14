@@ -32,6 +32,7 @@ from mp_comfyui_lab.discovery.ranking import (
     load_default_ranking_weights,
     rank_candidates,
 )
+from mp_comfyui_lab.discovery import ranking as ranking_module
 from mp_comfyui_lab.discovery.service import DiscoveryNotFoundError, DiscoveryService
 from mp_comfyui_lab.discovery.urls import UnsupportedSourceError
 from mp_comfyui_lab.executors.base import (
@@ -240,6 +241,33 @@ def test_query_expansion_schema_fails_closed_with_typed_errors(
         parse_query_expansions_yaml(document)
 
 
+@pytest.mark.parametrize("field", ["concept", "terms"])
+def test_query_expansion_rejects_duplicate_nested_keys_with_context(
+    field: str,
+) -> None:
+    duplicate = (
+        "    concept: second\n"
+        if field == "concept"
+        else "    terms: [three, four]\n"
+    )
+    document = (
+        "schema_version: 1\n"
+        "concepts:\n"
+        "  - concept: first\n"
+        "    terms: [one, two]\n"
+        f"{duplicate}"
+    )
+
+    with pytest.raises(QueryExpansionConfigError) as raised:
+        parse_query_expansions_yaml(document)
+
+    message = str(raised.value)
+    assert "query-expansions.yaml" in message
+    assert "duplicate" in message
+    assert f"concepts[0].{field}" in message
+    assert "line 5" in message
+
+
 def test_query_expansion_models_are_deeply_immutable_and_bounded() -> None:
     expanded = expand_query("next scene")
 
@@ -275,6 +303,42 @@ def test_default_weights_and_config_local_partial_override(tmp_path: Path) -> No
     assert overridden.relevance == 0.4
     assert overridden.novelty == 0.05
     assert overridden.engagement == defaults.engagement
+
+
+def test_default_ranking_resource_rejects_duplicate_weight_with_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = (
+        "relevance: 0.24\n"
+        "engagement: 0.22\n"
+        "output_evidence: 0.12\n"
+        "recency: 0.08\n"
+        "creator_track_record: 0.08\n"
+        "experimentability: 0.12\n"
+        "novelty: 0.14\n"
+        "duplicate_penalty: 0.35\n"
+        "relevance: 0.4\n"
+    )
+
+    class Resource:
+        def joinpath(self, _name: str) -> Resource:
+            return self
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "utf-8"
+            return document
+
+    monkeypatch.setattr(ranking_module.resources, "files", lambda _package: Resource())
+
+    with pytest.raises(RankingConfigError) as raised:
+        load_default_ranking_weights()
+
+    message = str(raised.value)
+    assert "default-ranking.yaml" in message
+    assert "duplicate" in message
+    assert "relevance" in message
+    assert "<root>" in message
+    assert "line 9" in message
 
 
 @pytest.mark.parametrize(
@@ -431,6 +495,89 @@ def test_engagement_uses_documented_log1p_metric_mix() -> None:
         rel_tol=0,
         abs_tol=1e-12,
     )
+
+
+def test_engagement_normalization_handles_typical_and_multiple_huge_counts() -> None:
+    counts = (0, 25_757, 10**1_000, 10**2_000)
+    candidates = tuple(
+        _candidate(
+            str(210 + index),
+            name="same",
+            author=f"creator-{index}",
+            uses=count,
+            likes=count,
+            collects=count,
+            covers=False,
+        )
+        for index, count in enumerate(counts)
+    )
+    details = {item.workflow_id: _detail(item) for item in candidates}
+
+    forward = rank_candidates(
+        "unmatched",
+        candidates,
+        details,
+        load_default_ranking_weights(),
+    )
+    reverse = rank_candidates(
+        "unmatched",
+        tuple(reversed(candidates)),
+        details,
+        load_default_ranking_weights(),
+    )
+    by_id = {item.candidate.workflow_id: item for item in forward}
+    normalized = [
+        by_id[str(210 + index)].components.engagement
+        for index in range(len(counts))
+    ]
+
+    assert normalized[0] == 0.0
+    assert normalized[-1] == 1.0
+    assert normalized == sorted(normalized)
+    assert len(set(normalized)) == len(normalized)
+    assert all(isfinite(value) and 0.0 <= value <= 1.0 for value in normalized)
+    assert [item.candidate.workflow_id for item in forward] == [
+        item.candidate.workflow_id for item in reverse
+    ]
+
+
+def test_all_equal_huge_engagement_is_finite_and_ties_by_workflow_id() -> None:
+    huge = 10**1_000
+    high_id = _candidate(
+        "222",
+        name="same",
+        uses=huge,
+        likes=huge,
+        collects=huge,
+        covers=False,
+    )
+    low_id = _candidate(
+        "221",
+        name="same",
+        uses=huge,
+        likes=huge,
+        collects=huge,
+        covers=False,
+    )
+    details = {item.workflow_id: _detail(item) for item in (high_id, low_id)}
+
+    forward = rank_candidates(
+        "unmatched",
+        (high_id, low_id),
+        details,
+        load_default_ranking_weights(),
+    )
+    reverse = rank_candidates(
+        "unmatched",
+        (low_id, high_id),
+        details,
+        load_default_ranking_weights(),
+    )
+
+    assert [item.candidate.workflow_id for item in forward] == ["221", "222"]
+    assert [item.candidate.workflow_id for item in reverse] == ["221", "222"]
+    assert [item.components.engagement for item in forward] == [1.0, 1.0]
+    assert all(isfinite(item.score) and 0.0 <= item.score <= 1.0 for item in forward)
 
 
 def test_recency_and_creator_track_record_depend_only_on_active_set() -> None:
@@ -899,6 +1046,50 @@ def test_similar_inspects_source_and_records_bounded_derivations(
         if Path(artifact.path).name == "search-results.json"
     )
     assert json.loads(snapshot.read_text(encoding="utf-8"))["derivations"]
+
+
+def test_similar_without_derivable_evidence_stops_before_provider_search(
+    tmp_path: Path,
+) -> None:
+    source = _candidate("1091", name="plain workflow", tags=(), covers=False)
+    executor = FakeDiscoveryExecutor(
+        (source,),
+        {"1091": _detail(source)},
+        graph={"1": {"class_type": "Reroute", "inputs": {}}},
+    )
+    service = _service(tmp_path, executor)
+
+    with pytest.raises(DiscoveryNotFoundError, match="no derivable public capability evidence"):
+        service.similar("https://www.runninghub.ai/post/1091", sort="HOTTEST")
+
+    assert executor.search_calls == []
+
+
+def test_similar_non_prompt_capability_never_adds_zero_grammar_query(
+    tmp_path: Path,
+) -> None:
+    source = _candidate("1092", name="output workflow", tags=(), covers=False)
+    executor = FakeDiscoveryExecutor(
+        (source,),
+        {"1092": _detail(source, primitive_nodes=("SaveImage",))},
+        graph={
+            "1": {
+                "class_type": "SaveImage",
+                "inputs": {"filename_prefix": "result"},
+            }
+        },
+    )
+    service = _service(tmp_path, executor)
+
+    result = service.similar(
+        "https://www.runninghub.ai/post/1092",
+        sort="HOTTEST",
+    )
+
+    assert {item.source for item in result.derivations} == {"capability_role"}
+    assert [item.value for item in result.derivations] == ["output"]
+    assert executor.search_calls
+    assert all("prompt grammar" not in call.query for call in executor.search_calls)
 
 
 def test_similar_include_graphs_reuses_inspected_source_graph(tmp_path: Path) -> None:

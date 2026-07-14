@@ -5,7 +5,8 @@ import re
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
-import yaml
+
+from mp_comfyui_lab.config import safe_load_yaml
 
 
 MAX_QUERY_LENGTH = 512
@@ -95,39 +96,12 @@ class ExpandedQuery(_FrozenModel):
     expansions: tuple[ExpansionRecord, ...] = Field(max_length=MAX_CONCEPTS)
 
 
-class _UniqueKeyLoader(yaml.SafeLoader):
-    pass
-
-
-def _construct_unique_mapping(
-    loader: _UniqueKeyLoader,
-    node: yaml.MappingNode,
-    deep: bool = False,
-) -> dict[Any, Any]:
-    mapping: dict[Any, Any] = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
-            raise QueryExpansionConfigError(f"duplicate YAML key: {key!r}")
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
-
-
-_UniqueKeyLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
-    _construct_unique_mapping,
-)
-
-
 def _strict_yaml(document: str) -> Any:
-    if not isinstance(document, str):
-        raise QueryExpansionConfigError("query expansion YAML must be text")
-    try:
-        return yaml.load(document, Loader=_UniqueKeyLoader)
-    except QueryExpansionConfigError:
-        raise
-    except yaml.YAMLError as error:
-        raise QueryExpansionConfigError(f"malformed query expansion YAML: {error}") from error
+    return safe_load_yaml(
+        document,
+        source="query-expansions.yaml",
+        error_type=QueryExpansionConfigError,
+    )
 
 
 def parse_query_expansions_yaml(document: str) -> QueryExpansionMap:

@@ -5,7 +5,7 @@ from collections.abc import Mapping, Sequence
 import hashlib
 from importlib import resources
 import json
-from math import isfinite, log1p
+from math import isfinite, log, log1p
 import re
 from typing import Annotated, Any
 
@@ -18,8 +18,8 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
-import yaml
 
+from mp_comfyui_lab.config import safe_load_yaml
 from mp_comfyui_lab.discovery.models import Engagement, WorkflowCandidate, WorkflowDetail
 from mp_comfyui_lab.discovery.query import ExpandedQuery, expand_query, term_match
 
@@ -37,6 +37,8 @@ POSITIVE_WEIGHT_FIELDS = (
 # collections contribute equally. Each metric is log1p-normalized independently.
 ENGAGEMENT_METRIC_MIX = {"uses": 0.6, "likes": 0.2, "collects": 0.2}
 MAX_EXPLANATION_LENGTH = 1_024
+_LOG_TWO = log(2.0)
+_LOG_MANTISSA_BITS = 53
 
 
 class RankingConfigError(ValueError):
@@ -147,26 +149,6 @@ class RankedWorkflow(_FrozenModel):
         return self.score
 
 
-class _UniqueKeyLoader(yaml.SafeLoader):
-    pass
-
-
-def _construct_unique_mapping(loader, node, deep=False):
-    mapping = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
-            raise RankingConfigError(f"duplicate YAML key: {key!r}")
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
-
-
-_UniqueKeyLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
-    _construct_unique_mapping,
-)
-
-
 def load_default_ranking_weights(
     overrides: Mapping[str, Any] | None = None,
 ) -> RankingWeights:
@@ -176,10 +158,14 @@ def load_default_ranking_weights(
             .joinpath("default-ranking.yaml")
             .read_text(encoding="utf-8")
         )
-        payload = yaml.load(document, Loader=_UniqueKeyLoader)
+        payload = safe_load_yaml(
+            document,
+            source="default-ranking.yaml",
+            error_type=RankingConfigError,
+        )
     except RankingConfigError:
         raise
-    except (OSError, TypeError, yaml.YAMLError) as error:
+    except (OSError, TypeError) as error:
         raise RankingConfigError(f"could not load default ranking weights: {error}") from error
     if not isinstance(payload, dict):
         raise RankingConfigError("default ranking weights must be an object")
@@ -259,6 +245,27 @@ def _count(engagement: Engagement, field: str) -> int:
     return int(getattr(engagement, field) or 0)
 
 
+def _integer_log1p(value: int) -> float:
+    if value < 0:
+        raise ValueError("engagement count must be nonnegative")
+    try:
+        return log1p(value)
+    except OverflowError:
+        bit_length = value.bit_length()
+        shift = max(0, bit_length - _LOG_MANTISSA_BITS)
+        leading = value >> shift
+        mantissa = leading / (1 << (bit_length - shift - 1))
+        return (bit_length - 1) * _LOG_TWO + log(mantissa)
+
+
+def _normalized_log1p(value: int, maximum: int) -> float:
+    if maximum <= 0 or value <= 0:
+        return 0.0
+    if value >= maximum:
+        return 1.0
+    return max(0.0, min(1.0, _integer_log1p(value) / _integer_log1p(maximum)))
+
+
 def _metric_score(
     engagement: Engagement,
     maxima: Mapping[str, int],
@@ -267,8 +274,11 @@ def _metric_score(
     for field, mix in ENGAGEMENT_METRIC_MIX.items():
         maximum = maxima[field]
         if maximum > 0:
-            score += mix * log1p(_count(engagement, field)) / log1p(maximum)
-    return score
+            score += mix * _normalized_log1p(
+                _count(engagement, field),
+                maximum,
+            )
+    return max(0.0, min(1.0, score))
 
 
 def _engagement_maxima(details: Sequence[WorkflowDetail]) -> dict[str, int]:
@@ -300,8 +310,8 @@ def _creator_scores(details: Sequence[WorkflowDetail]) -> dict[str, float]:
         score = 0.0
         for field, mix in ENGAGEMENT_METRIC_MIX.items():
             if maxima[field] > 0:
-                score += mix * log1p(counts[field]) / log1p(maxima[field])
-        scores[creator] = score
+                score += mix * _normalized_log1p(counts[field], maxima[field])
+        scores[creator] = max(0.0, min(1.0, score))
     return scores
 
 
@@ -477,13 +487,19 @@ def _explanation(
     engagement = candidate.engagement
     sentence = (
         f"Strongest evidence: {strongest} ({getattr(components, strongest):.2f}); "
-        f"{_count(engagement, 'uses'):,} uses, "
-        f"{_count(engagement, 'likes'):,} likes, and "
-        f"{_count(engagement, 'collects'):,} collects."
+        f"{_format_count(_count(engagement, 'uses'))} uses, "
+        f"{_format_count(_count(engagement, 'likes'))} likes, and "
+        f"{_format_count(_count(engagement, 'collects'))} collects."
     )
     if components.penalty > 0.0:
         sentence += f" Applied duplicate penalty for {duplicate_group}."
     return sentence
+
+
+def _format_count(value: int) -> str:
+    if value < 1_000_000_000_000_000:
+        return f"{value:,}"
+    return f"~2^{value.bit_length() - 1}"
 
 
 def _canonical_candidates(

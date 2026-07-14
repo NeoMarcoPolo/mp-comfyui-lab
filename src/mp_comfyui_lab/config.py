@@ -1,5 +1,6 @@
 from pathlib import Path
 from math import isfinite
+import re
 from typing import Annotated, Any, Self
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PrivateAttr
@@ -10,6 +11,122 @@ from mp_comfyui_lab.security import SafetyError
 
 class LabConfigError(ValueError):
     pass
+
+
+_PLAIN_PATH_SEGMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+
+def _format_yaml_path(path: tuple[str | int, ...]) -> str:
+    if not path:
+        return "<root>"
+    result = ""
+    for segment in path:
+        if isinstance(segment, int):
+            result += f"[{segment}]"
+        elif _PLAIN_PATH_SEGMENT.fullmatch(segment):
+            result += ("." if result else "") + segment
+        else:
+            result += f"[{segment!r}]"
+    return result
+
+
+def _yaml_key_segment(value: Any) -> str:
+    return value if isinstance(value, str) else repr(value)
+
+
+def _reject_duplicate_yaml_keys(
+    loader: yaml.SafeLoader,
+    node: yaml.Node,
+    *,
+    source: str,
+    error_type: type[ValueError],
+    path: tuple[str | int, ...] = (),
+    visited: set[int] | None = None,
+) -> None:
+    checked = visited if visited is not None else set()
+    identity = id(node)
+    if identity in checked:
+        return
+    checked.add(identity)
+
+    if isinstance(node, yaml.MappingNode):
+        seen: dict[Any, yaml.Node] = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=True)
+            try:
+                first = seen.get(key)
+            except TypeError as error:
+                raise error_type(
+                    f"{source}: line {key_node.start_mark.line + 1}, "
+                    f"column {key_node.start_mark.column + 1}: "
+                    f"unhashable YAML key at {_format_yaml_path(path)}"
+                ) from error
+            key_path = (*path, _yaml_key_segment(key))
+            if first is not None:
+                raise error_type(
+                    f"{source}: line {key_node.start_mark.line + 1}, "
+                    f"column {key_node.start_mark.column + 1}: "
+                    f"duplicate YAML key {key!r} at {_format_yaml_path(key_path)} "
+                    f"in mapping {_format_yaml_path(path)}; first defined at "
+                    f"line {first.start_mark.line + 1}, "
+                    f"column {first.start_mark.column + 1}"
+                )
+            seen[key] = key_node
+            _reject_duplicate_yaml_keys(
+                loader,
+                value_node,
+                source=source,
+                error_type=error_type,
+                path=key_path,
+                visited=checked,
+            )
+    elif isinstance(node, yaml.SequenceNode):
+        for index, value_node in enumerate(node.value):
+            _reject_duplicate_yaml_keys(
+                loader,
+                value_node,
+                source=source,
+                error_type=error_type,
+                path=(*path, index),
+                visited=checked,
+            )
+
+
+def safe_load_yaml(
+    document: str,
+    *,
+    source: str,
+    error_type: type[ValueError],
+) -> Any:
+    """Safely load YAML while rejecting duplicate keys at every mapping depth."""
+    if not isinstance(document, str):
+        raise error_type(f"{source}: YAML document must be text")
+
+    loader = yaml.SafeLoader(document)
+    try:
+        root = loader.get_single_node()
+        if root is None:
+            return None
+        _reject_duplicate_yaml_keys(
+            loader,
+            root,
+            source=source,
+            error_type=error_type,
+        )
+        return loader.construct_document(root)
+    except error_type:
+        raise
+    except yaml.YAMLError as error:
+        mark = getattr(error, "problem_mark", None)
+        location = (
+            f"line {mark.line + 1}, column {mark.column + 1}"
+            if mark is not None
+            else "unknown location"
+        )
+        problem = getattr(error, "problem", None) or str(error)
+        raise error_type(f"{source}: malformed YAML at {location}: {problem}") from error
+    finally:
+        loader.dispose()
 
 
 def _resolve_from(base: Path, path: Path) -> Path:
@@ -75,10 +192,11 @@ class LabConfig(BaseModel):
                 context={"base_dir": base},
             )
 
-        try:
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        except yaml.YAMLError as error:
-            raise LabConfigError("config.local.yaml is malformed") from error
+        data = safe_load_yaml(
+            config_path.read_text(encoding="utf-8"),
+            source=str(config_path),
+            error_type=LabConfigError,
+        )
         return cls.model_validate(data, context={"base_dir": base})
 
     def resolve_fixture(self, fixture: str | Path) -> Path:
