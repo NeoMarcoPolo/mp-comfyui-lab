@@ -261,6 +261,151 @@ def test_exact_qwen_multi_angle_consistency_with_visible_output_is_observed() ->
     assert "current_normalized_graph" in assessment.explanation
 
 
+@pytest.mark.parametrize(
+    ("dimension", "observed_identity", "claimed_identity"),
+    (
+        (
+            EvidenceDimension.CHECKPOINT,
+            "models/primary/shared.safetensors",
+            "models/archive/shared.safetensors",
+        ),
+        (
+            EvidenceDimension.LORAS,
+            "loras/primary/shared.safetensors",
+            "loras/archive/shared.safetensors",
+        ),
+        (
+            EvidenceDimension.LORA_STRENGTHS,
+            "loras/primary/shared.safetensors",
+            "loras/archive/shared.safetensors",
+        ),
+    ),
+)
+def test_exact_asset_comparisons_preserve_directory_components(
+    dimension: EvidenceDimension,
+    observed_identity: str,
+    claimed_identity: str,
+) -> None:
+    workflow = (
+        _workflow_graph(checkpoint=observed_identity)
+        if dimension is EvidenceDimension.CHECKPOINT
+        else _workflow_graph(
+            loras=(observed_identity, "consistency.safetensors"),
+        )
+    )
+    graph = build_evidence_graph(
+        (_current_source(graph=workflow),),
+        prior_experiment_roots=(),
+    )
+    observation = graph.observations[0]
+    if dimension is EvidenceDimension.CHECKPOINT:
+        claim = _claim(observation, checkpoint=claimed_identity)
+    elif dimension is EvidenceDimension.LORAS:
+        claim = _claim(
+            observation,
+            loras=(claimed_identity, *observation.loras[1:]),
+        )
+    else:
+        claim = _claim(
+            observation,
+            lora_strengths=(
+                observation.lora_strengths[0].model_copy(
+                    update={"identity": claimed_identity}
+                ),
+                *observation.lora_strengths[1:],
+            ),
+        )
+
+    assessment = assess_claim(claim, graph)
+
+    assert assessment.label is not ConfidenceLabel.OBSERVED
+    assert dimension in assessment.differing_dimensions
+
+
+@pytest.mark.parametrize(
+    ("dimension", "observed_identity", "claimed_identity"),
+    (
+        (
+            EvidenceDimension.CHECKPOINT,
+            "models/shared.safetensors",
+            "models/shared.ckpt",
+        ),
+        (
+            EvidenceDimension.LORAS,
+            "loras/shared.safetensors",
+            "loras/shared.ckpt",
+        ),
+        (
+            EvidenceDimension.LORA_STRENGTHS,
+            "loras/shared.safetensors",
+            "loras/shared.ckpt",
+        ),
+    ),
+)
+def test_exact_asset_comparisons_preserve_extensions(
+    dimension: EvidenceDimension,
+    observed_identity: str,
+    claimed_identity: str,
+) -> None:
+    workflow = (
+        _workflow_graph(checkpoint=observed_identity)
+        if dimension is EvidenceDimension.CHECKPOINT
+        else _workflow_graph(
+            loras=(observed_identity, "consistency.safetensors"),
+        )
+    )
+    graph = build_evidence_graph(
+        (_current_source(graph=workflow),),
+        prior_experiment_roots=(),
+    )
+    observation = graph.observations[0]
+    if dimension is EvidenceDimension.CHECKPOINT:
+        claim = _claim(observation, checkpoint=claimed_identity)
+    elif dimension is EvidenceDimension.LORAS:
+        claim = _claim(
+            observation,
+            loras=(claimed_identity, *observation.loras[1:]),
+        )
+    else:
+        claim = _claim(
+            observation,
+            lora_strengths=(
+                observation.lora_strengths[0].model_copy(
+                    update={"identity": claimed_identity}
+                ),
+                *observation.lora_strengths[1:],
+            ),
+        )
+
+    assessment = assess_claim(claim, graph)
+
+    assert assessment.label is not ConfidenceLabel.OBSERVED
+    assert dimension in assessment.differing_dimensions
+
+
+def test_exact_asset_comparison_normalizes_representation_only() -> None:
+    graph = build_evidence_graph(
+        (
+            _current_source(
+                graph=_workflow_graph(
+                    checkpoint="Models\\Cafe\N{COMBINING ACUTE ACCENT}\\QWEN.SAFETENSORS",
+                )
+            ),
+        ),
+        prior_experiment_roots=(),
+    )
+    observation = graph.observations[0]
+    claim = _claim(
+        observation,
+        checkpoint="models/caf\N{LATIN SMALL LETTER E WITH ACUTE}/qwen.safetensors",
+    )
+
+    assessment = assess_claim(claim, graph)
+
+    assert assessment.label is ConfidenceLabel.OBSERVED
+    assert EvidenceDimension.CHECKPOINT in assessment.matched_dimensions
+
+
 def test_same_family_matching_topology_one_declared_change_is_strongly_inferred() -> None:
     graph = build_evidence_graph((_current_source(),), prior_experiment_roots=())
     observation = graph.observations[0]
@@ -290,6 +435,33 @@ def test_partial_model_family_alone_is_weakly_inferred() -> None:
     assert assessment.label is ConfidenceLabel.WEAKLY_INFERRED
     assert assessment.supporting_source_ids == ("workflow-1",)
     assert assessment.matched_dimensions == ()
+
+
+@pytest.mark.parametrize(
+    ("observed_family", "claimed_family"),
+    (
+        ("2509", "2511"),
+        ("bf16", "fp8"),
+    ),
+)
+def test_missing_model_lineages_are_unexplored(
+    observed_family: str,
+    claimed_family: str,
+) -> None:
+    graph = build_evidence_graph((_current_source(),), prior_experiment_roots=())
+    observation = graph.observations[0].model_copy(
+        update={"model_family": observed_family}
+    )
+    graph = EvidenceGraph(
+        sources=graph.sources,
+        observations=(observation,),
+        warnings=graph.warnings,
+    )
+
+    assessment = assess_claim(MutationClaim(model_family=claimed_family), graph)
+
+    assert assessment.label is ConfidenceLabel.UNEXPLORED
+    assert assessment.supporting_source_ids == ()
 
 
 def test_lora_order_and_loader_topology_mismatch_is_weakly_inferred() -> None:

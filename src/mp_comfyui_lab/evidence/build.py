@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import unicodedata
 from typing import Any
 
 from pydantic import ValidationError
@@ -88,6 +89,11 @@ def _canonical_identity(value: str) -> str:
     return _IDENTITY_SEPARATOR.sub("_", basename).strip("_")
 
 
+def _asset_identity(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value.strip().replace("\\", "/"))
+    return unicodedata.normalize("NFC", normalized.casefold())
+
+
 def _model_family(checkpoint: str | None) -> str | None:
     if checkpoint is None:
         return None
@@ -135,7 +141,7 @@ def _topology_for_role(
         node = nodes[binding.node_id]
         base = f"{index}:{node.class_type}.{binding.field_name}"
         if include_value:
-            base = f"{base}={_canonical_identity(_binding_identity(binding))}"
+            base = f"{base}={_asset_identity(_binding_identity(binding))}"
         records.append(base)
     return tuple(records)
 
@@ -149,7 +155,7 @@ def _loader_topology(graph: NormalizedGraph) -> tuple[str, ...]:
         records.append(f"checkpoint:{index}:{node.class_type}.{binding.field_name}")
     for index, binding in enumerate(graph.bindings(SemanticRole.LORA)):
         node = nodes[binding.node_id]
-        identity = _canonical_identity(_binding_identity(binding))
+        identity = _asset_identity(_binding_identity(binding))
         model_inputs = sorted(
             field_name
             for field_name in node.input_links
@@ -999,17 +1005,17 @@ def _dimension_value_equal(
     observation_value: Any,
 ) -> bool:
     if dimension is EvidenceDimension.CHECKPOINT:
-        return _canonical_identity(claim_value) == _canonical_identity(observation_value)
+        return _asset_identity(claim_value) == _asset_identity(observation_value)
     if dimension is EvidenceDimension.MODEL_FAMILY:
         return _canonical_identity(claim_value) == _canonical_identity(observation_value)
     if dimension is EvidenceDimension.LORAS:
-        return tuple(_canonical_identity(value) for value in claim_value) == tuple(
-            _canonical_identity(value) for value in observation_value
+        return tuple(_asset_identity(value) for value in claim_value) == tuple(
+            _asset_identity(value) for value in observation_value
         )
     if dimension is EvidenceDimension.LORA_STRENGTHS:
         claim_records = tuple(
             (
-                _canonical_identity(record.identity),
+                _asset_identity(record.identity),
                 record.minimum,
                 record.maximum,
                 record.buckets,
@@ -1018,7 +1024,7 @@ def _dimension_value_equal(
         )
         observation_records = tuple(
             (
-                _canonical_identity(record.identity),
+                _asset_identity(record.identity),
                 record.minimum,
                 record.maximum,
                 record.buckets,
@@ -1047,7 +1053,13 @@ def _family_support(
     if claim_family is None or observation_family is None:
         return (False, False)
     exact = _canonical_identity(claim_family) == _canonical_identity(observation_family)
-    partial = _model_lineage(claim_family) == _model_lineage(observation_family)
+    claim_lineage = _model_lineage(claim_family)
+    observation_lineage = _model_lineage(observation_family)
+    partial = (
+        claim_lineage is not None
+        and observation_lineage is not None
+        and claim_lineage == observation_lineage
+    )
     return (exact, partial)
 
 
