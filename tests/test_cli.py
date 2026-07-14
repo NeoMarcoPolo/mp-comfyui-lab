@@ -618,3 +618,64 @@ dimensions:
     persisted["variants"][0]["materialized_graph"][next(iter(persisted["variants"][0]["materialized_graph"]))]["inputs"]["signed_input"] = "tampered"
     with pytest.raises(Exception):
         ExperimentPlan.model_validate(persisted)
+
+
+class MultiWorkflowExecutor(ReadOnlyExecutor):
+    def __init__(self, graphs, reverse=False):
+        super().__init__(graphs["100"])
+        self.graphs = graphs
+        self.reverse = reverse
+
+    def _candidate(self, workflow_id):
+        return WorkflowCandidate(
+            executor="runninghub",
+            workflow_id=workflow_id,
+            canonical_url=f"https://www.runninghub.ai/post/{workflow_id}",
+            name=f"workflow-{workflow_id}",
+        )
+
+    def search(self, request):
+        self.calls.append(("search", request.query))
+        records = (self._candidate("100"), self._candidate("200"))
+        return SearchPage(records=tuple(reversed(records)) if self.reverse else records, total=2, page=1, size=30, has_next=False)
+
+    def fetch_workflow(self, ref):
+        self.calls.append(("fetch_workflow", ref.workflow_id))
+        candidate = self._candidate(ref.workflow_id)
+        return FetchedWorkflow(ref=ref, detail=WorkflowDetail(candidate=candidate), graph=self.graphs[ref.workflow_id])
+
+
+def test_default_plan_compiles_deterministic_donor_checkpoint_variant(tmp_path, capsys, monkeypatch):
+    baseline = json.loads((Path(__file__).parent / "fixtures" / "runninghub" / "qwen_graph.json").read_text(encoding="utf-8"))
+    donor = json.loads(json.dumps(baseline))
+    checkpoint = next(node for node in donor.values() if node["class_type"] == "UNETLoader")
+    checkpoint["inputs"]["unet_name"] = "donor.safetensors"
+    manifest = tmp_path / "plan.yaml"
+    manifest.write_text("""goal: x
+sources:
+  queries: [next scene]
+  urls: [https://www.runninghub.ai/post/100]
+fixtures:
+  reference_images: []
+  prompt_lines: [one]
+expectations:
+  output_count: 1
+  media_types: [image/png]
+dimensions:
+  checkpoint: approved
+""", encoding="utf-8")
+    payloads = []
+    for reverse in (False, True):
+        executor = MultiWorkflowExecutor({"100": baseline, "200": donor}, reverse=reverse)
+        monkeypatch.setattr(app, "RunningHubExecutor", lambda executor=executor: executor)
+        assert main(["plan", str(manifest)], cwd=tmp_path) == ExitCode.OK
+        document = _single_json_document(capsys.readouterr())
+        plan_path = next(Path(item["path"]) for item in document["artifacts"] if Path(item["path"]).parent.name == "plans")
+        plan = ExperimentPlan.model_validate_json(plan_path.read_text(encoding="utf-8"), strict=True)
+        assert plan.capability_coverage == ("checkpoint",)
+        variant = next(item for item in plan.variants if item.variant_id != "baseline")
+        assert variant.evidence_ids == ("200",)
+        assert variant.materialized_graph["106"]["inputs"]["unet_name"] == "donor.safetensors"
+        assert {call[0] for call in executor.calls} == {"search", "fetch_workflow", "inspect_capabilities"}
+        payloads.append(plan.approval_payload)
+    assert payloads[0] == payloads[1]
