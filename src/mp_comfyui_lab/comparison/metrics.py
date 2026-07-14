@@ -5,10 +5,8 @@ from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any, Literal
-import warnings
 
 import imagehash
-from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
 
 from mp_comfyui_lab.discovery.models import ContentClassification
@@ -16,6 +14,12 @@ from mp_comfyui_lab.experiments.models import OutputRecord, RunRecord
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.json_types import thaw_json
+from mp_comfyui_lab.media import (
+    MAX_IMAGE_PIXELS,
+    MediaFamily,
+    inspect_media_file,
+    media_family,
+)
 
 from .paths import hash_stored_artifact, resolve_stored_artifact
 
@@ -44,6 +48,20 @@ class ProviderOutputMetadata(_FactModel):
     integrity_matches_record: bool | None = None
 
 
+class MediaErrorFacts(_FactModel):
+    code: Literal[
+        "unreadable_file",
+        "empty_file",
+        "byte_limit_exceeded",
+        "unrecognized_signature",
+        "declared_mime_mismatch",
+        "invalid_image",
+        "image_pixel_limit_exceeded",
+        "invalid_archive",
+    ]
+    message: str
+
+
 class MediaFacts(_FactModel):
     output_id: str
     variant_id: str
@@ -56,9 +74,14 @@ class MediaFacts(_FactModel):
         "not_recorded",
         "unsafe",
         "unreadable",
+        "invalid",
     ]
     artifact_relative_path: str | None = None
     mime_type: str
+    declared_mime_type: str
+    declared_media_kind: MediaFamily
+    detected_mime_type: str | None = None
+    detected_media_kind: MediaFamily | None = None
     bytes: int | None = Field(default=None, ge=0)
     sha256: str | None = None
     width: int | None = Field(default=None, gt=0)
@@ -67,6 +90,7 @@ class MediaFacts(_FactModel):
     phash: str | None = None
     prompt_label: str
     provider_metadata: ProviderOutputMetadata | None = None
+    media_error: MediaErrorFacts | None = None
 
 
 class VariantComparison(_FactModel):
@@ -214,16 +238,20 @@ def _media_facts(
     output_id = f"{run.variant_id}/{ordinal}"
     if record is None:
         mime_type = _expected_media_type(run, ordinal)
+        declared_kind = _media_kind(mime_type)
         return MediaFacts(
             output_id=output_id,
             variant_id=run.variant_id,
             output_ordinal=ordinal,
-            media_kind=_media_kind(mime_type),
+            media_kind=declared_kind,
             availability="not_recorded",
             mime_type=mime_type,
+            declared_mime_type=mime_type,
+            declared_media_kind=declared_kind,
             prompt_label=prompt_label,
         )
 
+    declared_kind = _media_kind(record.media_type)
     provider = ProviderOutputMetadata(
         run_id=run.run_id,
         provider_task_id=run.provider_task_id,
@@ -243,9 +271,11 @@ def _media_facts(
             output_id=output_id,
             variant_id=run.variant_id,
             output_ordinal=ordinal,
-            media_kind=_media_kind(record.media_type),
+            media_kind=declared_kind,
             availability=availability,
             mime_type=record.media_type,
+            declared_mime_type=record.media_type,
+            declared_media_kind=declared_kind,
             prompt_label=prompt_label,
             provider_metadata=provider,
         )
@@ -257,9 +287,11 @@ def _media_facts(
             output_id=output_id,
             variant_id=run.variant_id,
             output_ordinal=ordinal,
-            media_kind=_media_kind(record.media_type),
+            media_kind=declared_kind,
             availability="unreadable",
             mime_type=record.media_type,
+            declared_mime_type=record.media_type,
+            declared_media_kind=declared_kind,
             prompt_label=prompt_label,
             provider_metadata=provider,
         )
@@ -283,48 +315,67 @@ def _media_facts(
             record.local_relative_path if integrity_matches else None
         ),
         "mime_type": record.media_type,
+        "declared_mime_type": record.media_type,
+        "declared_media_kind": declared_kind,
         "bytes": byte_count,
         "sha256": sha256,
         "prompt_label": prompt_label,
         "provider_metadata": provider,
     }
-    if not record.media_type.startswith("image/"):
+    if not integrity_matches:
         return MediaFacts(
-            media_kind=_media_kind(record.media_type),
+            media_kind=declared_kind,
             **common,
         )
 
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(path) as source:
-                source.load()
-                display = ImageOps.exif_transpose(source)
-                actual_mime = Image.MIME.get(source.format, record.media_type)
-                width, height = display.size
-                mode = display.mode
-                perceptual_hash = str(imagehash.phash(display))
-    except (Image.DecompressionBombError, Image.DecompressionBombWarning, OSError):
+    inspection = inspect_media_file(
+        path,
+        record.media_type,
+        max_image_pixels=MAX_IMAGE_PIXELS,
+    )
+    detected = {
+        "detected_mime_type": inspection.detected_mime_type,
+        "detected_media_kind": inspection.detected_family,
+    }
+    if not inspection.valid:
         return MediaFacts(
-            media_kind="unknown",
-            **common,
+            media_kind=declared_kind,
+            **{
+                **common,
+                "availability": "invalid",
+                "artifact_relative_path": None,
+            },
+            **detected,
+            media_error=MediaErrorFacts(
+                code=inspection.error_code,
+                message=inspection.error_message,
+            ),
         )
+    if inspection.image is None:
+        return MediaFacts(
+            media_kind=declared_kind,
+            **common,
+            **detected,
+        )
+    display = inspection.image
+    try:
+        perceptual_hash = str(imagehash.phash(display))
+        width, height = display.size
+    finally:
+        display.close()
     return MediaFacts(
         media_kind="image",
-        mime_type=actual_mime,
         width=width,
         height=height,
-        mode=mode,
+        mode=inspection.source_mode,
         phash=perceptual_hash,
-        **{key: value for key, value in common.items() if key != "mime_type"},
+        **common,
+        **detected,
     )
 
 
-def _media_kind(mime_type: str) -> Literal["image", "video", "audio", "unknown"]:
-    for kind in ("image", "video", "audio"):
-        if mime_type.startswith(f"{kind}/"):
-            return kind
-    return "unknown"
+def _media_kind(mime_type: str) -> MediaFamily:
+    return media_family(mime_type)
 
 
 def _expected_media_type(run: RunRecord, ordinal: int) -> str:

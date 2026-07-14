@@ -767,13 +767,19 @@ def _validated_comparison_run_evidence(
 def _comparison_artifacts_payload(
     rendered: ComparisonArtifacts,
 ) -> list[dict[str, str]]:
-    paths = (
+    paths = [
         ("comparison_facts", rendered.facts),
         ("duplicate_groups", rendered.duplicate_groups),
-        ("contact_sheet", rendered.contact_sheet),
+        *[
+            (
+                "contact_sheet" if index == 0 else "contact_sheet_page",
+                path,
+            )
+            for index, path in enumerate(rendered.contact_sheets)
+        ],
         ("comparison_gallery", rendered.gallery),
         ("judgment_input", rendered.judgment_input),
-    )
+    ]
     artifacts = [{"kind": kind, "path": str(path)} for kind, path in paths]
     if rendered.judgments is not None:
         artifacts.append(
@@ -821,6 +827,7 @@ def _compare_command(
             "facts": str(rendered.facts),
             "duplicate_groups": str(rendered.duplicate_groups),
             "contact_sheet": str(rendered.contact_sheet),
+            "contact_sheets": [str(path) for path in rendered.contact_sheets],
             "gallery": str(rendered.gallery),
             "judgment_input": str(rendered.judgment_input),
             "judgments": (

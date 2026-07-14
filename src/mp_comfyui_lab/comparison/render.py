@@ -13,13 +13,17 @@ from pathlib import Path
 import shutil
 from string import Template
 import tempfile
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, ConfigDict
 
 from mp_comfyui_lab.experiments.store import ExperimentStore
+from mp_comfyui_lab.media import (
+    MAX_IMAGE_PIXELS,
+    load_normalized_image,
+)
 from mp_comfyui_lab.security import SafetyError
 
 from .metrics import ComparisonReport, MediaFacts, VariantComparison
@@ -35,15 +39,12 @@ _TILE_WIDTH = 420
 _TILE_HEIGHT = 360
 _THUMBNAIL_SIZE = (380, 205)
 _CONTACT_COLUMNS = 3
-_OBJECTIVE_ARTIFACT_NAMES = (
-    "facts.json",
-    "duplicate-groups.json",
-    "contact-sheet.jpg",
-    "index.html",
-    "judgment-input.json",
-)
+# 64 tiles cap each decoded page at 1,260 x 7,920 pixels.
+CONTACT_SHEET_MAX_TILES = 64
 _JUDGMENTS_NAME = "judgments.json"
 FaultInjector = Callable[[str], None]
+ArtifactProducer = Callable[[], bytes]
+ArtifactValue = bytes | ArtifactProducer
 
 
 class ComparisonArtifactConflict(SafetyError):
@@ -57,6 +58,7 @@ class ComparisonArtifacts(BaseModel):
     facts: Path
     duplicate_groups: Path
     contact_sheet: Path
+    contact_sheets: tuple[Path, ...]
     gallery: Path
     judgment_input: Path
     judgments: Path | None = None
@@ -83,21 +85,26 @@ def render_comparison(
             "duplicate_groups": [list(group) for group in report.duplicate_groups],
         }
     )
-    artifact_values = {
+    contact_items = _contact_sheet_items(report)
+    contact_page_names = _contact_sheet_page_names(len(contact_items))
+    artifact_values: dict[str, ArtifactValue] = {
         "facts.json": facts_bytes,
         "duplicate-groups.json": duplicate_groups_bytes,
-        "contact-sheet.jpg": _contact_sheet_bytes(
-            report,
-            root,
-        ),
         "index.html": _gallery_html(
             report,
             root,
+            contact_page_names,
         ).encode("utf-8"),
         "judgment-input.json": _json_bytes(
             _judgment_input(report, facts_bytes)
         ),
     }
+    for page_index, page_name in enumerate(contact_page_names):
+        start = page_index * CONTACT_SHEET_MAX_TILES
+        page_items = contact_items[start : start + CONTACT_SHEET_MAX_TILES]
+        artifact_values[page_name] = (
+            lambda items=page_items: _contact_sheet_page_bytes(items, root)
+        )
     _publish_artifact_set(
         root,
         artifact_values,
@@ -105,13 +112,17 @@ def render_comparison(
         fault_injector=fault_injector,
     )
     judgments_path = root / _COMPARISON_DIRECTORY / _JUDGMENTS_NAME
+    contact_sheets = tuple(
+        root / _COMPARISON_DIRECTORY / name for name in contact_page_names
+    )
     return ComparisonArtifacts(
         experiment_root=root,
         facts=root / _COMPARISON_DIRECTORY / "facts.json",
         duplicate_groups=(
             root / _COMPARISON_DIRECTORY / "duplicate-groups.json"
         ),
-        contact_sheet=root / _COMPARISON_DIRECTORY / "contact-sheet.jpg",
+        contact_sheet=contact_sheets[0],
+        contact_sheets=contact_sheets,
         gallery=root / _COMPARISON_DIRECTORY / "index.html",
         judgment_input=root / _COMPARISON_DIRECTORY / "judgment-input.json",
         judgments=judgments_path if judgments_path.exists() else None,
@@ -137,7 +148,7 @@ def comparison_facts_sha256(report: ComparisonReport) -> str:
 
 def _publish_artifact_set(
     root: Path,
-    objective_artifacts: dict[str, bytes],
+    objective_artifacts: dict[str, ArtifactValue],
     *,
     judgment_document: bytes | None,
     fault_injector: FaultInjector | None,
@@ -147,37 +158,26 @@ def _publish_artifact_set(
         _verify_existing_artifact_set(
             destination,
             objective_artifacts,
-            expected_judgments=judgment_document,
             context="preexisting",
         )
-        if judgment_document is not None and not (
-            destination / _JUDGMENTS_NAME
-        ).exists():
-            _inject(fault_injector, f"publish:{_JUDGMENTS_NAME}")
-            store = ExperimentStore(root.parent)
-            try:
-                store.write_bytes_new(
-                    root.name,
-                    _COMPARISON_DIRECTORY / _JUDGMENTS_NAME,
-                    judgment_document,
-                    reuse_matching=True,
-                )
-            except SafetyError as error:
-                raise ComparisonArtifactConflict(
-                    "comparison judgments conflict with an existing artifact"
-                ) from error
+        if judgment_document is not None:
+            _append_judgments(
+                root,
+                judgment_document,
+                fault_injector=fault_injector,
+            )
         return
 
     stage = Path(
         tempfile.mkdtemp(prefix=".comparison-stage-", dir=root)
     )
-    staged_artifacts = dict(objective_artifacts)
+    staged_artifacts: dict[str, ArtifactValue] = dict(objective_artifacts)
     if judgment_document is not None:
         staged_artifacts[_JUDGMENTS_NAME] = judgment_document
     try:
         for name, content in staged_artifacts.items():
             _inject(fault_injector, f"stage:{name}")
-            _write_staged_file(stage / name, content)
+            _write_staged_file(stage / name, _artifact_bytes(content))
         _inject(fault_injector, "fsync:staging")
         _fsync_directory(stage)
         _inject(fault_injector, "publish:comparisons")
@@ -188,9 +188,14 @@ def _publish_artifact_set(
                 _verify_existing_artifact_set(
                     destination,
                     objective_artifacts,
-                    expected_judgments=judgment_document,
                     context="concurrent",
                 )
+                if judgment_document is not None:
+                    _append_judgments(
+                        root,
+                        judgment_document,
+                        fault_injector=fault_injector,
+                    )
             except ComparisonArtifactConflict as conflict:
                 raise conflict from error
         else:
@@ -201,9 +206,8 @@ def _publish_artifact_set(
 
 def _verify_existing_artifact_set(
     directory: Path,
-    objective_artifacts: dict[str, bytes],
+    objective_artifacts: dict[str, ArtifactValue],
     *,
-    expected_judgments: bytes | None,
     context: str,
 ) -> None:
     if path_component_is_link_or_junction(directory) or not directory.is_dir():
@@ -217,7 +221,7 @@ def _verify_existing_artifact_set(
             f"{context} comparison artifact set is not safely readable"
         ) from error
     names = {entry.name for entry in entries}
-    objective_names = set(_OBJECTIVE_ARTIFACT_NAMES)
+    objective_names = set(objective_artifacts)
     allowed_names = objective_names | {_JUDGMENTS_NAME}
     if not objective_names.issubset(names):
         raise ComparisonArtifactConflict(
@@ -227,15 +231,8 @@ def _verify_existing_artifact_set(
         raise ComparisonArtifactConflict(
             f"{context} comparison artifact set contains unexpected files"
         )
-    if expected_judgments is not None and _JUDGMENTS_NAME not in names:
-        if context == "concurrent":
-            raise ComparisonArtifactConflict(
-                "concurrent comparison artifact set is incomplete"
-            )
     expected = dict(objective_artifacts)
-    if expected_judgments is not None and _JUDGMENTS_NAME in names:
-        expected[_JUDGMENTS_NAME] = expected_judgments
-    elif _JUDGMENTS_NAME in names:
+    if _JUDGMENTS_NAME in names:
         artifact = directory / _JUDGMENTS_NAME
         if path_component_is_link_or_junction(artifact) or not artifact.is_file():
             raise ComparisonArtifactConflict(
@@ -249,7 +246,10 @@ def _verify_existing_artifact_set(
                 f"{context} comparison artifact is a link or junction: {name}"
             )
         try:
-            if not artifact.is_file() or artifact.read_bytes() != content:
+            if (
+                not artifact.is_file()
+                or artifact.read_bytes() != _artifact_bytes(content)
+            ):
                 raise ComparisonArtifactConflict(
                     f"{context} comparison artifact would clobber {name}"
                 )
@@ -257,6 +257,33 @@ def _verify_existing_artifact_set(
             raise ComparisonArtifactConflict(
                 f"{context} comparison artifact is not safely readable: {name}"
             ) from error
+
+
+def _append_judgments(
+    root: Path,
+    judgment_document: bytes,
+    *,
+    fault_injector: FaultInjector | None,
+) -> None:
+    judgment_path = root / _COMPARISON_DIRECTORY / _JUDGMENTS_NAME
+    if not judgment_path.exists():
+        _inject(fault_injector, f"publish:{_JUDGMENTS_NAME}")
+    store = ExperimentStore(root.parent)
+    try:
+        store.write_bytes_new(
+            root.name,
+            _COMPARISON_DIRECTORY / _JUDGMENTS_NAME,
+            judgment_document,
+            reuse_matching=True,
+        )
+    except SafetyError as error:
+        raise ComparisonArtifactConflict(
+            "comparison judgments conflict with an existing artifact"
+        ) from error
+
+
+def _artifact_bytes(value: ArtifactValue) -> bytes:
+    return value() if callable(value) else value
 
 
 def _write_staged_file(path: Path, content: bytes) -> None:
@@ -472,7 +499,11 @@ def _variant_judgment_schema(
     }
 
 
-def _gallery_html(report: ComparisonReport, experiment_root: Path) -> str:
+def _gallery_html(
+    report: ComparisonReport,
+    experiment_root: Path,
+    contact_page_names: tuple[str, ...],
+) -> str:
     template_text = (
         resources.files("mp_comfyui_lab.resources")
         .joinpath("comparison.html")
@@ -486,7 +517,21 @@ def _gallery_html(report: ComparisonReport, experiment_root: Path) -> str:
         sections = '<p class="empty">No durable runs are available.</p>'
     return Template(template_text).substitute(
         experiment_id=_escape(report.experiment_id),
+        contact_sheet_links=_contact_sheet_links(contact_page_names),
         variant_sections=sections,
+    )
+
+
+def _contact_sheet_links(page_names: tuple[str, ...]) -> str:
+    links = "".join(
+        f'<a href="{_escape(name)}">Page {index}</a>'
+        for index, name in enumerate(page_names, start=1)
+    )
+    return (
+        '<nav class="contact-sheets" aria-label="Contact sheets">'
+        "<strong>Contact sheets</strong>"
+        f"{links}"
+        "</nav>"
     )
 
 
@@ -537,7 +582,12 @@ def _output_html(
     experiment_root: Path,
 ) -> str:
     href = _validated_artifact_href(experiment_root, output)
-    media = '<div class="missing">Artifact unavailable</div>'
+    unavailable_label = (
+        "Artifact invalid"
+        if output.availability == "invalid"
+        else "Artifact unavailable"
+    )
+    media = f'<div class="missing">{unavailable_label}</div>'
     if href is not None:
         escaped_href = _escape(href)
         if output.media_kind == "image":
@@ -565,6 +615,12 @@ def _output_html(
         if output.width is None or output.height is None
         else f" | {output.width} x {output.height} {output.mode or ''}".rstrip()
     )
+    detected = output.detected_mime_type or "unrecognized"
+    error = (
+        ""
+        if output.media_error is None
+        else f" | {_escape(output.media_error.code)}: {_escape(output.media_error.message)}"
+    )
     return (
         f'<figure data-output-id="{_escape(output.output_id)}">'
         f'<div class="media">{media}</div>'
@@ -572,7 +628,10 @@ def _output_html(
         f"<strong>Output {output.output_ordinal}</strong>"
         f"<span>{_escape(output.prompt_label)}</span>"
         f"<span>Status: {_escape(variant.status)} / {_escape(output.availability)}</span>"
-        f"<span>{_escape(output.mime_type)} | {output.bytes if output.bytes is not None else 'n/a'} bytes{_escape(dimensions)}</span>"
+        f"<span>Declared: {_escape(output.declared_mime_type)} | "
+        f"Detected: {_escape(detected)} | "
+        f"{output.bytes if output.bytes is not None else 'n/a'} bytes"
+        f"{_escape(dimensions)}{error}</span>"
         "</figcaption>"
         "</figure>"
     )
@@ -610,16 +669,31 @@ def _validated_artifact_href(
     )
 
 
-def _contact_sheet_bytes(
+def _contact_sheet_items(
     report: ComparisonReport,
-    experiment_root: Path,
-) -> bytes:
-    items = [
+) -> tuple[tuple[VariantComparison, MediaFacts], ...]:
+    return tuple(
         (variant, output)
         for variant_id in sorted(report.variants)
         for variant in (report.variants[variant_id],)
         for output in sorted(variant.outputs, key=lambda item: item.output_ordinal)
-    ]
+    )
+
+
+def _contact_sheet_page_names(item_count: int) -> tuple[str, ...]:
+    page_count = max(1, math.ceil(item_count / CONTACT_SHEET_MAX_TILES))
+    return tuple(
+        "contact-sheet.jpg"
+        if page == 1
+        else f"contact-sheet-{page:04d}.jpg"
+        for page in range(1, page_count + 1)
+    )
+
+
+def _contact_sheet_page_bytes(
+    items: Sequence[tuple[VariantComparison, MediaFacts]],
+    experiment_root: Path,
+) -> bytes:
     count = max(1, len(items))
     columns = min(_CONTACT_COLUMNS, count)
     rows = math.ceil(count / columns)
@@ -628,33 +702,41 @@ def _contact_sheet_bytes(
         (columns * _TILE_WIDTH, rows * _TILE_HEIGHT),
         color=(245, 247, 248),
     )
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default()
-    if not items:
-        draw.text((24, 24), "No durable comparison outputs", fill=(25, 30, 35), font=font)
-    for index, (variant, output) in enumerate(items):
-        x = (index % columns) * _TILE_WIDTH
-        y = (index // columns) * _TILE_HEIGHT
-        _draw_contact_tile(
-            canvas,
-            draw,
-            font,
-            x,
-            y,
-            variant,
-            output,
-            experiment_root,
+    try:
+        draw = ImageDraw.Draw(canvas)
+        font = ImageFont.load_default()
+        if not items:
+            draw.text(
+                (24, 24),
+                "No durable comparison outputs",
+                fill=(25, 30, 35),
+                font=font,
+            )
+        for index, (variant, output) in enumerate(items):
+            x = (index % columns) * _TILE_WIDTH
+            y = (index // columns) * _TILE_HEIGHT
+            _draw_contact_tile(
+                canvas,
+                draw,
+                font,
+                x,
+                y,
+                variant,
+                output,
+                experiment_root,
+            )
+        encoded = BytesIO()
+        canvas.save(
+            encoded,
+            format="JPEG",
+            quality=90,
+            optimize=False,
+            progressive=False,
+            subsampling=0,
         )
-    encoded = BytesIO()
-    canvas.save(
-        encoded,
-        format="JPEG",
-        quality=90,
-        optimize=False,
-        progressive=False,
-        subsampling=0,
-    )
-    return encoded.getvalue()
+        return encoded.getvalue()
+    finally:
+        canvas.close()
 
 
 def _draw_contact_tile(
@@ -685,16 +767,25 @@ def _draw_contact_tile(
     if output.media_kind == "image" and href is not None:
         source_path = experiment_root / output.artifact_relative_path
         try:
-            with Image.open(source_path) as source:
-                image = ImageOps.exif_transpose(source).convert("RGB")
+            image, _ = load_normalized_image(
+                source_path,
+                alpha_background="checkerboard",
+                max_image_pixels=MAX_IMAGE_PIXELS,
+            )
+            try:
                 image.thumbnail(_THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
                 left = media_box[0] + (_THUMBNAIL_SIZE[0] - image.width) // 2
                 top = media_box[1] + (_THUMBNAIL_SIZE[1] - image.height) // 2
                 canvas.paste(image, (left, top))
-        except OSError:
-            _draw_placeholder(draw, media_box, output.media_kind, font)
+            finally:
+                image.close()
+        except (OSError, SyntaxError, ValueError):
+            _draw_placeholder(draw, media_box, "invalid", font)
     else:
-        _draw_placeholder(draw, media_box, output.media_kind, font)
+        placeholder = (
+            "invalid" if output.availability == "invalid" else output.media_kind
+        )
+        _draw_placeholder(draw, media_box, placeholder, font)
     lines = (
         f"Variant: {variant.variant_id}",
         variant.model_lora_summary,

@@ -13,6 +13,7 @@ import pytest
 
 from mp_comfyui_lab.cli import app
 from mp_comfyui_lab.cli.app import ExitCode, main
+from mp_comfyui_lab.comparison import metrics as comparison_metrics
 from mp_comfyui_lab.comparison import render as comparison_render
 from mp_comfyui_lab.comparison.judgments import (
     JudgmentValidationError,
@@ -35,6 +36,7 @@ from mp_comfyui_lab.experiments.planning import recompute_exact_run_hash
 from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.graph.hashing import capability_hash
 from mp_comfyui_lab.security import SafetyError
+from tests.helpers import valid_media_bytes
 
 
 PLAN_HASH = "a" * 64
@@ -278,8 +280,16 @@ def test_compare_records_video_audio_and_unknown_without_phash(
 ) -> None:
     experiment_root = tmp_path / "experiment-compare"
     media = (
-        ("outputs/mixed/run-mixed/clip.mp4", b"video-bytes", "video/mp4"),
-        ("outputs/mixed/run-mixed/sound.wav", b"audio-bytes", "audio/wav"),
+        (
+            "outputs/mixed/run-mixed/clip.mp4",
+            valid_media_bytes("video/mp4"),
+            "video/mp4",
+        ),
+        (
+            "outputs/mixed/run-mixed/sound.wav",
+            valid_media_bytes("audio/wav"),
+            "audio/wav",
+        ),
         (
             "outputs/mixed/run-mixed/result.bin",
             b"unknown-bytes",
@@ -311,11 +321,223 @@ def test_compare_records_video_audio_and_unknown_without_phash(
     ]
     assert all(item.phash is None for item in facts)
     assert [item.bytes for item in facts] == [
-        len(b"video-bytes"),
-        len(b"audio-bytes"),
+        len(valid_media_bytes("video/mp4")),
+        len(valid_media_bytes("audio/wav")),
         len(b"unknown-bytes"),
     ]
     assert all(item.provider_metadata.run_id == "run-mixed" for item in facts)
+
+
+def _write_alpha_checkerboard(path: Path, *, alpha: int) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.new("RGBA", (64, 64))
+    for y in range(64):
+        for x in range(64):
+            value = 0 if ((x // 32) + (y // 32)) % 2 == 0 else 255
+            image.putpixel((x, y), (value, value, value, alpha))
+    image.save(path, format="PNG")
+    return path.read_bytes()
+
+
+def test_phash_composites_alpha_on_white_before_luminance(
+    tmp_path: Path,
+) -> None:
+    experiment_root = tmp_path / "experiment-compare"
+    transparent_path = (
+        experiment_root / "outputs/transparent/run-transparent/frame.png"
+    )
+    opaque_path = experiment_root / "outputs/opaque/run-opaque/frame.png"
+    transparent = _write_alpha_checkerboard(transparent_path, alpha=0)
+    opaque = _write_alpha_checkerboard(opaque_path, alpha=255)
+
+    report = compare_outputs(
+        (
+            _run(
+                "transparent",
+                (
+                    _output(
+                        "outputs/transparent/run-transparent/frame.png",
+                        transparent,
+                    ),
+                ),
+            ),
+            _run(
+                "opaque",
+                (_output("outputs/opaque/run-opaque/frame.png", opaque),),
+            ),
+        ),
+        experiment_root,
+    )
+
+    transparent_hash = report.variants["transparent"].outputs[0].phash
+    opaque_hash = report.variants["opaque"].outputs[0].phash
+    assert transparent_hash is not None
+    assert opaque_hash is not None
+    assert transparent_hash != opaque_hash
+    assert report.duplicate_groups == ()
+
+
+def test_contact_sheet_represents_transparency_on_checkerboard(
+    tmp_path: Path,
+) -> None:
+    experiment_root = tmp_path / "experiment-compare"
+    path = experiment_root / "outputs/transparent/run-transparent/frame.png"
+    content = _write_alpha_checkerboard(path, alpha=0)
+    report = compare_outputs(
+        (
+            _run(
+                "transparent",
+                (
+                    _output(
+                        "outputs/transparent/run-transparent/frame.png",
+                        content,
+                    ),
+                ),
+            ),
+        ),
+        experiment_root,
+    )
+
+    artifacts = render_comparison(report, experiment_root)
+
+    with Image.open(artifacts.contact_sheet) as sheet:
+        thumbnail = sheet.crop((178, 90, 242, 154)).convert("L")
+        extrema = thumbnail.getextrema()
+        assert extrema[0] >= 150
+        assert extrema[1] - extrema[0] >= 15
+
+
+def test_invalid_images_are_objective_nonavailable_facts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    experiment_root = tmp_path / "experiment-compare"
+    corrupt = b"not an image"
+    valid_path = experiment_root / "valid.png"
+    valid = _write_image(valid_path)
+    truncated = valid[:32]
+    payloads = (
+        (
+            "outputs/invalid/run-invalid/corrupt.png",
+            corrupt,
+            "unrecognized_signature",
+        ),
+        (
+            "outputs/invalid/run-invalid/truncated.png",
+            truncated,
+            "invalid_image",
+        ),
+        (
+            "outputs/invalid/run-invalid/too-many-pixels.png",
+            valid,
+            "image_pixel_limit_exceeded",
+        ),
+    )
+    outputs = []
+    for ordinal, (relative_path, content, _) in enumerate(payloads):
+        path = experiment_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        outputs.append(_output(relative_path, content, ordinal=ordinal))
+    monkeypatch.setattr(
+        comparison_metrics,
+        "MAX_IMAGE_PIXELS",
+        1,
+        raising=False,
+    )
+
+    report = compare_outputs((_run("invalid", tuple(outputs)),), experiment_root)
+    facts = report.variants["invalid"].outputs
+
+    assert [item.availability for item in facts] == ["invalid"] * 3
+    assert [item.media_error.code for item in facts] == [
+        item[2] for item in payloads
+    ]
+    assert all(item.artifact_relative_path is None for item in facts)
+    assert all(item.bytes is not None and item.sha256 is not None for item in facts)
+    assert all(item.phash is None for item in facts)
+    artifacts = render_comparison(report, experiment_root)
+    judgment_input = json.loads(
+        artifacts.judgment_input.read_text(encoding="utf-8")
+    )
+    html = artifacts.gallery.read_text(encoding="utf-8")
+    assert judgment_input["output_ids"] == []
+    assert "Status: SUCCESS / invalid" in html
+    assert "Artifact invalid" in html
+    assert "<img" not in html
+
+
+def test_comparison_verifies_declared_and_detected_media_types(
+    tmp_path: Path,
+) -> None:
+    experiment_root = tmp_path / "experiment-compare"
+    cases = (
+        ("video/mp4", "image/png"),
+        ("image/png", "image/jpeg"),
+        ("audio/wav", "audio/mpeg"),
+        ("application/octet-stream", "image/png"),
+    )
+    outputs = []
+    for ordinal, (declared, detected) in enumerate(cases):
+        content = valid_media_bytes(detected)
+        relative_path = f"outputs/mismatch/run-mismatch/{ordinal:04d}.bin"
+        path = experiment_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        outputs.append(
+            _output(
+                relative_path,
+                content,
+                ordinal=ordinal,
+                media_type=declared,
+            )
+        )
+
+    report = compare_outputs((_run("mismatch", tuple(outputs)),), experiment_root)
+    facts = report.variants["mismatch"].outputs
+
+    assert [item.declared_mime_type for item in facts] == [
+        item[0] for item in cases
+    ]
+    assert [item.detected_mime_type for item in facts] == [
+        item[1] for item in cases
+    ]
+    assert [item.declared_media_kind for item in facts] == [
+        "video",
+        "image",
+        "audio",
+        "unknown",
+    ]
+    assert [item.detected_media_kind for item in facts] == [
+        "image",
+        "image",
+        "audio",
+        "image",
+    ]
+    assert [item.availability for item in facts] == [
+        "invalid",
+        "invalid",
+        "invalid",
+        "available",
+    ]
+    assert [item.media_error.code if item.media_error else None for item in facts] == [
+        "declared_mime_mismatch",
+        "declared_mime_mismatch",
+        "declared_mime_mismatch",
+        None,
+    ]
+    assert facts[3].media_kind == "unknown"
+    assert facts[3].phash is None
+    artifacts = render_comparison(report, experiment_root)
+    judgment_input = json.loads(
+        artifacts.judgment_input.read_text(encoding="utf-8")
+    )
+    html = artifacts.gallery.read_text(encoding="utf-8")
+    assert judgment_input["output_ids"] == ["mismatch/3"]
+    assert "<video" not in html
+    assert "<audio" not in html
+    assert "<img" not in html
+    assert html.count("Open local artifact") == 1
 
 
 def test_compare_gracefully_records_missing_output_from_failed_run(
@@ -449,8 +671,16 @@ def _mixed_report(tmp_path: Path):
     image_bytes = _write_image(image_path)
     media = (
         ("outputs/mixed/run-mixed/frame.png", image_bytes, "image/png"),
-        ("outputs/mixed/run-mixed/clip.mp4", b"video-bytes", "video/mp4"),
-        ("outputs/mixed/run-mixed/sound.wav", b"audio-bytes", "audio/wav"),
+        (
+            "outputs/mixed/run-mixed/clip.mp4",
+            valid_media_bytes("video/mp4"),
+            "video/mp4",
+        ),
+        (
+            "outputs/mixed/run-mixed/sound.wav",
+            valid_media_bytes("audio/wav"),
+            "audio/wav",
+        ),
         (
             "outputs/mixed/run-mixed/result.bin",
             b"unknown-bytes",
@@ -570,6 +800,87 @@ def test_render_writes_stable_objective_artifacts_and_media_controls(
     assert judgments_schema["allOf"][0]["contains"]["properties"][
         "variant_id"
     ]["const"] == "mixed"
+
+
+def test_contact_sheets_paginate_545_outputs_with_bounded_dimensions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    experiment_root = tmp_path / "experiment-compare"
+    experiment_root.mkdir()
+    report = compare_outputs(
+        (
+            _run(
+                "large",
+                (),
+                state=RunState.FAILED,
+                expected_output_count=545,
+                error={"kind": "provider_error"},
+            ),
+        ),
+        experiment_root,
+    )
+    original_new = comparison_render.Image.new
+    canvas_sizes: list[tuple[int, int]] = []
+
+    def bounded_canvas(mode, size, *args, **kwargs):
+        assert size[0] <= 3 * 420
+        assert size[1] <= 22 * 360
+        canvas_sizes.append(size)
+        return original_new(mode, size, *args, **kwargs)
+
+    monkeypatch.setattr(comparison_render.Image, "new", bounded_canvas)
+
+    artifacts = render_comparison(report, experiment_root)
+
+    expected_names = [
+        "contact-sheet.jpg",
+        *[f"contact-sheet-{page:04d}.jpg" for page in range(2, 10)],
+    ]
+    assert artifacts.contact_sheet == artifacts.contact_sheets[0]
+    assert [path.name for path in artifacts.contact_sheets] == expected_names
+    assert len(canvas_sizes) == 9
+    for path in artifacts.contact_sheets:
+        with Image.open(path) as page:
+            assert page.width <= 3 * 420
+            assert page.height <= 22 * 360
+    html = artifacts.gallery.read_text(encoding="utf-8")
+    assert all(f'href="{name}"' in html for name in expected_names)
+    cli_artifacts = app._comparison_artifacts_payload(artifacts)
+    assert [
+        Path(item["path"]).name
+        for item in cli_artifacts
+        if item["kind"].startswith("contact_sheet")
+    ] == expected_names
+
+
+def test_later_contact_sheet_page_failure_is_atomic(
+    tmp_path: Path,
+) -> None:
+    experiment_root = tmp_path / "experiment-compare"
+    experiment_root.mkdir()
+    report = compare_outputs(
+        (
+            _run(
+                "large",
+                (),
+                state=RunState.FAILED,
+                expected_output_count=65,
+                error={"kind": "provider_error"},
+            ),
+        ),
+        experiment_root,
+    )
+
+    def inject(point: str) -> None:
+        if point == "stage:contact-sheet-0002.jpg":
+            raise RuntimeError("injected later page failure")
+
+    with pytest.raises(RuntimeError, match="later page failure"):
+        render_comparison(report, experiment_root, fault_injector=inject)
+
+    assert not (experiment_root / "comparisons").exists()
+    assert not list(experiment_root.glob(".comparison-stage-*"))
 
 
 def _judgment_for(variant_id: str, output_ids: list[str]) -> dict[str, object]:
@@ -1047,6 +1358,115 @@ def test_render_accepts_byte_identical_concurrent_directory_winner(
     }
 
 
+def test_judged_render_appends_after_compatible_plain_concurrent_winner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    experiment_root, report = _mixed_report(tmp_path)
+    judgment_document = b'{"writer":"judged"}\n'
+
+    def concurrent_plain_publish(source: Path, destination: Path) -> None:
+        shutil.copytree(source, destination)
+        (destination / "judgments.json").unlink()
+        raise FileExistsError("plain comparison won")
+
+    monkeypatch.setattr(
+        comparison_render,
+        "_rename_directory_new",
+        concurrent_plain_publish,
+    )
+
+    artifacts = render_comparison(
+        report,
+        experiment_root,
+        judgment_document=judgment_document,
+    )
+
+    assert artifacts.judgments is not None
+    assert artifacts.judgments.read_bytes() == judgment_document
+    assert not list(experiment_root.glob(".comparison-stage-*"))
+
+
+def test_plain_render_accepts_compatible_judged_concurrent_winner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    experiment_root, report = _mixed_report(tmp_path)
+    judgment_document = b'{"writer":"judged"}\n'
+
+    def concurrent_judged_publish(source: Path, destination: Path) -> None:
+        shutil.copytree(source, destination)
+        (destination / "judgments.json").write_bytes(judgment_document)
+        raise FileExistsError("judged comparison won")
+
+    monkeypatch.setattr(
+        comparison_render,
+        "_rename_directory_new",
+        concurrent_judged_publish,
+    )
+
+    artifacts = render_comparison(report, experiment_root)
+
+    assert artifacts.judgments is not None
+    assert artifacts.judgments.read_bytes() == judgment_document
+
+
+def test_identical_concurrent_judged_writer_is_idempotent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    experiment_root, report = _mixed_report(tmp_path)
+    judgment_document = b'{"writer":"same"}\n'
+
+    def identical_judged_publish(source: Path, destination: Path) -> None:
+        shutil.copytree(source, destination)
+        raise FileExistsError("identical judged comparison won")
+
+    monkeypatch.setattr(
+        comparison_render,
+        "_rename_directory_new",
+        identical_judged_publish,
+    )
+
+    artifacts = render_comparison(
+        report,
+        experiment_root,
+        judgment_document=judgment_document,
+    )
+
+    assert artifacts.judgments is not None
+    assert artifacts.judgments.read_bytes() == judgment_document
+
+
+def test_conflicting_concurrent_judged_writer_wins_without_clobber(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    experiment_root, report = _mixed_report(tmp_path)
+    submitted = b'{"writer":"submitted"}\n'
+    winner = b'{"writer":"winner"}\n'
+
+    def conflicting_judged_publish(source: Path, destination: Path) -> None:
+        shutil.copytree(source, destination)
+        (destination / "judgments.json").write_bytes(winner)
+        raise FileExistsError("different judged comparison won")
+
+    monkeypatch.setattr(
+        comparison_render,
+        "_rename_directory_new",
+        conflicting_judged_publish,
+    )
+
+    with pytest.raises(ComparisonArtifactConflict, match="judgments conflict"):
+        render_comparison(
+            report,
+            experiment_root,
+            judgment_document=submitted,
+        )
+
+    assert (experiment_root / "comparisons/judgments.json").read_bytes() == winner
+
+
 def test_render_rejects_conflicting_concurrent_directory_winner(
     tmp_path: Path,
     monkeypatch,
@@ -1343,6 +1763,9 @@ def test_compare_cli_is_store_only_and_returns_judgment_input(
         "contact_sheet": str(
             (experiment_root / "comparisons/contact-sheet.jpg").resolve()
         ),
+        "contact_sheets": [
+            str((experiment_root / "comparisons/contact-sheet.jpg").resolve())
+        ],
         "gallery": str((experiment_root / "comparisons/index.html").resolve()),
         "judgment_input": str(
             (experiment_root / "comparisons/judgment-input.json").resolve()
@@ -1395,6 +1818,9 @@ def test_compare_cli_returns_rendered_absolute_paths_from_custom_store(
         assert Path(initial["data"][key]) == path
         assert Path(initial["data"][key]).is_absolute()
     assert initial["data"]["judgments"] is None
+    assert [Path(path) for path in initial["data"]["contact_sheets"]] == [
+        expected["contact_sheet"]
+    ]
     assert [Path(item["path"]) for item in initial["artifacts"]] == [
         expected["facts"],
         expected["duplicate_groups"],

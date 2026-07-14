@@ -12,10 +12,7 @@ import stat
 import tempfile
 from typing import Any
 import uuid
-import warnings
-import zipfile
 
-from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 import requests
 
@@ -29,6 +26,7 @@ from mp_comfyui_lab.executors.base import (
 )
 from mp_comfyui_lab.graph.hashing import capability_hash
 from mp_comfyui_lab.json_types import thaw_json
+from mp_comfyui_lab.media import MEDIA_EXTENSIONS, verify_media_file
 from mp_comfyui_lab.security import SafetyError
 from mp_comfyui_lab.security import safe_filename
 from mp_comfyui_lab.security import sanitize_for_persistence
@@ -66,18 +64,7 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _RETRY_DELAYS = (1, 2, 4)
 _POLL_INTERVAL_SECONDS = 1
 MAX_OUTPUT_BYTES = 512 * 1024 * 1024
-_OUTPUT_EXTENSIONS = {
-    "image/png": "png",
-    "image/jpeg": "jpg",
-    "image/webp": "webp",
-    "image/gif": "gif",
-    "video/mp4": "mp4",
-    "video/webm": "webm",
-    "audio/mpeg": "mp3",
-    "audio/wav": "wav",
-    "audio/ogg": "ogg",
-    "application/zip": "zip",
-}
+_OUTPUT_EXTENSIONS = MEDIA_EXTENSIONS
 
 
 class ApprovalError(RuntimeError):
@@ -1778,117 +1765,8 @@ class ExperimentEngine:
         )
 
     def _verify_downloaded_media(self, path: Path, media_type: str) -> None:
-        try:
-            file_stat = path.lstat()
-        except OSError as error:
-            raise SafetyError(
-                "output downloader did not produce a readable file"
-            ) from error
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise SafetyError("downloaded output is not a regular file")
-        if file_stat.st_size == 0:
-            raise SafetyError("downloaded output is empty")
-        if file_stat.st_size > self._max_output_bytes:
-            raise SafetyError("downloaded output exceeds byte limit")
-
-        image_formats = {
-            "image/png": "PNG",
-            "image/jpeg": "JPEG",
-            "image/webp": "WEBP",
-            "image/gif": "GIF",
-        }
-        if media_type in image_formats:
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", Image.DecompressionBombWarning)
-                    with Image.open(path) as image:
-                        if image.format != image_formats[media_type]:
-                            raise SafetyError(
-                                "downloaded image format does not match media type"
-                            )
-                        image.verify()
-            except SafetyError:
-                raise
-            except (
-                Image.DecompressionBombError,
-                Image.DecompressionBombWarning,
-                UnidentifiedImageError,
-                OSError,
-                SyntaxError,
-                ValueError,
-            ) as error:
-                raise SafetyError("downloaded image failed verification") from error
-            return
-
-        try:
-            with path.open("rb") as source:
-                prefix = source.read(65_536)
-        except OSError as error:
-            raise SafetyError("downloaded output cannot be inspected") from error
-        if media_type == "video/mp4":
-            box_size = int.from_bytes(prefix[:4], "big") if len(prefix) >= 4 else 0
-            valid = (
-                len(prefix) >= 16
-                and prefix[4:8] == b"ftyp"
-                and 16 <= box_size <= file_stat.st_size
-                and prefix[8:12] != b"\x00\x00\x00\x00"
-            )
-        elif media_type == "video/webm":
-            valid = prefix.startswith(b"\x1aE\xdf\xa3") and b"webm" in prefix
-        elif media_type == "audio/mpeg":
-            valid = self._valid_mp3(prefix, file_stat.st_size)
-        elif media_type == "audio/wav":
-            valid = (
-                len(prefix) >= 12
-                and prefix[:4] == b"RIFF"
-                and prefix[8:12] == b"WAVE"
-                and int.from_bytes(prefix[4:8], "little") + 8
-                <= file_stat.st_size
-            )
-        elif media_type == "audio/ogg":
-            segment_count = prefix[26] if len(prefix) >= 27 else 0
-            header_size = 27 + segment_count
-            payload_size = (
-                sum(prefix[27:header_size])
-                if len(prefix) >= header_size
-                else file_stat.st_size + 1
-            )
-            valid = (
-                len(prefix) >= header_size
-                and prefix[:4] == b"OggS"
-                and prefix[4] == 0
-                and header_size + payload_size <= file_stat.st_size
-            )
-        elif media_type == "application/zip":
-            try:
-                with zipfile.ZipFile(path) as archive:
-                    valid = archive.testzip() is None
-            except (OSError, zipfile.BadZipFile, RuntimeError):
-                valid = False
-        else:
-            valid = False
-        if not valid:
-            raise SafetyError(
-                "downloaded output signature does not match media type"
-            )
-
-    @staticmethod
-    def _valid_mp3(prefix: bytes, size: int) -> bool:
-        if prefix.startswith(b"ID3") and len(prefix) >= 10:
-            encoded_size = prefix[6:10]
-            if any(value >= 128 for value in encoded_size):
-                return False
-            tag_size = (
-                (encoded_size[0] << 21)
-                | (encoded_size[1] << 14)
-                | (encoded_size[2] << 7)
-                | encoded_size[3]
-            )
-            return 10 + tag_size <= size
-        return (
-            len(prefix) >= 4
-            and prefix[0] == 0xFF
-            and prefix[1] & 0xE0 == 0xE0
-            and prefix[1] & 0x18 != 0x08
-            and prefix[2] & 0xF0 != 0xF0
+        verify_media_file(
+            path,
+            media_type,
+            max_bytes=self._max_output_bytes,
         )

@@ -22,6 +22,15 @@
     h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: 0; }
     header p { margin: 0; color: #e7ecee; }
     main { max-width: 1440px; margin: 0 auto; padding: 24px; }
+    .contact-sheets {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 16px;
+      padding: 0 0 20px;
+      border-bottom: 1px solid #c7d0d5;
+    }
+    .contact-sheets a { color: #075b52; font-weight: 700; }
     .variant { padding: 24px 0 32px; border-bottom: 1px solid #c7d0d5; }
     .variant h2 { margin: 0 0 16px; font-size: 22px; letter-spacing: 0; }
     dl {
@@ -73,6 +82,7 @@
     <p>Experiment <code>$experiment_id</code></p>
   </header>
   <main>
+    $contact_sheet_links
     $variant_sections
   </main>
 </body>
