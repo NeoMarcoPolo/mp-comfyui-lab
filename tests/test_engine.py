@@ -27,14 +27,17 @@ from mp_comfyui_lab.executors.base import (
 )
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
 from mp_comfyui_lab.experiments.models import (
+    DimensionName,
     ExperimentPlan,
     FixtureFingerprint,
     OutputRecord,
     PlannedVariant,
+    PlanningConfidence,
     RunRecord,
     RunState,
 )
 from mp_comfyui_lab.experiments.planning import recompute_exact_run_hash
+from mp_comfyui_lab.experiments.saturation import RerunReasonRequired
 from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.json_types import thaw_json
 
@@ -127,6 +130,109 @@ def _persist_plan(
         f"variants/{variant.variant_id}.json",
         variant.model_dump(mode="json"),
     )
+    store.write_json_new(
+        experiment_id,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    return config, plan
+
+
+def _persist_wave_plan(
+    tmp_path: Path,
+    *,
+    experiment_id: str = "wave-approved",
+    variants: tuple[tuple[str, str, PlanningConfidence, int, int], ...] = (
+        ("strong", "b" * 64, PlanningConfidence.OBSERVED, 10, 2),
+        (
+            "weak-popular",
+            "b" * 64,
+            PlanningConfidence.WEAKLY_INFERRED,
+            100_000,
+            1,
+        ),
+        ("other", "c" * 64, PlanningConfidence.OBSERVED, 5, 1),
+    ),
+    hypothesis: DimensionName = DimensionName.CHECKPOINT,
+    coverage: tuple[DimensionName, ...] = (DimensionName.CHECKPOINT,),
+) -> tuple[LabConfig, ExperimentPlan]:
+    config = LabConfig.model_validate(
+        {"experiments_root": tmp_path / "experiments"},
+        context={"base_dir": tmp_path},
+    )
+    store = ExperimentStore(config.experiments_root)
+    store.create(experiment_id)
+    planned: list[PlannedVariant] = []
+    candidates: list[dict[str, object]] = []
+    for index, (variant_id, capability_hash, confidence, engagement, provenance) in enumerate(
+        variants,
+        start=1,
+    ):
+        draft = PlannedVariant(
+            variant_id=variant_id,
+            source_workflow_id="workflow-1",
+            source_hash="a" * 64,
+            materialized_graph={
+                "1": {
+                    "class_type": "CheckpointLoaderSimple",
+                    "inputs": {"ckpt_name": f"model-{index}.safetensors"},
+                },
+                "9": {
+                    "class_type": "SaveImage",
+                    "inputs": {"filename_prefix": variant_id},
+                },
+            },
+            hypothesis=hypothesis,
+            evidence_ids=(f"workflow-{index}",),
+            confidence=confidence,
+            exact_run_hash="0" * 64,
+            capability_hash=capability_hash,
+            expected_output_count=1,
+            output_node_ids=("9",),
+            expected_media_types=("image/png",),
+            execution_parameters={
+                "prompt_lines": ["one"],
+                "expected_output_count": 1,
+                "output_node_ids": ["9"],
+            },
+        )
+        variant = PlannedVariant.model_validate(
+            {
+                **draft.model_dump(mode="python"),
+                "exact_run_hash": recompute_exact_run_hash(draft),
+            }
+        )
+        planned.append(variant)
+        candidates.append(
+            {
+                "candidate_id": variant_id,
+                "confidence": confidence.value,
+                "evidence_ids": [f"workflow-{index}"],
+                "engagement": engagement,
+                "provenance_rank": provenance,
+            }
+        )
+    approval_payload = {
+        "source_hashes": ["a" * 64],
+        "variants": [item.model_dump(mode="json") for item in planned],
+        "capability_coverage": [item.value for item in coverage],
+        "warnings": [],
+        "candidates": candidates,
+    }
+    plan = ExperimentPlan(
+        plan_hash=_canonical_hash(approval_payload),
+        source_hashes=("a" * 64,),
+        variants=tuple(planned),
+        capability_coverage=coverage,
+        warnings=(),
+        approval_payload=approval_payload,
+    )
+    for variant in plan.variants:
+        store.write_json_new(
+            experiment_id,
+            f"variants/{variant.variant_id}.json",
+            variant.model_dump(mode="json"),
+        )
     store.write_json_new(
         experiment_id,
         f"plans/{plan.plan_hash}.json",
@@ -407,18 +513,26 @@ def test_all_run_artifacts_sanitize_untrusted_diagnostics(tmp_path: Path) -> Non
     )
     engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
 
-    for executor in executors:
+    for index, executor in enumerate(executors):
         engine = engine_module.ExperimentEngine(
             config=config,
             executor_factory=lambda executor=executor: executor,
             downloader=lambda _url, _target: None,
             sleep=lambda _seconds: None,
         )
-        engine.run(
-            "plan-approved",
-            "baseline",
-            approved_plan_hash=plan.plan_hash,
-        )
+        if index == 0:
+            engine.run(
+                "plan-approved",
+                "baseline",
+                approved_plan_hash=plan.plan_hash,
+            )
+        else:
+            engine.rerun(
+                "plan-approved",
+                "baseline",
+                approved_plan_hash=plan.plan_hash,
+                reason=f"exercise sanitized diagnostic path {index}",
+            )
 
     durable_bytes = b"\n".join(
         path.read_bytes()
@@ -1250,15 +1364,17 @@ def test_identical_second_run_reuses_matching_variant_output(tmp_path: Path) -> 
         "baseline",
         approved_plan_hash=plan.plan_hash,
     )
-    second = engine.run(
+    second = engine.rerun(
         "plan-approved",
         "baseline",
         approved_plan_hash=plan.plan_hash,
+        reason="verify exact-output reproducibility",
     )
 
     assert first.state is second.state is RunState.SUCCESS
     assert first.run_id != second.run_id
     assert first.outputs == second.outputs
+    assert second.original_run_ids == (first.run_id,)
     output_path = (
         config.experiments_root
         / "plan-approved"
@@ -2679,3 +2795,360 @@ with store.run_lock("plan-approved", "run-process-lock"):
     stdout, stderr = process.communicate(timeout=10)
     assert process.returncode == 0, (stdout, stderr)
     assert marker.read_text(encoding="utf-8") == "acquired"
+
+
+def _wave_engine(
+    config: LabConfig,
+    executor: FakeExecutor,
+):
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+
+    def downloader(_url: str, target: Path) -> None:
+        target.write_bytes(valid_media_bytes("image/png"))
+
+    return engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+
+def test_run_wave_executes_all_novel_capabilities_and_persists_decision(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(tmp_path)
+    executor = FakeExecutor.success(
+        outputs=(
+            ProviderOutput(
+                node_id="9",
+                url="memory://result.png",
+                media_type="image/png",
+                provider_order=0,
+            ),
+        )
+    )
+    engine = _wave_engine(config, executor)
+
+    wave = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert wave.ordinal == 1
+    assert wave.plan_hash == plan.plan_hash
+    assert wave.selected_variant_ids == ("strong", "other")
+    assert wave.saturation_reason is None
+    assert [item.variant_id for item, _fixtures in executor.submissions] == [
+        "strong",
+        "other",
+    ]
+    artifact_path = (
+        config.experiments_root
+        / "wave-approved"
+        / "plans"
+        / "waves"
+        / "1.json"
+    )
+    persisted = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert persisted["completed"] is True
+    assert persisted["considered_variant_ids"] == [
+        "strong",
+        "weak-popular",
+        "other",
+    ]
+    assert persisted["selected_variant_ids"] == ["strong", "other"]
+    assert persisted["skips"]["weak-popular"] == (
+        "weaker_representative_of_novel_capability"
+    )
+    assert persisted["objective_evidence"]["run_states"] == {
+        "other": "SUCCESS",
+        "strong": "SUCCESS",
+    }
+    assert persisted["objective_evidence"]["output_duplicate_groups"] == [
+        ["other", "strong"]
+    ]
+    assert persisted["objective_evidence"]["actual_output_counts"] == {
+        "other": 1,
+        "strong": 1,
+    }
+    assert "task_budget" not in persisted
+    assert "max_tasks" not in persisted
+    assert len(persisted["run_ids"]) == 2
+
+
+def test_completed_saturation_wave_resumes_without_regenerating_runs(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(tmp_path)
+    executor = FakeExecutor.success(
+        outputs=(
+            ProviderOutput(
+                node_id="9",
+                url="memory://result.png",
+                media_type="image/png",
+            ),
+        )
+    )
+    engine = _wave_engine(config, executor)
+    first = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+    submitted = len(executor.submissions)
+
+    saturated = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+    resumed = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert first.ordinal == 1
+    assert saturated.ordinal == 2
+    assert saturated.selected_variant_ids == ()
+    assert saturated.saturation_reason == (
+        "no_approved_non_dominated_novel_capability_signature_remains"
+    )
+    assert resumed == saturated
+    assert len(executor.submissions) == submitted
+    waves_root = (
+        config.experiments_root / "wave-approved" / "plans" / "waves"
+    )
+    assert sorted(path.name for path in waves_root.glob("*.json")) == [
+        "1.json",
+        "2.json",
+    ]
+
+
+def test_wave_resume_uses_durable_runs_even_without_a_wave_artifact(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(tmp_path)
+    executor = FakeExecutor.success(
+        outputs=(
+            ProviderOutput(
+                node_id="9",
+                url="memory://result.png",
+                media_type="image/png",
+            ),
+        )
+    )
+    engine = _wave_engine(config, executor)
+
+    original = engine.run(
+        "wave-approved",
+        "strong",
+        approved_plan_hash=plan.plan_hash,
+    )
+    wave = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert original.state is RunState.SUCCESS
+    assert wave.selected_variant_ids == ("other",)
+    assert [item.variant_id for item, _fixtures in executor.submissions] == [
+        "strong",
+        "other",
+    ]
+    assert wave.skips["strong"] == "exact_run_already_recorded"
+    assert wave.skips["weak-popular"] == "dominated_by_tested_capability"
+
+
+def test_wave_approval_failure_constructs_no_executor(tmp_path: Path) -> None:
+    config, plan = _persist_wave_plan(tmp_path)
+    constructions: list[str] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: constructions.append("executor"),
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(engine_module.ApprovalError):
+        engine.run_wave(
+            "wave-approved",
+            approved_plan_hash="f" * 64,
+        )
+
+    assert plan.plan_hash != "f" * 64
+    assert constructions == []
+
+
+def test_unapproved_hypothesis_dimension_requires_reapproval_before_executor(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("new-sampler", "d" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+        hypothesis=DimensionName.SAMPLER,
+        coverage=(DimensionName.CHECKPOINT,),
+    )
+    constructions: list[str] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: constructions.append("executor"),
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(engine_module.ApprovalError, match="approved dimensions"):
+        engine.run(
+            "wave-approved",
+            "new-sampler",
+            approved_plan_hash=plan.plan_hash,
+        )
+
+    assert constructions == []
+    assert list(
+        (config.experiments_root / "wave-approved" / "runs").glob("*.json")
+    ) == []
+
+
+def test_repeated_wave_failure_requires_a_new_plan_hashed_hypothesis(
+    tmp_path: Path,
+) -> None:
+    same_capability = "d" * 64
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("first", same_capability, PlanningConfidence.OBSERVED, 3, 3),
+            ("second", same_capability, PlanningConfidence.OBSERVED, 2, 2),
+            ("third", same_capability, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    executor = FakeExecutor(
+        validation=ValidationReport(
+            errors=(
+                ValidationIssue(
+                    code="missing-node",
+                    message="TextEncodeQwen is unavailable",
+                ),
+            )
+        )
+    )
+    engine = _wave_engine(config, executor)
+
+    first = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+    second = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+    saturated = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert first.selected_variant_ids == ("first",)
+    assert second.selected_variant_ids == ("second",)
+    assert saturated.selected_variant_ids == ()
+    assert saturated.skips["third"] == (
+        "repeated_failure_requires_new_corrective_hypothesis"
+    )
+    assert sum(second.objective_evidence["failure_signatures"].values()) == 2
+    assert executor.submissions == []
+
+
+def test_exact_repeat_is_skipped_without_explicit_rerun_request(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("repeat", "e" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    executor = FakeExecutor.success(
+        outputs=(
+            ProviderOutput(
+                node_id="9",
+                url="memory://result.png",
+                media_type="image/png",
+            ),
+        )
+    )
+    engine = _wave_engine(config, executor)
+    original = engine.run(
+        "wave-approved",
+        "repeat",
+        approved_plan_hash=plan.plan_hash,
+    )
+    submitted = len(executor.submissions)
+
+    with pytest.raises(ValueError, match="already recorded"):
+        engine.run(
+            "wave-approved",
+            "repeat",
+            approved_plan_hash=plan.plan_hash,
+        )
+
+    assert original.state is RunState.SUCCESS
+    assert len(executor.submissions) == submitted
+
+
+def test_exact_rerun_requires_reason_and_persists_original_run_links(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("repeat", "e" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    executor = FakeExecutor.success(
+        outputs=(
+            ProviderOutput(
+                node_id="9",
+                url="memory://result.png",
+                media_type="image/png",
+            ),
+        )
+    )
+    engine = _wave_engine(config, executor)
+    original = engine.run(
+        "wave-approved",
+        "repeat",
+        approved_plan_hash=plan.plan_hash,
+    )
+    submitted = len(executor.submissions)
+
+    with pytest.raises(RerunReasonRequired):
+        engine.rerun(
+            "wave-approved",
+            "repeat",
+            approved_plan_hash=plan.plan_hash,
+            reason="  ",
+        )
+
+    rerun = engine.rerun(
+        "wave-approved",
+        "repeat",
+        approved_plan_hash=plan.plan_hash,
+        reason="measure output variance",
+    )
+
+    assert len(executor.submissions) == submitted + 1
+    assert rerun.run_id != original.run_id
+    assert rerun.exact_run_hash == original.exact_run_hash
+    assert rerun.rerun_reason == "measure output variance"
+    assert rerun.original_exact_run_hash == original.exact_run_hash
+    assert rerun.original_run_ids == (original.run_id,)
+    persisted = json.loads(
+        (
+            config.experiments_root
+            / "wave-approved"
+            / "runs"
+            / f"{rerun.run_id}.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert persisted["original_run_ids"] == [original.run_id]

@@ -275,12 +275,14 @@ def _build_parser() -> StructuredArgumentParser:
     run = subparsers.add_parser(
         "run",
         usage=(
-            "%(prog)s EXPERIMENT_ID VARIANT_ID "
-            "--approve-plan-hash HASH"
+            "%(prog)s EXPERIMENT_ID [VARIANT_ID | --rerun VARIANT_ID "
+            "--reason TEXT] --approve-plan-hash HASH"
         ),
     )
     run.add_argument("experiment_id", metavar="EXPERIMENT_ID")
-    run.add_argument("variant_id", metavar="VARIANT_ID")
+    run.add_argument("variant_id", metavar="VARIANT_ID", nargs="?")
+    run.add_argument("--rerun", dest="rerun_variant_id", metavar="VARIANT_ID")
+    run.add_argument("--reason", metavar="TEXT")
     run.add_argument(
         "--approve-plan-hash",
         metavar="HASH",
@@ -309,6 +311,19 @@ def _build_parser() -> StructuredArgumentParser:
     reconcile.add_argument("run_id", metavar="RUN_ID")
     reconcile.add_argument("--task-id", metavar="ID", required=True)
     return parser
+
+
+def _validate_run_arguments(parsed: argparse.Namespace) -> None:
+    has_variant = parsed.variant_id is not None
+    has_rerun = parsed.rerun_variant_id is not None
+    if has_variant == has_rerun:
+        raise UsageError("run requires exactly one of VARIANT_ID or --rerun VARIANT_ID")
+    if not has_rerun and parsed.reason is not None:
+        raise UsageError("--reason is valid only with --rerun")
+    if has_rerun and (
+        not isinstance(parsed.reason, str) or not parsed.reason.strip()
+    ):
+        raise UsageError("--rerun requires a non-empty --reason")
 
 
 def _bounded_integer(minimum: int, maximum: int):
@@ -746,6 +761,8 @@ def main(
 
     try:
         parsed = _build_parser().parse_args(arguments)
+        if parsed.command == "run":
+            _validate_run_arguments(parsed)
     except HelpRequested as error:
         emit_success("help", {"text": str(error)})
         return ExitCode.OK
@@ -766,11 +783,19 @@ def main(
                 executor=executor,
             )
             if parsed.command == "run":
-                record = engine.run(
-                    parsed.experiment_id,
-                    parsed.variant_id,
-                    approved_plan_hash=parsed.approve_plan_hash,
-                )
+                if parsed.rerun_variant_id is not None:
+                    record = engine.rerun(
+                        parsed.experiment_id,
+                        parsed.rerun_variant_id,
+                        approved_plan_hash=parsed.approve_plan_hash,
+                        reason=parsed.reason.strip(),
+                    )
+                else:
+                    record = engine.run(
+                        parsed.experiment_id,
+                        parsed.variant_id,
+                        approved_plan_hash=parsed.approve_plan_hash,
+                    )
             elif parsed.command == "resume":
                 record = engine.resume(parsed.experiment_id, parsed.run_id)
             elif parsed.command == "reconcile":

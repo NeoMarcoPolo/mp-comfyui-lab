@@ -1,0 +1,386 @@
+from __future__ import annotations
+
+import hashlib
+import json
+
+import pytest
+
+from mp_comfyui_lab.experiments.models import (
+    DimensionName,
+    ExperimentPlan,
+    PlannedVariant,
+    PlanningConfidence,
+)
+from mp_comfyui_lab.experiments.saturation import (
+    ExperimentHistory,
+    RerunReasonRequired,
+    next_wave,
+    request_rerun,
+)
+
+
+def _hash(value: object) -> str:
+    document = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(document.encode("utf-8")).hexdigest()
+
+
+def _variant(
+    variant_id: str,
+    *,
+    capability_hash: str,
+    exact_run_hash: str,
+    confidence: PlanningConfidence = PlanningConfidence.OBSERVED,
+    hypothesis: DimensionName = DimensionName.CHECKPOINT,
+    required_nodes: tuple[str, ...] = ("KSampler", "SaveImage"),
+    corrective_hypotheses: dict[str, str] | None = None,
+    warnings: tuple[str, ...] = (),
+) -> PlannedVariant:
+    graph = {
+        str(index): {"class_type": class_type, "inputs": {}}
+        for index, class_type in enumerate(required_nodes, start=1)
+    }
+    execution_parameters: dict[str, object] = {
+        "prompt_lines": ["one"],
+        "expected_output_count": 1,
+        "output_node_ids": [str(len(graph))],
+    }
+    if corrective_hypotheses is not None:
+        execution_parameters["corrective_hypotheses"] = corrective_hypotheses
+    return PlannedVariant(
+        variant_id=variant_id,
+        source_workflow_id="workflow-1",
+        source_hash="a" * 64,
+        materialized_graph=graph,
+        hypothesis=hypothesis,
+        evidence_ids=(f"evidence-{variant_id}",),
+        confidence=confidence,
+        warnings=warnings,
+        exact_run_hash=exact_run_hash,
+        capability_hash=capability_hash,
+        expected_output_count=1,
+        output_node_ids=(str(len(graph)),),
+        expected_media_types=("image/png",),
+        execution_parameters=execution_parameters,
+    )
+
+
+def _plan(
+    *variants: PlannedVariant,
+    candidate_scores: dict[str, tuple[int, int]] | None = None,
+    coverage: tuple[DimensionName, ...] = (DimensionName.CHECKPOINT,),
+) -> ExperimentPlan:
+    scores = candidate_scores or {}
+    candidates = [
+        {
+            "candidate_id": item.variant_id,
+            "confidence": item.confidence.value if item.confidence else "observed",
+            "evidence_ids": list(item.evidence_ids),
+            "engagement": scores.get(item.variant_id, (0, 0))[0],
+            "provenance_rank": scores.get(item.variant_id, (0, 0))[1],
+        }
+        for item in variants
+    ]
+    payload = {
+        "source_hashes": ["a" * 64],
+        "variants": [item.model_dump(mode="json") for item in variants],
+        "capability_coverage": [item.value for item in coverage],
+        "warnings": [],
+        "candidates": candidates,
+    }
+    return ExperimentPlan(
+        plan_hash=_hash(payload),
+        source_hashes=("a" * 64,),
+        variants=variants,
+        capability_coverage=coverage,
+        warnings=(),
+        approval_payload=payload,
+    )
+
+
+def test_next_wave_selects_strongest_representative_per_novel_capability() -> None:
+    repeated = _variant(
+        "already-run",
+        capability_hash="1" * 64,
+        exact_run_hash="a" * 64,
+    )
+    weak = _variant(
+        "weak-high-engagement",
+        capability_hash="2" * 64,
+        exact_run_hash="b" * 64,
+        confidence=PlanningConfidence.WEAKLY_INFERRED,
+    )
+    observed = _variant(
+        "observed-low-engagement",
+        capability_hash="2" * 64,
+        exact_run_hash="c" * 64,
+    )
+    other = _variant(
+        "other-capability",
+        capability_hash="3" * 64,
+        exact_run_hash="d" * 64,
+    )
+    plan = _plan(
+        repeated,
+        weak,
+        observed,
+        other,
+        candidate_scores={
+            "weak-high-engagement": (99_999, 1),
+            "observed-low-engagement": (1, 1),
+        },
+    )
+    history = ExperimentHistory()
+    history.record_success(repeated, run_id="run-original")
+
+    wave = next_wave(plan, history)
+
+    assert [item.variant_id for item in wave.variants] == [
+        "observed-low-engagement",
+        "other-capability",
+    ]
+    assert len({item.capability_hash for item in wave.variants}) == len(
+        wave.variants
+    )
+    assert all(
+        item.exact_run_hash not in history.exact_run_hashes
+        for item in wave.variants
+    )
+    assert wave.reasons["already-run"] == "exact_run_already_recorded"
+    assert wave.reasons["weak-high-engagement"] == (
+        "weaker_representative_of_novel_capability"
+    )
+
+
+def test_candidate_evidence_breaks_ties_by_provenance_then_engagement() -> None:
+    popular = _variant(
+        "popular",
+        capability_hash="4" * 64,
+        exact_run_hash="e" * 64,
+    )
+    stronger_provenance = _variant(
+        "stronger-provenance",
+        capability_hash="4" * 64,
+        exact_run_hash="f" * 64,
+    )
+    plan = _plan(
+        popular,
+        stronger_provenance,
+        candidate_scores={
+            "popular": (10_000, 1),
+            "stronger-provenance": (1, 2),
+        },
+    )
+
+    wave = next_wave(plan, ExperimentHistory())
+
+    assert [item.variant_id for item in wave.variants] == [
+        "stronger-provenance"
+    ]
+
+
+def test_representative_ranking_uses_engagement_cleanliness_and_stable_id() -> None:
+    popular = _variant(
+        "popular-with-warning",
+        capability_hash="d" * 64,
+        exact_run_hash="a" * 64,
+        warnings=("structural warning",),
+    )
+    clean = _variant(
+        "clean-but-less-popular",
+        capability_hash="d" * 64,
+        exact_run_hash="b" * 64,
+    )
+    warned_tie = _variant(
+        "warned-tie",
+        capability_hash="e" * 64,
+        exact_run_hash="c" * 64,
+        warnings=("structural warning",),
+    )
+    clean_tie = _variant(
+        "clean-tie",
+        capability_hash="e" * 64,
+        exact_run_hash="d" * 64,
+    )
+    stable_b = _variant(
+        "stable-b",
+        capability_hash="f" * 64,
+        exact_run_hash="e" * 64,
+    )
+    stable_a = _variant(
+        "stable-a",
+        capability_hash="f" * 64,
+        exact_run_hash="f" * 64,
+    )
+    plan = _plan(
+        popular,
+        clean,
+        warned_tie,
+        clean_tie,
+        stable_b,
+        stable_a,
+        candidate_scores={
+            "popular-with-warning": (100, 1),
+            "clean-but-less-popular": (10, 1),
+            "warned-tie": (5, 1),
+            "clean-tie": (5, 1),
+            "stable-b": (1, 1),
+            "stable-a": (1, 1),
+        },
+    )
+
+    decision = next_wave(plan, ExperimentHistory())
+
+    assert [item.variant_id for item in decision.variants] == [
+        "popular-with-warning",
+        "clean-tie",
+        "stable-a",
+    ]
+
+
+def test_perceptually_equivalent_tested_capability_dominates_weaker_candidate() -> None:
+    tested = _variant(
+        "observed-high-engagement",
+        capability_hash="5" * 64,
+        exact_run_hash="1" * 64,
+    )
+    weaker = _variant(
+        "unexplored-low-evidence",
+        capability_hash="6" * 64,
+        exact_run_hash="2" * 64,
+        confidence=PlanningConfidence.UNEXPLORED,
+    )
+    plan = _plan(tested, weaker)
+    history = ExperimentHistory()
+    history.record_success(tested, run_id="run-tested")
+    history.add_equivalent_group(
+        ["observed-high-engagement", "unexplored-low-evidence"]
+    )
+
+    decision = next_wave(plan, history)
+
+    assert "unexplored-low-evidence" in decision.skipped_variant_ids
+    assert decision.reasons["unexplored-low-evidence"] == (
+        "dominated_by_equivalent_tested_capability"
+    )
+
+
+def test_weaker_tested_candidate_does_not_dominate_stronger_untested_claim() -> None:
+    tested = _variant(
+        "weak-tested",
+        capability_hash="7" * 64,
+        exact_run_hash="3" * 64,
+        confidence=PlanningConfidence.WEAKLY_INFERRED,
+    )
+    stronger = _variant(
+        "observed-untested",
+        capability_hash="7" * 64,
+        exact_run_hash="4" * 64,
+    )
+    plan = _plan(tested, stronger)
+    history = ExperimentHistory()
+    history.record_success(tested, run_id="run-weak")
+
+    decision = next_wave(plan, history)
+
+    assert [item.variant_id for item in decision.variants] == [
+        "observed-untested"
+    ]
+
+
+def test_repeated_missing_node_failure_requires_corrective_hypothesis() -> None:
+    unchanged = _variant(
+        "still-requires-missing-node",
+        capability_hash="8" * 64,
+        exact_run_hash="5" * 64,
+        required_nodes=("TextEncodeQwen", "SaveImage"),
+    )
+    corrected = _variant(
+        "new-encoder-path",
+        capability_hash="9" * 64,
+        exact_run_hash="6" * 64,
+        required_nodes=("CLIPTextEncode", "SaveImage"),
+    )
+    history = ExperimentHistory()
+    history.record_failure(
+        "variant-a",
+        signature="missing-node:TextEncodeQwen",
+        run_id="run-a",
+    )
+    history.record_failure(
+        "variant-b",
+        signature="missing-node:TextEncodeQwen",
+        run_id="run-b",
+    )
+
+    decision = next_wave(_plan(unchanged, corrected), history)
+
+    assert [item.variant_id for item in decision.variants] == [
+        "new-encoder-path"
+    ]
+    assert decision.reasons["still-requires-missing-node"] == (
+        "repeated_failure_requires_new_corrective_hypothesis"
+    )
+
+
+def test_plan_hashed_corrective_hypothesis_can_address_repeated_failure() -> None:
+    signature = "missing-node:TextEncodeQwen"
+    corrected = _variant(
+        "install-and-use-required-node",
+        capability_hash="0" * 64,
+        exact_run_hash="7" * 64,
+        required_nodes=("TextEncodeQwen", "SaveImage"),
+        corrective_hypotheses={
+            signature: "executor capability audit confirms the node is installed"
+        },
+    )
+    history = ExperimentHistory()
+    history.record_failure("variant-a", signature=signature, run_id="run-a")
+    history.record_failure("variant-b", signature=signature, run_id="run-b")
+
+    decision = next_wave(_plan(corrected), history)
+
+    assert [item.variant_id for item in decision.variants] == [
+        "install-and-use-required-node"
+    ]
+
+
+def test_exact_repeat_requires_recorded_rerun_reason_and_links_original_hash() -> None:
+    repeated = _variant(
+        "repeat-me",
+        capability_hash="a" * 64,
+        exact_run_hash="8" * 64,
+    )
+
+    with pytest.raises(RerunReasonRequired):
+        request_rerun(repeated, reason="")
+
+    approved = request_rerun(repeated, reason="measure output variance")
+
+    assert approved.original_exact_run_hash == repeated.exact_run_hash
+    assert approved.reason == "measure output variance"
+
+
+def test_unapproved_dimension_is_not_submitted_from_an_old_plan() -> None:
+    variant = _variant(
+        "new-sampler",
+        capability_hash="b" * 64,
+        exact_run_hash="9" * 64,
+        hypothesis=DimensionName.SAMPLER,
+    )
+
+    decision = next_wave(
+        _plan(variant, coverage=(DimensionName.CHECKPOINT,)),
+        ExperimentHistory(),
+    )
+
+    assert decision.variants == ()
+    assert decision.reasons["new-sampler"] == "hypothesis_dimension_not_approved"
+    assert decision.saturation_reason == (
+        "no_approved_non_dominated_novel_capability_signature_remains"
+    )

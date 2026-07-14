@@ -129,6 +129,25 @@ class FakeExperimentEngine:
         )
         return self.record
 
+    def rerun(
+        self,
+        experiment_id,
+        variant_id,
+        *,
+        approved_plan_hash,
+        reason,
+    ):
+        self.calls.append(
+            (
+                "rerun",
+                experiment_id,
+                variant_id,
+                approved_plan_hash,
+                reason,
+            )
+        )
+        return self.record
+
     def resume(self, experiment_id, run_id):
         self.calls.append(("resume", experiment_id, run_id))
         return self.record
@@ -184,6 +203,72 @@ def test_run_cli_rejects_missing_explicit_approval_hash(capsys):
     assert payload["command"] == "run"
     assert payload["error"]["kind"] == "usage"
     assert "--approve-plan-hash" in payload["error"]["message"]
+
+
+def test_run_cli_rerun_requires_reason_and_wires_original_variant(capsys):
+    record = RunRecord(
+        run_id="run-rerun",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.SUCCESS,
+        provider_task_id="provider-task-2",
+        expected_output_count=1,
+        actual_output_count=1,
+    )
+    engine = FakeExperimentEngine(record)
+
+    code = main(
+        [
+            "run",
+            "plan-approved",
+            "--rerun",
+            "baseline",
+            "--reason",
+            "measure output variance",
+            "--approve-plan-hash",
+            "a" * 64,
+        ],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.OK
+    assert engine.calls == [
+        (
+            "rerun",
+            "plan-approved",
+            "baseline",
+            "a" * 64,
+            "measure output variance",
+        )
+    ]
+    assert payload["data"]["run_id"] == "run-rerun"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["run", "plan-approved", "--rerun", "baseline"],
+        [
+            "run",
+            "plan-approved",
+            "baseline",
+            "--rerun",
+            "baseline",
+            "--reason",
+            "variance",
+        ],
+    ],
+)
+def test_run_cli_rejects_incomplete_or_ambiguous_rerun_usage(
+    arguments,
+    capsys,
+):
+    code = main([*arguments, "--approve-plan-hash", "a" * 64])
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.USAGE
+    assert payload["error"]["kind"] == "usage"
 
 
 def test_resume_cli_wires_existing_run_id(capsys):

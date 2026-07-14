@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 import hashlib
 import os
@@ -43,6 +43,13 @@ from .models import (
     RunState,
 )
 from .planning import recompute_exact_run_hash
+from .saturation import (
+    ExperimentHistory,
+    RerunRequest,
+    WaveArtifact,
+    next_wave,
+    request_rerun,
+)
 from .store import ExperimentStore
 
 
@@ -111,11 +118,44 @@ class ExperimentEngine:
         *,
         approved_plan_hash: str,
     ) -> RunRecord:
+        self._load_approved_plan(
+            experiment_id,
+            variant_id,
+            approved_plan_hash,
+        )
+        with self._store.run_lock(experiment_id, "wave-execution"):
+            return self._run_locked(
+                experiment_id,
+                variant_id,
+                approved_plan_hash=approved_plan_hash,
+            )
+
+    def _run_locked(
+        self,
+        experiment_id: str,
+        variant_id: str,
+        *,
+        approved_plan_hash: str,
+        rerun_request: RerunRequest | None = None,
+    ) -> RunRecord:
         plan, variant = self._load_approved_plan(
             experiment_id,
             variant_id,
             approved_plan_hash,
         )
+        history = self._load_history(experiment_id, plan)
+        original_run_ids = history.original_run_ids(variant.exact_run_hash)
+        if rerun_request is None and original_run_ids:
+            raise ValueError(
+                "exact run fingerprint is already recorded; use --rerun with a reason"
+            )
+        if rerun_request is not None and (
+            rerun_request.variant_id != variant.variant_id
+            or rerun_request.original_exact_run_hash != variant.exact_run_hash
+            or rerun_request.original_run_ids != original_run_ids
+            or not original_run_ids
+        ):
+            raise ApprovalError("rerun request does not match approved history")
         materialized = MaterializedVariant(
             variant_id=variant.variant_id,
             source_workflow_id=variant.source_workflow_id,
@@ -142,6 +182,19 @@ class ExperimentEngine:
             expected_output_count=variant.expected_output_count,
             expected_output_node_ids=variant.output_node_ids,
             expected_media_types=variant.expected_media_types,
+            rerun_reason=(
+                None if rerun_request is None else rerun_request.reason
+            ),
+            original_run_ids=(
+                ()
+                if rerun_request is None
+                else rerun_request.original_run_ids
+            ),
+            original_exact_run_hash=(
+                None
+                if rerun_request is None
+                else rerun_request.original_exact_run_hash
+            ),
             created_at=created_at,
             updated_at=created_at,
         )
@@ -235,6 +288,102 @@ class ExperimentEngine:
             self._persist(record)
             return self._poll_current(record, executor)
 
+    def rerun(
+        self,
+        experiment_id: str,
+        variant_id: str,
+        *,
+        approved_plan_hash: str,
+        reason: str,
+    ) -> RunRecord:
+        plan, variant = self._load_approved_plan(
+            experiment_id,
+            variant_id,
+            approved_plan_hash,
+        )
+        request_rerun(variant, reason=reason)
+        with self._store.run_lock(experiment_id, "wave-execution"):
+            plan, variant = self._load_approved_plan(
+                experiment_id,
+                variant_id,
+                approved_plan_hash,
+            )
+            history = self._load_history(experiment_id, plan)
+            original_run_ids = history.original_run_ids(variant.exact_run_hash)
+            if not original_run_ids:
+                raise ValueError("exact rerun requires at least one original run")
+            rerun_request = request_rerun(
+                variant,
+                reason=reason,
+                original_run_ids=original_run_ids,
+            )
+            return self._run_locked(
+                experiment_id,
+                variant_id,
+                approved_plan_hash=approved_plan_hash,
+                rerun_request=rerun_request,
+            )
+
+    def run_wave(
+        self,
+        experiment_id: str,
+        *,
+        approved_plan_hash: str,
+    ) -> WaveArtifact:
+        self._load_approved_plan_document(experiment_id, approved_plan_hash)
+        with self._store.run_lock(experiment_id, "wave-execution"):
+            plan = self._load_approved_plan_document(
+                experiment_id,
+                approved_plan_hash,
+            )
+            completed_waves = self._load_completed_waves(experiment_id)
+            if (
+                completed_waves
+                and completed_waves[-1].plan_hash == plan.plan_hash
+                and completed_waves[-1].saturation_reason is not None
+            ):
+                return completed_waves[-1]
+
+            history = self._load_history(experiment_id, plan)
+            self._load_equivalent_groups(experiment_id, history)
+            decision = next_wave(plan, history)
+            records = tuple(
+                self._run_locked(
+                    experiment_id,
+                    variant.variant_id,
+                    approved_plan_hash=approved_plan_hash,
+                )
+                for variant in decision.variants
+            )
+            ordinal = completed_waves[-1].ordinal + 1 if completed_waves else 1
+            refreshed_history = self._load_history(experiment_id, plan)
+            self._load_equivalent_groups(experiment_id, refreshed_history)
+            artifact = WaveArtifact(
+                ordinal=ordinal,
+                plan_hash=plan.plan_hash,
+                considered_variant_ids=decision.considered_variant_ids,
+                selected_variant_ids=tuple(
+                    item.variant_id for item in decision.variants
+                ),
+                skips=dict(decision.reasons),
+                candidate_evidence={
+                    variant_id: dict(evidence)
+                    for variant_id, evidence in decision.evidence.items()
+                },
+                run_ids=tuple(record.run_id for record in records),
+                objective_evidence=self._wave_objective_evidence(
+                    records,
+                    refreshed_history,
+                ),
+                saturation_reason=decision.saturation_reason,
+            )
+            self._store.write_json_new(
+                experiment_id,
+                f"plans/waves/{ordinal}.json",
+                artifact.model_dump(mode="json"),
+            )
+            return artifact
+
     def resume(self, experiment_id: str, run_id: str) -> RunRecord:
         record = self._load_run(experiment_id, run_id)
         if record.state in {
@@ -316,23 +465,10 @@ class ExperimentEngine:
         variant_id: str,
         approved_plan_hash: str,
     ) -> tuple[ExperimentPlan, PlannedVariant]:
-        if (
-            not isinstance(approved_plan_hash, str)
-            or _SHA256_PATTERN.fullmatch(approved_plan_hash) is None
-        ):
-            raise ApprovalError("approved plan hash must be an exact SHA-256 value")
-        try:
-            plan = ExperimentPlan.model_validate_json(
-                self._store.read_text(
-                    experiment_id,
-                    f"plans/{approved_plan_hash}.json",
-                ),
-                strict=True,
-            )
-        except (FileNotFoundError, OSError, ValueError, ValidationError) as error:
-            raise ApprovalError("approved plan artifact is missing or invalid") from error
-        if plan.plan_hash != approved_plan_hash:
-            raise ApprovalError("approved plan hash does not match its artifact filename")
+        plan = self._load_approved_plan_document(
+            experiment_id,
+            approved_plan_hash,
+        )
         selected = tuple(
             item for item in plan.variants if item.variant_id == variant_id
         )
@@ -354,6 +490,250 @@ class ExperimentEngine:
         if recompute_exact_run_hash(selected_variant) != selected_variant.exact_run_hash:
             raise ApprovalError("selected variant exact run hash does not match")
         return plan, selected_variant
+
+    def _load_approved_plan_document(
+        self,
+        experiment_id: str,
+        approved_plan_hash: str,
+    ) -> ExperimentPlan:
+        if (
+            not isinstance(approved_plan_hash, str)
+            or _SHA256_PATTERN.fullmatch(approved_plan_hash) is None
+        ):
+            raise ApprovalError("approved plan hash must be an exact SHA-256 value")
+        try:
+            plan = ExperimentPlan.model_validate_json(
+                self._store.read_text(
+                    experiment_id,
+                    f"plans/{approved_plan_hash}.json",
+                ),
+                strict=True,
+            )
+        except (FileNotFoundError, OSError, ValueError, ValidationError) as error:
+            raise ApprovalError("approved plan artifact is missing or invalid") from error
+        if plan.plan_hash != approved_plan_hash:
+            raise ApprovalError("approved plan hash does not match its artifact filename")
+        if any(
+            variant.hypothesis is not None
+            and variant.hypothesis not in plan.capability_coverage
+            for variant in plan.variants
+        ):
+            raise ApprovalError(
+                "plan contains a hypothesis outside approved dimensions; "
+                "create and approve the revised plan hash"
+            )
+        return plan
+
+    def _load_completed_waves(
+        self,
+        experiment_id: str,
+    ) -> tuple[WaveArtifact, ...]:
+        waves_root = self._store.root(experiment_id) / "plans" / "waves"
+        if not waves_root.exists():
+            return ()
+        try:
+            paths = tuple(waves_root.glob("*.json"))
+        except OSError as error:
+            raise SafetyError("wave artifacts cannot be listed") from error
+
+        by_ordinal: dict[int, WaveArtifact] = {}
+        for path in paths:
+            if not path.stem.isdigit():
+                raise SafetyError("wave artifact filename is not an ordinal")
+            ordinal = int(path.stem)
+            if ordinal < 1 or path.name != f"{ordinal}.json":
+                raise SafetyError("wave artifact filename is not canonical")
+            try:
+                artifact = WaveArtifact.model_validate_json(
+                    self._store.read_text(
+                        experiment_id,
+                        f"plans/waves/{path.name}",
+                    ),
+                    strict=True,
+                )
+            except (FileNotFoundError, OSError, ValueError, ValidationError) as error:
+                raise SafetyError("wave artifact is missing or invalid") from error
+            if artifact.ordinal != ordinal or ordinal in by_ordinal:
+                raise SafetyError("wave artifact ordinal does not match its path")
+            by_ordinal[ordinal] = artifact
+
+        ordered = tuple(by_ordinal[index] for index in sorted(by_ordinal))
+        if tuple(item.ordinal for item in ordered) != tuple(
+            range(1, len(ordered) + 1)
+        ):
+            raise SafetyError("wave artifact ordinals must be contiguous")
+        return ordered
+
+    def _load_history(
+        self,
+        experiment_id: str,
+        plan: ExperimentPlan,
+    ) -> ExperimentHistory:
+        history = ExperimentHistory()
+        variants = {
+            (variant.variant_id, variant.exact_run_hash): variant
+            for variant in plan.variants
+        }
+        output_groups: dict[tuple[tuple[object, ...], ...], set[str]] = {}
+
+        for record in self._load_run_records(experiment_id):
+            if record.exact_run_hash is not None:
+                history.record_exact_run(
+                    record.exact_run_hash,
+                    run_id=record.run_id,
+                )
+            variant = variants.get((record.variant_id, record.exact_run_hash))
+            if variant is None:
+                continue
+            if record.state is RunState.SUCCESS:
+                history.record_success(variant, run_id=record.run_id)
+                output_signature = tuple(
+                    (
+                        output.ordinal,
+                        output.provider_order,
+                        output.node_id,
+                        output.media_type,
+                        output.content_sha256,
+                        output.size,
+                    )
+                    for output in sorted(record.outputs, key=lambda item: item.ordinal)
+                )
+                if output_signature:
+                    output_groups.setdefault(output_signature, set()).add(
+                        variant.variant_id
+                    )
+            elif record.state is RunState.FAILED:
+                for signature in self._failure_signatures(record):
+                    history.record_failure(
+                        variant,
+                        signature=signature,
+                        run_id=record.run_id,
+                    )
+
+        for variant_ids in output_groups.values():
+            if len(variant_ids) >= 2:
+                history.add_equivalent_group(variant_ids)
+        return history
+
+    def _load_run_records(
+        self,
+        experiment_id: str,
+    ) -> tuple[RunRecord, ...]:
+        runs_root = self._store.root(experiment_id) / "runs"
+        try:
+            paths = sorted(runs_root.glob("*.json"), key=lambda item: item.name)
+        except OSError as error:
+            raise SafetyError("run artifacts cannot be listed") from error
+        return tuple(self._load_run(experiment_id, path.stem) for path in paths)
+
+    def _load_equivalent_groups(
+        self,
+        experiment_id: str,
+        history: ExperimentHistory,
+    ) -> None:
+        for wave in self._load_completed_waves(experiment_id):
+            evidence = thaw_json(wave.objective_evidence)
+            groups = evidence.get("output_duplicate_groups", [])
+            if not isinstance(groups, list):
+                raise SafetyError("wave output duplicate groups are invalid")
+            for group in groups:
+                if (
+                    not isinstance(group, list)
+                    or len(group) < 2
+                    or any(not isinstance(item, str) or not item.strip() for item in group)
+                ):
+                    raise SafetyError("wave output duplicate group is invalid")
+                history.add_equivalent_group(group)
+
+    @staticmethod
+    def _failure_signatures(record: RunRecord) -> tuple[str, ...]:
+        if record.state is not RunState.FAILED or record.error is None:
+            return ()
+        error = thaw_json(record.error)
+        if not isinstance(error, Mapping):
+            return ()
+        kind = error.get("kind")
+        normalized_kind = (
+            re.sub(r"[^a-z0-9]+", "-", kind.casefold()).strip("-")
+            if isinstance(kind, str)
+            else "failed"
+        )
+        signatures: set[str] = set()
+        issues = error.get("errors")
+        if normalized_kind == "validation-failed" and isinstance(issues, list):
+            for issue in issues:
+                if not isinstance(issue, Mapping):
+                    continue
+                raw_code = issue.get("code")
+                code = (
+                    re.sub(
+                        r"[^a-z0-9]+",
+                        "-",
+                        raw_code.casefold(),
+                    ).strip("-")
+                    if isinstance(raw_code, str)
+                    else "validation"
+                )
+                raw_message = issue.get("message")
+                message = (
+                    " ".join(raw_message.split())[:512]
+                    if isinstance(raw_message, str)
+                    else ""
+                )
+                if code.startswith("missing-node") and message:
+                    requirement = re.search(
+                        r"\b[A-Za-z][A-Za-z0-9_.-]{1,127}\b",
+                        message,
+                    )
+                    signatures.add(
+                        f"missing-node:{requirement.group(0) if requirement else message}"
+                    )
+                else:
+                    signatures.add(f"{code}:{message}" if message else code)
+        if not signatures:
+            diagnostic = error.get("diagnostic")
+            message = (
+                " ".join(diagnostic.split())[:512]
+                if isinstance(diagnostic, str)
+                else ""
+            )
+            signatures.add(
+                f"{normalized_kind}:{message}" if message else normalized_kind
+            )
+        return tuple(sorted(signatures))
+
+    @staticmethod
+    def _wave_objective_evidence(
+        records: tuple[RunRecord, ...],
+        history: ExperimentHistory,
+    ) -> dict[str, object]:
+        ordered_records = sorted(records, key=lambda item: item.variant_id)
+        duplicate_groups = sorted(
+            (sorted(group) for group in history.equivalent_groups),
+            key=lambda group: tuple(group),
+        )
+        return {
+            "run_states": {
+                record.variant_id: record.state.value for record in ordered_records
+            },
+            "expected_output_counts": {
+                record.variant_id: record.expected_output_count
+                for record in ordered_records
+            },
+            "actual_output_counts": {
+                record.variant_id: record.actual_output_count
+                for record in ordered_records
+            },
+            "output_complete": {
+                record.variant_id: (
+                    record.state is RunState.SUCCESS
+                    and record.actual_output_count == record.expected_output_count
+                )
+                for record in ordered_records
+            },
+            "output_duplicate_groups": duplicate_groups,
+            "failure_signatures": dict(sorted(history.failure_signatures.items())),
+        }
 
     def _snapshot_fixtures(
         self,

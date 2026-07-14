@@ -106,6 +106,9 @@ _IMMUTABLE_TRANSITION_FIELDS = (
     "expected_media_types",
     "created_at",
     "submission_intent_at",
+    "rerun_reason",
+    "original_run_ids",
+    "original_exact_run_hash",
 )
 
 
@@ -246,6 +249,9 @@ class RunRecord(_FrozenModel):
     outputs: tuple[OutputRecord, ...] = ()
     error: SanitizedJsonObject | None = None
     diagnostics: tuple[SanitizedJsonObject, ...] = ()
+    rerun_reason: NonBlankStr | None = None
+    original_run_ids: tuple[NonBlankStr, ...] = ()
+    original_exact_run_hash: Sha256 | None = None
     created_at: UtcDatetime | None = None
     submission_intent_at: UtcDatetime | None = None
     submitted_at: UtcDatetime | None = None
@@ -257,6 +263,7 @@ class RunRecord(_FrozenModel):
         "expected_output_node_ids",
         "expected_media_types",
         "outputs",
+        "original_run_ids",
         mode="before",
     )
     @classmethod
@@ -299,6 +306,28 @@ class RunRecord(_FrozenModel):
             raise ValueError(
                 "actual_output_count must equal expected_output_count for SUCCESS"
             )
+
+        rerun_fields_present = (
+            self.rerun_reason is not None,
+            bool(self.original_run_ids),
+            self.original_exact_run_hash is not None,
+        )
+        if any(rerun_fields_present) and not all(rerun_fields_present):
+            raise ValueError(
+                "rerun reason, original run IDs, and original exact hash "
+                "must be recorded together"
+            )
+        if self.rerun_reason is not None:
+            if len(set(self.original_run_ids)) != len(self.original_run_ids):
+                raise ValueError("original run IDs must be unique")
+            if self.run_id in self.original_run_ids:
+                raise ValueError("a rerun cannot link itself as an original run")
+            if self.exact_run_hash is None:
+                raise ValueError("a rerun requires an exact run hash")
+            if self.original_exact_run_hash != self.exact_run_hash:
+                raise ValueError(
+                    "rerun original exact hash must equal the repeated fingerprint"
+                )
 
         timestamps = [
             timestamp
