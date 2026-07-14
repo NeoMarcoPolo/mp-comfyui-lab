@@ -18,6 +18,7 @@ from mp_comfyui_lab.mutations.models import (
     DonorNode,
     LoraLoaderTemplate,
     LoraSpec,
+    MutationDiff,
     Mutation,
     ReplaceLoraStack,
     ReplaceSubgraph,
@@ -1083,3 +1084,168 @@ def test_preflight_reserved_ids_survive_a_prior_lora_shrink() -> None:
     assert first.graph["3"]["inputs"]["value"] == ("101", 0)
     assert first.diff.mutations[1].added_node_ids == ("101",)
     assert first.diff == second.diff
+
+
+def test_clip_lora_chain_requires_every_requested_clip_strength() -> None:
+    graph = _two_lora_model_clip_graph()
+    source = copy.deepcopy(graph)
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceLoraStack(
+                loras=[LoraSpec(name="consistency.safetensors", strength_model=0.65)],
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="strength_clip"):
+        apply_patch(graph, patch)
+    assert graph == source
+
+
+def test_clip_lora_chain_preserves_base_clip_output_zero_and_safe_custom_encoder() -> None:
+    graph = {
+        "model-base": _node("UNETLoader", unet_name="base.safetensors"),
+        "clip-base": _node("CLIPLoader", clip_name="clip.safetensors"),
+        "first": _node(
+            "LoraLoader",
+            model=["model-base", 0],
+            clip=["clip-base", 0],
+            lora_name="first.safetensors",
+            strength_model=0.5,
+            strength_clip=0.5,
+        ),
+        "second": _node(
+            "LoraLoader",
+            model=["first", 0],
+            clip=["first", 1],
+            lora_name="second.safetensors",
+            strength_model=0.8,
+            strength_clip=0.8,
+        ),
+        "sampler": _node("KSampler", model=["second", 0], seed=1),
+        "encoder": _node("TextEncodeQwenImageEditPlus", clip=["second", 1], text="portrait"),
+    }
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceLoraStack(
+                loras=[
+                    LoraSpec(name="second.safetensors", strength_model=0.8, strength_clip=0.8),
+                    LoraSpec(name="first.safetensors", strength_model=0.5, strength_clip=0.5),
+                ],
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    result = apply_patch(graph, patch)
+
+    assert result["second"]["inputs"]["clip"] == ["clip-base", 0]
+    assert result["first"]["inputs"]["clip"] == ["second", 1]
+    assert result["encoder"]["inputs"]["clip"] == ["first", 1]
+    assert result["second"]["inputs"]["strength_clip"] == 0.8
+    assert result["first"]["inputs"]["strength_clip"] == 0.5
+
+
+@pytest.mark.parametrize("source_id", ["9" * 4_301, "9" * 2_048])
+def test_structural_id_overflow_is_a_public_preflight_error(source_id: str) -> None:
+    graph = {
+        source_id: _node("Unused"),
+        "old": _node("Old"),
+        "consumer": _node("Consumer", value=["old", 0]),
+    }
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceSubgraph(
+                target_node_ids=["old"],
+                donor_nodes=[DonorNode(node_id="donor", class_type="New", inputs={})],
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="donor",
+                        donor_output_index=0,
+                        consumer_node_id="consumer",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="donor",
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    for materialize in (apply_patch, materialize_variant):
+        with pytest.raises(PatchValidationError, match="node ID"):
+            materialize(graph, patch)
+
+
+def test_decimal_id_allocation_is_deterministic_with_leading_zeros() -> None:
+    graph = {
+        "0009": _node("Unused"),
+        "old": _node("Old"),
+        "consumer": _node("Consumer", value=["old", 0]),
+    }
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceSubgraph(
+                target_node_ids=["old"],
+                donor_nodes=[DonorNode(node_id="donor", class_type="New", inputs={})],
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="donor",
+                        donor_output_index=0,
+                        consumer_node_id="consumer",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="donor",
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    assert apply_patch(graph, patch)["consumer"]["inputs"]["value"] == ["10", 0]
+
+
+def test_evidence_ids_canonicalize_after_item_validation_and_reject_bad_shapes() -> None:
+    lora = ReplaceLoraStack(
+        loras=[],
+        evidence_ids=["e", " e "],
+        loader_template=None,
+    )
+    template = LoraLoaderTemplate(
+        donor_node_id="template",
+        class_type="LoraLoaderModelOnly",
+        inputs={"model": ["base", 0], "lora_name": "name", "strength_model": 1.0},
+        donor_workflow_id="donor",
+        evidence_ids=["e", " e "],
+    )
+    subgraph = ReplaceSubgraph(
+        target_node_ids=["old"],
+        donor_nodes=[DonorNode(node_id="donor", class_type="New", inputs={})],
+        boundary_outputs=[
+            BoundaryOutputMapping(
+                donor_node_id="donor",
+                donor_output_index=0,
+                consumer_node_id="consumer",
+                consumer_field_name="value",
+            )
+        ],
+        donor_workflow_id="donor",
+        evidence_ids=["e", " e "],
+    )
+
+    assert lora.evidence_ids == template.evidence_ids == subgraph.evidence_ids == ("e",)
+    assert MutationDiff(mutation_index=0, op="set_node_input", evidence_ids=["e", " e "]).evidence_ids == ("e",)
+    with pytest.raises(ValidationError):
+        ReplaceLoraStack(loras=[], evidence_ids=[["bad"]])
+
+
+@pytest.mark.parametrize("materialize", [apply_patch, materialize_variant])
+def test_malformed_source_graph_uses_public_patch_errors(materialize: object) -> None:
+    graph = {"bad": {"class_type": "Broken"}}
+    patch = SemanticPatch(
+        mutations=[SetNodeInput(node_id="bad", field_name="value", value=1)]
+    )
+
+    with pytest.raises(PatchValidationError):
+        materialize(graph, patch)  # type: ignore[operator]

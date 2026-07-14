@@ -13,7 +13,6 @@ from mp_comfyui_lab.graph.normalize import (
     GraphTopologyError,
     GraphValidationError,
     _canonical_field_name,
-    _compact_class,
     _input_link,
     _lora_chains,
     _model_links,
@@ -101,8 +100,30 @@ def _next_numeric_ids_for_node_ids(
     node_ids: Mapping[str, Any] | set[str] | frozenset[str],
     count: int,
 ) -> list[str]:
-    maximum = max((int(node_id) for node_id in node_ids if node_id.isdecimal()), default=0)
-    return [str(maximum + offset) for offset in range(1, count + 1)]
+    decimal_ids = [
+        node_id.lstrip("0") or "0"
+        for node_id in node_ids
+        if node_id.isascii() and node_id.isdecimal()
+    ]
+    maximum = max(decimal_ids, key=lambda value: (len(value), value), default="0")
+    allocated: list[str] = []
+    current = maximum
+    for _ in range(count):
+        digits = list(current)
+        carry = 1
+        for index in range(len(digits) - 1, -1, -1):
+            value = ord(digits[index]) - ord("0") + carry
+            digits[index] = chr(ord("0") + value % 10)
+            carry = value // 10
+        if carry:
+            digits.insert(0, "1")
+        current = "".join(digits)
+        if len(current) > 2_048:
+            raise PatchValidationError(
+                "generated node ID exceeds the maximum mutation node ID length"
+            )
+        allocated.append(current)
+    return allocated
 
 
 def _semantic_link(
@@ -253,7 +274,7 @@ def _assert_linear_lora_chain(graph: dict[str, Any]) -> _LoraChainPlan:
         if any(link is None for link in clip_links):
             raise PatchTopologyError("LoRA model and clip paths must use matching loaders")
         resolved_clips = tuple(link for link in clip_links if link is not None)
-        if any(link[1][1] != 1 for link in resolved_clips):
+        if any(link[1][1] != 1 for link in resolved_clips[1:]):
             raise PatchTopologyError("LoRA clip path has an unknown output index")
         for index, (_, link) in enumerate(resolved_clips[1:], start=1):
             if link != (chain_ids[index - 1], 1):
@@ -282,7 +303,6 @@ def _assert_linear_lora_chain(graph: dict[str, Any]) -> _LoraChainPlan:
                 clip_fields is not None
                 and link == (chain_ids[-1], 1)
                 and _canonical_field_name(field_name) == "clip"
-                and any(token in _compact_class(consumer.class_type) for token in ("clip", "textencoder"))
             ):
                 clip_terminals.append((consumer.node_id, field_name))
                 continue
@@ -299,6 +319,18 @@ def _assert_linear_lora_chain(graph: dict[str, Any]) -> _LoraChainPlan:
         clip_base=clip_base,
         clip_terminals=tuple(sorted(clip_terminals, key=lambda item: (_node_sort_key(item[0]), item[1]))),
     )
+
+
+def _validate_lora_request(
+    plan: _LoraChainPlan,
+    mutation: ReplaceLoraStack,
+) -> None:
+    if plan.clip_fields is not None and any(
+        lora.strength_clip is None for lora in mutation.loras
+    ):
+        raise PatchValidationError(
+            "standard model+CLIP LoRA chains require strength_clip for every LoRA"
+        )
 
 
 def _template_lora_node(mutation: ReplaceLoraStack) -> dict[str, Any]:
@@ -324,6 +356,7 @@ def _replace_lora_stack(
     reserved_added_ids: tuple[str, ...],
 ) -> None:
     plan = _assert_linear_lora_chain(graph)
+    _validate_lora_request(plan, mutation)
     normalized = _normalize(graph)
     bindings = list(normalized.bindings(SemanticRole.LORA))
     bindings_by_id = {binding.node_id: binding for binding in bindings}
@@ -378,7 +411,11 @@ def _replace_lora_stack(
             raise PatchTopologyError("LoRA loader template lacks a model input")
         inputs[name_field] = lora.name
         inputs["strength_model"] = lora.strength_model
-        if lora.strength_clip is not None:
+        if plan.clip_fields is not None:
+            if "strength_clip" not in inputs:
+                raise PatchTopologyError("LoRA loader lacks strength_clip input")
+            inputs["strength_clip"] = lora.strength_clip
+        elif lora.strength_clip is not None:
             if "strength_clip" not in inputs:
                 raise PatchTopologyError("LoRA loader lacks strength_clip input")
             inputs["strength_clip"] = lora.strength_clip
@@ -562,6 +599,7 @@ def _operation_scope(
         return _OperationScope(writes=frozenset({(mutation.node_id, mutation.field_name)}))
     if isinstance(mutation, ReplaceLoraStack):
         plan = _assert_linear_lora_chain(dict(graph))
+        _validate_lora_request(plan, mutation)
         added = max(0, len(mutation.loras) - len(plan.node_ids))
         if added and mutation.loader_template is None:
             raise PatchTopologyError("growing a LoRA stack requires a provenance-bearing loader template")
@@ -719,7 +757,7 @@ def _materialize(
     if not isinstance(patch, SemanticPatch):
         raise TypeError("patch must be a SemanticPatch")
     # Validate first, then clone all metadata and JSON values into mutable plain JSON.
-    semantic_graph_projection(graph)
+    _normalize(graph)
     working = _plain_json_copy(graph)
     _normalize(working)
     scopes = _preflight_patch(working, patch)
@@ -760,7 +798,7 @@ def apply_patch(graph: Any, patch: SemanticPatch) -> dict[str, Any]:
 
 def materialize_variant(graph: Any, patch: SemanticPatch) -> MaterializationResult:
     """Materialize a patch with deterministic graph diff and validation report."""
-    semantic_graph_projection(graph)
+    _normalize(graph)
     before = _plain_json_copy(graph)
     materialized, validation, operation_added_nodes = _materialize(graph, patch)
     return MaterializationResult(

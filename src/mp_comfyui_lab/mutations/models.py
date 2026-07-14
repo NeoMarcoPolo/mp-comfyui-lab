@@ -66,11 +66,8 @@ def _as_tuple(value: Any) -> Any:
     return value
 
 
-def _sorted_unique_text(values: Any) -> Any:
-    values = _as_tuple(values)
-    if isinstance(values, tuple):
-        return tuple(sorted(set(values)))
-    return values
+def _canonical_evidence_ids(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted(set(values)))
 
 
 def _validate_json_value(value: Any, path: str) -> Any:
@@ -137,7 +134,12 @@ class LoraLoaderTemplate(_FrozenModel):
     @field_validator("evidence_ids", mode="before")
     @classmethod
     def normalize_evidence_ids(cls, value: Any) -> Any:
-        return _sorted_unique_text(value)
+        return _as_tuple(value)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def canonicalize_evidence_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return _canonical_evidence_ids(values)
 
     @field_validator("inputs", "metadata", mode="before")
     @classmethod
@@ -198,7 +200,12 @@ class ReplaceLoraStack(_FrozenModel):
     @field_validator("evidence_ids", mode="before")
     @classmethod
     def normalize_evidence_ids(cls, value: Any) -> Any:
-        return _sorted_unique_text(value)
+        return _as_tuple(value)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def canonicalize_evidence_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return _canonical_evidence_ids(values)
 
     @model_validator(mode="after")
     def require_unique_lora_names(self) -> ReplaceLoraStack:
@@ -298,7 +305,12 @@ class ReplaceSubgraph(_FrozenModel):
     @field_validator("evidence_ids", mode="before")
     @classmethod
     def normalize_evidence_ids(cls, value: Any) -> Any:
-        return _sorted_unique_text(value)
+        return _as_tuple(value)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def canonicalize_evidence_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return _canonical_evidence_ids(values)
 
 
 class SetNodeInput(_FrozenModel):
@@ -396,6 +408,16 @@ class MutationDiff(_FrozenModel):
         max_length=128,
     )
     added_node_ids: tuple[BoundedNodeId, ...] = Field(default=(), max_length=MAX_DONOR_NODES)
+
+    @field_validator("evidence_ids", "loader_template_evidence_ids", mode="before")
+    @classmethod
+    def normalize_evidence_ids(cls, value: Any) -> Any:
+        return _as_tuple(value)
+
+    @field_validator("evidence_ids", "loader_template_evidence_ids")
+    @classmethod
+    def canonicalize_evidence_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return _canonical_evidence_ids(values)
 
 
 class CanonicalDiff(_FrozenModel):
