@@ -157,6 +157,71 @@ def test_graph_dimension_changes_preserve_known_checkpoint_and_lora_deltas() -> 
     )
 
 
+@pytest.mark.parametrize(
+    ("before_specs", "after_specs", "expected"),
+    [
+        ((), (("new.safetensors", 1.0, 1.0),), ("lora_stack",)),
+        ((("old.safetensors", 1.0, 1.0),), (), ("lora_stack",)),
+        (
+            (("first.safetensors", 1.0, 1.0), ("second.safetensors", 1.0, 1.0)),
+            (("second.safetensors", 1.0, 1.0), ("first.safetensors", 1.0, 1.0)),
+            ("lora_stack",),
+        ),
+        (
+            (("same.safetensors", 0.5, 0.5),),
+            (("same.safetensors", 1.0, 1.0),),
+            ("lora_strength",),
+        ),
+    ],
+)
+def test_graph_dimension_changes_accept_canonical_lora_deltas(
+    before_specs: tuple[tuple[str, float, float | None], ...],
+    after_specs: tuple[tuple[str, float, float | None], ...],
+    expected: tuple[str, ...],
+) -> None:
+    assert classify_graph_dimension_changes(
+        _lora_stack_graph(before_specs),
+        _lora_stack_graph(after_specs),
+    ) == expected
+
+
+@pytest.mark.parametrize("residue_kind", ["input", "link", "class_type"])
+def test_graph_dimension_changes_preserve_unknown_lora_node_residue(
+    residue_kind: str,
+) -> None:
+    before = _lora_stack_graph((("old.safetensors", 1.0, 1.0),))
+    after = _lora_stack_graph((("new.safetensors", 1.0, 1.0),))
+    if residue_kind == "input":
+        after["20"]["inputs"]["unapproved_mode"] = "experimental"
+    elif residue_kind == "link":
+        after["20"]["inputs"]["unapproved_source"] = ["4", 0]
+    else:
+        after["20"]["class_type"] = "LoraLoaderAdvanced"
+
+    expected = ("lora_stack", "unclassified")
+    assert classify_graph_dimension_changes(before, after) == expected
+    assert classify_graph_dimension_changes(after, before) == expected
+
+
+@pytest.mark.parametrize("direction", ["added", "removed"])
+def test_graph_dimension_changes_preserve_unknown_inputs_on_added_or_removed_lora(
+    direction: str,
+) -> None:
+    without_lora = _lora_stack_graph(())
+    with_lora = _lora_stack_graph((("new.safetensors", 1.0, 1.0),))
+    with_lora["20"]["inputs"]["unapproved_mode"] = "experimental"
+    before, after = (
+        (without_lora, with_lora)
+        if direction == "added"
+        else (with_lora, without_lora)
+    )
+
+    assert classify_graph_dimension_changes(before, after) == (
+        "lora_stack",
+        "unclassified",
+    )
+
+
 def test_graph_dimension_changes_mark_disconnected_custom_node_unclassified() -> None:
     before = _graph()
     after = json.loads(json.dumps(before))

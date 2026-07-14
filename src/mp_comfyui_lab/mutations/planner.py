@@ -93,6 +93,11 @@ _MASKED_CLASS_BY_ROLE = {
     SemanticRole.SEED: "KSampler",
 }
 _UNCLASSIFIED_DIMENSION = "unclassified"
+_LORA_DIMENSIONS = frozenset(
+    {DimensionName.LORA_STACK, DimensionName.LORA_STRENGTH}
+)
+_LORA_RESIDUAL_CLASS = "MPUnclassifiedLoraResidue"
+_LORA_STRENGTH_FIELDS = frozenset({"strengthclip", "strengthmodel"})
 _TOPOLOGY_ROLES = {
     DimensionName.CHECKPOINT: (
         SemanticRole.CHECKPOINT,
@@ -693,7 +698,14 @@ def classify_graph_dimension_changes(
     dimensions.update(DimensionName(item) for item in lora_dimensions)
     before_residual = _mask_recognized_graph_dimensions(before, dimensions)
     after_residual = _mask_recognized_graph_dimensions(after, dimensions)
-    unexplained = before_residual is None or after_residual is None
+    unexplained = (
+        before_residual is None
+        or after_residual is None
+        or (
+            bool(dimensions & _LORA_DIMENSIONS)
+            and _shared_lora_class_type_changed(before, after)
+        )
+    )
     if not unexplained:
         try:
             unexplained = capability_hash(before_residual) != capability_hash(
@@ -743,8 +755,8 @@ def _mask_recognized_graph_dimensions(
         }
         for node in normalized.nodes
     }
-    if dimensions & {DimensionName.LORA_STACK, DimensionName.LORA_STRENGTH}:
-        if not _strip_lora_topology(graph, normalized):
+    if dimensions & _LORA_DIMENSIONS:
+        if not _mask_lora_topology(graph, normalized):
             return None
 
     for dimension in DimensionName:
@@ -768,15 +780,35 @@ def _mask_recognized_graph_dimensions(
     return graph
 
 
-def _strip_lora_topology(
+def _shared_lora_class_type_changed(
+    before: NormalizedGraph,
+    after: NormalizedGraph,
+) -> bool:
+    before_nodes = {node.node_id: node for node in before.nodes}
+    after_nodes = {node.node_id: node for node in after.nodes}
+    before_lora_ids = {
+        binding.node_id for binding in before.bindings(SemanticRole.LORA)
+    }
+    after_lora_ids = {
+        binding.node_id for binding in after.bindings(SemanticRole.LORA)
+    }
+    return any(
+        before_nodes[node_id].class_type != after_nodes[node_id].class_type
+        for node_id in before_lora_ids & after_lora_ids
+    )
+
+
+def _mask_lora_topology(
     graph: dict[str, object],
     normalized: NormalizedGraph,
 ) -> bool:
-    lora_node_ids = {
-        binding.node_id for binding in normalized.bindings(SemanticRole.LORA)
-    }
+    lora_bindings = normalized.bindings(SemanticRole.LORA)
+    lora_node_ids = {binding.node_id for binding in lora_bindings}
     if not lora_node_ids:
         return True
+    binding_fields: dict[str, set[str]] = {}
+    for binding in lora_bindings:
+        binding_fields.setdefault(binding.node_id, set()).add(binding.field_name)
 
     def resolve_link(
         source_node_id: str,
@@ -793,18 +825,26 @@ def _strip_lora_topology(
         raw_inputs = raw_node.get("inputs")
         if not isinstance(raw_inputs, dict):
             return None
-        upstream_field = "model" if output_index == 0 else "clip" if output_index == 1 else None
-        upstream = raw_inputs.get(upstream_field) if upstream_field is not None else None
-        if not _is_graph_link(upstream):
+        upstream = [
+            value
+            for field_name, value in raw_inputs.items()
+            if _is_graph_link(value)
+            and (
+                (output_index == 0 and _is_model_flow_field(field_name))
+                or (output_index == 1 and _is_clip_flow_field(field_name))
+            )
+        ]
+        if len(upstream) != 1:
             return None
         return resolve_link(
-            upstream[0],
-            upstream[1],
+            upstream[0][0],
+            upstream[0][1],
             seen | {source_node_id},
         )
 
+    residual_sources: set[str] = set()
     for node_id, raw_node in graph.items():
-        if node_id in lora_node_ids or not isinstance(raw_node, dict):
+        if not isinstance(raw_node, dict):
             continue
         raw_inputs = raw_node.get("inputs")
         if not isinstance(raw_inputs, dict):
@@ -812,13 +852,81 @@ def _strip_lora_topology(
         for field_name, value in tuple(raw_inputs.items()):
             if not _is_graph_link(value) or value[0] not in lora_node_ids:
                 continue
+            if not _is_standard_lora_consumer(field_name, value[1]):
+                residual_sources.add(value[0])
+                continue
             resolved = resolve_link(value[0], value[1])
             if resolved is None:
                 return False
             raw_inputs[field_name] = resolved
     for node_id in lora_node_ids:
-        graph.pop(node_id, None)
+        raw_node = graph.get(node_id)
+        if not isinstance(raw_node, dict):
+            return False
+        raw_inputs = raw_node.get("inputs")
+        if not isinstance(raw_inputs, dict):
+            return False
+        residual_inputs: dict[str, object] = {}
+        for field_name, value in raw_inputs.items():
+            if field_name in binding_fields.get(node_id, set()):
+                nested_residual = _lora_binding_residual(value)
+                if nested_residual:
+                    residual_inputs[field_name] = nested_residual
+                continue
+            canonical = _canonical_graph_field(field_name)
+            if canonical in _LORA_STRENGTH_FIELDS:
+                continue
+            if _is_graph_link(value) and (
+                _is_model_flow_field(field_name)
+                or _is_clip_flow_field(field_name)
+            ):
+                continue
+            residual_inputs[field_name] = value
+        if residual_inputs or node_id in residual_sources:
+            raw_node["class_type"] = _LORA_RESIDUAL_CLASS
+            raw_node["inputs"] = residual_inputs
+        else:
+            graph.pop(node_id, None)
     return True
+
+
+def _lora_binding_residual(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    canonical_fields = {"lora", "name", "on"} | _LORA_STRENGTH_FIELDS | {
+        "strength"
+    }
+    residual = {
+        key: item
+        for key, item in value.items()
+        if _canonical_graph_field(key) not in canonical_fields
+    }
+    return residual or None
+
+
+def _canonical_graph_field(field_name: str) -> str:
+    return "".join(
+        character
+        for character in field_name.casefold()
+        if character.isalnum()
+    )
+
+
+def _is_model_flow_field(field_name: str) -> bool:
+    canonical = _canonical_graph_field(field_name)
+    return canonical in {"model", "unet"} or canonical.endswith(
+        ("model", "unet")
+    )
+
+
+def _is_clip_flow_field(field_name: str) -> bool:
+    return _canonical_graph_field(field_name) == "clip"
+
+
+def _is_standard_lora_consumer(field_name: str, output_index: int) -> bool:
+    return (output_index == 0 and _is_model_flow_field(field_name)) or (
+        output_index == 1 and _is_clip_flow_field(field_name)
+    )
 
 
 def _is_graph_link(value: object) -> bool:

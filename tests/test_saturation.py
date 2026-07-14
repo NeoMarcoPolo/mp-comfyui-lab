@@ -578,6 +578,49 @@ def test_checkpoint_and_lora_correction_uses_actual_changed_dimensions() -> None
     assert decision.variants == (candidate,)
 
 
+def test_lora_correction_with_unknown_same_node_input_is_rejected() -> None:
+    signature = "provider-failed:unapproved lora mode"
+    failed_graph = _checkpoint_sampler_lora_graph(lora="old.safetensors")
+    failed = _variant(
+        "failed",
+        capability_hash=graph_capability_hash(failed_graph),
+        exact_run_hash="5" * 64,
+        graph=failed_graph,
+        hypothesis=DimensionName.LORA_STACK,
+    )
+    candidate_graph = _checkpoint_sampler_lora_graph(lora="new.safetensors")
+    candidate_graph["2"]["inputs"]["unapproved_mode"] = "experimental"
+    candidate = _variant(
+        "candidate",
+        capability_hash=graph_capability_hash(candidate_graph),
+        exact_run_hash="6" * 64,
+        graph=candidate_graph,
+        hypothesis=DimensionName.LORA_STACK,
+        correction={
+            "schema_version": 1,
+            "failure_signature": signature,
+            "failed_variant_id": failed.variant_id,
+            "failed_exact_run_hash": failed.exact_run_hash,
+            "failed_capability_hash": failed.capability_hash,
+            "candidate_variant_id": "candidate",
+            "changed_dimensions": [DimensionName.LORA_STACK.value],
+        },
+    )
+    history = ExperimentHistory()
+    history.record_failure(failed, signature=signature, run_id="run-a")
+    history.record_failure(failed, signature=signature, run_id="run-b")
+
+    decision = next_wave(
+        _plan(candidate, coverage=(DimensionName.LORA_STACK,)),
+        history,
+    )
+
+    assert decision.variants == ()
+    assert decision.reasons[candidate.variant_id] == (
+        "repeated_failure_requires_new_corrective_hypothesis"
+    )
+
+
 def test_checkpoint_correction_with_disconnected_custom_node_is_rejected() -> None:
     signature = "provider-failed:unexplained node"
     failed_graph = _checkpoint_sampler_lora_graph(

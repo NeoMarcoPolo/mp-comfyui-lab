@@ -4194,19 +4194,25 @@ def test_correction_outside_approved_dimensions_changes_hash_and_requires_reappr
 
 @pytest.mark.parametrize(
     "delta_kind",
-    ["unapproved-sampler", "unclassified-node"],
+    ["unapproved-sampler", "unclassified-node", "unclassified-lora-input"],
 )
 def test_actual_unapproved_correction_dimension_requires_reapproval(
     tmp_path: Path,
     delta_kind: str,
 ) -> None:
+    approved_dimension = (
+        DimensionName.LORA_STACK
+        if delta_kind == "unclassified-lora-input"
+        else DimensionName.CHECKPOINT
+    )
     config, original_plan = _persist_wave_plan(
         tmp_path,
         variants=(
             ("failed", "d" * 64, PlanningConfidence.OBSERVED, 2, 2),
             ("candidate", "e" * 64, PlanningConfidence.OBSERVED, 1, 1),
         ),
-        coverage=(DimensionName.CHECKPOINT,),
+        hypothesis=approved_dimension,
+        coverage=(approved_dimension,),
     )
 
     def graph(
@@ -4214,26 +4220,47 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
         *,
         checkpoint: str = "base.safetensors",
         custom_node: bool = False,
+        lora: str | None = None,
+        lora_unapproved_mode: bool = False,
     ) -> dict[str, object]:
         result: dict[str, object] = {
             "1": {
                 "class_type": "CheckpointLoaderSimple",
                 "inputs": {"ckpt_name": checkpoint},
             },
-            "8": {
-                "class_type": "KSampler",
+        }
+        model_node_id = "1"
+        if lora is not None:
+            result["2"] = {
+                "class_type": "LoraLoader",
                 "inputs": {
                     "model": ["1", 0],
-                    "sampler_name": sampler,
-                    "scheduler": "normal",
-                    "seed": 1,
+                    "clip": ["1", 1],
+                    "lora_name": lora,
+                    "strength_model": 1.0,
+                    "strength_clip": 1.0,
                 },
-            },
-            "9": {
-                "class_type": "SaveImage",
-                "inputs": {"images": ["8", 0]},
-            },
-        }
+            }
+            if lora_unapproved_mode:
+                result["2"]["inputs"]["unapproved_mode"] = "experimental"
+            model_node_id = "2"
+        result.update(
+            {
+                "8": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "model": [model_node_id, 0],
+                        "sampler_name": sampler,
+                        "scheduler": "normal",
+                        "seed": 1,
+                    },
+                },
+                "9": {
+                    "class_type": "SaveImage",
+                    "inputs": {"images": ["8", 0]},
+                },
+            }
+        )
         if custom_node:
             result["90"] = {
                 "class_type": "UnapprovedCustomNode",
@@ -4241,11 +4268,19 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
             }
         return result
 
+    failed_graph = graph(
+        "euler",
+        lora=(
+            "old.safetensors"
+            if delta_kind == "unclassified-lora-input"
+            else None
+        ),
+    )
     failed_draft = PlannedVariant.model_validate(
         {
             **original_plan.variants[0].model_dump(mode="python"),
-            "materialized_graph": graph("euler"),
-            "capability_hash": graph_capability_hash(graph("euler")),
+            "materialized_graph": failed_graph,
+            "capability_hash": graph_capability_hash(failed_graph),
             "exact_run_hash": "0" * 64,
         }
     )
@@ -4262,21 +4297,26 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
         "failed_exact_run_hash": failed.exact_run_hash,
         "failed_capability_hash": failed.capability_hash,
         "candidate_variant_id": "candidate",
-        "changed_dimensions": [DimensionName.CHECKPOINT.value],
+        "changed_dimensions": [approved_dimension.value],
     }
     candidate_parameters = thaw_json(
         original_plan.variants[1].execution_parameters
     )
     candidate_parameters["correction"] = correction
-    candidate_graph = (
-        graph("dpmpp_2m")
-        if delta_kind == "unapproved-sampler"
-        else graph(
+    if delta_kind == "unapproved-sampler":
+        candidate_graph = graph("dpmpp_2m")
+    elif delta_kind == "unclassified-node":
+        candidate_graph = graph(
             "euler",
             checkpoint="revised.safetensors",
             custom_node=True,
         )
-    )
+    else:
+        candidate_graph = graph(
+            "euler",
+            lora="new.safetensors",
+            lora_unapproved_mode=True,
+        )
     candidate_draft = PlannedVariant.model_validate(
         {
             **original_plan.variants[1].model_dump(mode="python"),
