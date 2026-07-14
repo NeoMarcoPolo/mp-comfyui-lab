@@ -34,6 +34,7 @@ from mp_comfyui_lab.experiments.models import (
 )
 from mp_comfyui_lab.mutations import LoraSpec, ReplaceLoraStack, SemanticPatch, SetRoleInput
 from mp_comfyui_lab.mutations.planner import validate_candidate_patch
+from mp_comfyui_lab.mutations.planner import compile_observed_candidates
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
@@ -562,3 +563,21 @@ def test_lora_delta_requires_strength_approval_for_non_neutral_additions() -> No
     strength_candidate = Candidate(candidate_id="lora-strength", hypothesis="lora_strength", capability_signature="lora-strength", confidence="observed", evidence_ids=("123",), semantic_patch=SemanticPatch(mutations=(strength,)))
     strength_brief = _brief(dimensions={"checkpoint": "approved", "prompt_grammar": "approved", "sampler": "approved", "lora_strength": "approved"})
     assert validate_candidate_patch(strength_candidate, strength_candidate.semantic_patch, source, strength_brief) is None
+
+
+def test_compiler_emits_safe_lora_candidates_and_omits_mixed_delta() -> None:
+    graph = _graph()
+    graph["20"] = {"class_type": "LoraLoader", "inputs": {"lora_name": "base.safetensors", "strength_model": 1.0, "strength_clip": 1.0, "model": ["4", 0]}}
+    graph["6"]["inputs"]["model"] = ["20", 0]
+    baseline = _source(graph, workflow_id="123")
+    donor_graph = json.loads(json.dumps(graph))
+    donor_graph["20"]["inputs"]["strength_model"] = 2.0
+    donor = _source(donor_graph, workflow_id="124")
+    brief = _brief(dimensions={"checkpoint": "approved", "prompt_grammar": "approved", "sampler": "approved", "lora_strength": "approved", "lora_stack": "approved"})
+    strength = compile_observed_candidates(brief, baseline, (donor,))
+    assert strength.candidates[0].hypothesis.value == "lora_strength"
+    mixed_graph = json.loads(json.dumps(graph))
+    mixed_graph["20"]["inputs"].update({"lora_name": "new.safetensors", "strength_model": 19.0})
+    mixed = compile_observed_candidates(brief, baseline, (_source(mixed_graph, workflow_id="125"),))
+    assert not mixed.candidates
+    assert "lora_stack and lora_strength" in mixed.warnings[0]

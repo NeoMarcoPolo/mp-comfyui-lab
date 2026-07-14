@@ -12,6 +12,8 @@ from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.mutations.models import (
     ReplaceLoraStack,
+    LoraLoaderTemplate,
+    LoraSpec,
     ReplaceSubgraph,
     SemanticPatch,
     SetNodeInput,
@@ -95,8 +97,76 @@ def compile_observed_candidates(
                 semantic_patch=SemanticPatch(mutations=(SetRoleInput(role=role, binding_index=0, field_name=left[0].field_name, value=value),)),
                 engagement=donor.engagement, provenance_rank=1,
             ))
+        lora_candidate, lora_warning = _compile_lora_candidate(brief, baseline, donor)
+        if lora_candidate is not None:
+            candidates.append(lora_candidate)
+        if lora_warning is not None:
+            warnings.append(lora_warning)
     candidates.sort(key=lambda item: (item.capability_signature, item.candidate_id))
     return CandidateSelection(candidates=tuple(candidates), warnings=tuple(sorted(set(warnings))))
+
+
+def _compile_lora_candidate(brief, baseline, donor):
+    try:
+        before = _lora_specs(baseline)
+        after = _lora_specs(donor)
+    except ValueError as error:
+        return None, f"candidate lora-{donor.workflow_id} omitted: {error}"
+    if before == after:
+        return None, None
+    before_names = tuple(item.name for item in before)
+    after_names = tuple(item.name for item in after)
+    strength_changed = tuple((item.strength_model, item.strength_clip) for item in before) != tuple((item.strength_model, item.strength_clip) for item in after)
+    identity_changed = before_names != after_names
+    if identity_changed and any(item.strength_model != 1.0 or item.strength_clip not in {None, 1.0} for item in after if item.name not in before_names):
+        return None, f"candidate lora-{donor.workflow_id} omitted: lora_stack and lora_strength changed"
+    if identity_changed:
+        dimension = DimensionName.LORA_STACK
+    elif strength_changed:
+        dimension = DimensionName.LORA_STRENGTH
+    else:
+        return None, None
+    if brief.policy_for(dimension).value != "approved":
+        return None, None
+    template = _lora_template(donor) if len(after) > len(before) else None
+    if len(after) > len(before) and template is None:
+        return None, f"candidate lora-{donor.workflow_id} omitted: exact donor loader template unavailable"
+    mutation = ReplaceLoraStack(loras=after, evidence_ids=(donor.workflow_id,), loader_template=template)
+    candidate = Candidate(candidate_id=f"{dimension.value}-{donor.workflow_id}"[:96], hypothesis=dimension, capability_signature=f"{dimension.value}:{_lora_signature(after)}", confidence="observed", evidence_ids=(donor.workflow_id,), semantic_patch=SemanticPatch(mutations=(mutation,)), engagement=donor.engagement, provenance_rank=1)
+    if _mutation_dimensions(mutation, baseline) != {dimension.value}:
+        return None, f"candidate lora-{donor.workflow_id} omitted: compiled patch affects multiple dimensions"
+    return candidate, None
+
+
+def _lora_specs(source):
+    nodes = {node.node_id: node for node in source.normalized_graph.nodes}
+    specs = []
+    for binding in source.normalized_graph.bindings(SemanticRole.LORA):
+        node = nodes[binding.node_id]
+        name = node.inputs.get("lora_name")
+        model = node.inputs.get("strength_model", 1.0)
+        clip = node.inputs.get("strength_clip")
+        if not isinstance(name, str) or not isinstance(model, (int, float)) or isinstance(model, bool):
+            raise ValueError("malformed LoRA binding")
+        if clip is not None and (not isinstance(clip, (int, float)) or isinstance(clip, bool)):
+            raise ValueError("malformed LoRA binding")
+        specs.append(LoraSpec(name=name, strength_model=float(model), strength_clip=None if clip is None else float(clip)))
+    return tuple(specs)
+
+
+def _lora_template(source):
+    bindings = source.normalized_graph.bindings(SemanticRole.LORA)
+    if not bindings:
+        return None
+    node_id = bindings[-1].node_id
+    raw = thaw_json(source.raw_graph).get(node_id)
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("class_type"), str) or not isinstance(raw.get("inputs"), Mapping):
+        return None
+    return LoraLoaderTemplate(donor_node_id=node_id, class_type=raw["class_type"], inputs=raw["inputs"], donor_workflow_id=source.workflow_id, evidence_ids=(source.workflow_id,))
+
+
+def _lora_signature(specs):
+    return hashlib.sha256(json.dumps([item.model_dump(mode="json") for item in specs], sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 
 def select_candidates(
