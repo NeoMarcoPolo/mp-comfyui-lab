@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 from datetime import UTC
 from enum import StrEnum
 import json
@@ -27,6 +28,7 @@ from mp_comfyui_lab.graph.normalize import GraphNormalizationError, normalize_gr
 from mp_comfyui_lab.json_types import (
     FrozenJsonObject,
     SanitizedJsonObject,
+    thaw_json,
 )
 from mp_comfyui_lab.security import SafetyError, safe_filename
 
@@ -712,6 +714,23 @@ class ExperimentPlan(_FrozenModel):
     variants: tuple[PlannedVariant, ...] = Field(min_length=1, max_length=MAX_PLAN_VARIANTS)
     capability_coverage: tuple[DimensionName, ...] = Field(default=(), max_length=len(DimensionName))
     warnings: tuple[str, ...] = Field(default=(), max_length=512)
+    approval_payload: SanitizedJsonObject
+
+    @model_validator(mode="after")
+    def validate_plan_hash(self) -> Self:
+        if self.plan_hash != self.recompute_plan_hash():
+            raise ValueError("plan_hash does not match durable approval_payload")
+        return self
+
+    def recompute_plan_hash(self) -> str:
+        payload = json.dumps(
+            thaw_json(self.approval_payload),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def canonical_json(self) -> str:
         return json.dumps(

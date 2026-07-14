@@ -197,7 +197,12 @@ def _mutation_dimensions(mutation, source: PlanningSource) -> set[str] | None:
         existing = _lora_effective_values(source)
         requested = tuple((item.name, item.strength_model, item.strength_clip) for item in mutation.loras)
         if len(existing) != len(requested):
-            return {"lora_stack"}
+            dimensions = {"lora_stack"}
+            existing_names = {item[0] for item in existing}
+            for name, model, clip in requested:
+                if name not in existing_names and (model != 1.0 or clip not in {None, 1.0}):
+                    dimensions.add("lora_strength")
+            return dimensions
         identity_changed = tuple(item[0] for item in existing) != tuple(item[0] for item in requested)
         strength_changed = any(left[1:] != right[1:] for left, right in zip(existing, requested, strict=True))
         dimensions: set[str] = set()

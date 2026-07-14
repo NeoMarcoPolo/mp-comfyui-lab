@@ -88,7 +88,7 @@ class ReadOnlyPlanningBundleLoader:
         fetched = self._executor.fetch_workflow(ref)
         # Inspection is intentional evidence collection, not provider validation.
         capability_report = self._executor.inspect_capabilities(fetched)
-        graph = fetched.graph
+        graph = sanitize_for_persistence(fetched.graph)
         source = PlanningSource(
             workflow_id=fetched.detail.candidate.workflow_id,
             canonical_url=fetched.detail.candidate.canonical_url,

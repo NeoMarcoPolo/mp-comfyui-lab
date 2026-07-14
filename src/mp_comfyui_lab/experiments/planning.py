@@ -697,4 +697,5 @@ def build_plan(
         variants=variants_tuple,
         capability_coverage=tuple(sorted(coverage, key=lambda item: item.value)),
         warnings=tuple(sorted(set(warnings))),
+        approval_payload=plan_payload,
     )
