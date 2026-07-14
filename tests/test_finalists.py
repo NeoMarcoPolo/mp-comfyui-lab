@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import hashlib
+from html.parser import HTMLParser
 import json
 from pathlib import Path
+from urllib.parse import unquote
 
 from PIL import Image
 import pytest
@@ -13,6 +15,7 @@ from mp_comfyui_lab.comparison.finalists import (
     FinalistSelectionError,
     SelectionState,
     ReviewGenerationConflict,
+    load_canonical_review,
     propose_finalists,
     regenerate_review_artifacts,
     select_finalist,
@@ -38,6 +41,18 @@ from mp_comfyui_lab.graph.hashing import capability_hash
 
 
 EXPERIMENT_ID = "exp-finalists"
+
+
+class _LocalReviewLinks(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        attributes = dict(attrs)
+        value = attributes.get("src") or attributes.get("href")
+        if value is not None and "://" not in value and not value.startswith("#"):
+            self.links.append(value)
 
 
 def _canonical_hash(value: object) -> str:
@@ -395,6 +410,73 @@ def test_finalists_persist_all_scoring_facts_and_validated_judgment_reasons(
     }
 
 
+def test_review_generation_uses_one_canonical_sanitized_judgment_model(
+    tmp_path: Path,
+) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create(EXPERIMENT_ID)
+    plan = _plan(("complete",))
+    variant = plan.variants[0]
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    run = _run(root, variant, state=RunState.SUCCESS).model_copy(
+        update={"plan_hash": plan.plan_hash}
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        run.model_dump(mode="json"),
+    )
+    report = compare_outputs((run,), root, experiment_id=EXPERIMENT_ID)
+    reason = "review https://example.com/output.png?token=secret&view=human"
+    judgments = JudgmentSubmission.model_validate(
+        {
+            "schema_version": "1",
+            "experiment_id": EXPERIMENT_ID,
+            "facts_sha256": comparison_facts_sha256(report),
+            "judgments": [
+                {
+                    "variant_id": "complete",
+                    "identity_fidelity": 5,
+                    "prompt_adherence": 5,
+                    "visual_quality": 5,
+                    "creative_usefulness": 5,
+                    "reasons": [reason],
+                    "referenced_output_ids": ["complete/0"],
+                }
+            ],
+        }
+    )
+
+    review = regenerate_review_artifacts(
+        store,
+        EXPERIMENT_ID,
+        plan,
+        (run,),
+        judgments=judgments,
+    )
+
+    canonical_reason = "review https://example.com/output.png"
+    persisted_judgments = json.loads(
+        (
+            review.finalists_path.parent
+            / "comparisons"
+            / "judgments.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert persisted_judgments["judgments"][0]["reasons"] == [canonical_reason]
+    assert review.finalists.finalists[0].judgment_reasons == (canonical_reason,)
+    assert review.finalists.finalists[0].agent_judgment is not None
+    assert review.finalists.finalists[0].agent_judgment.reasons == (
+        canonical_reason,
+    )
+    selection = select_finalist(store, EXPERIMENT_ID, "complete")
+    assert selection.variant_id == "complete"
+
+
 def test_regeneration_writes_empty_finalists_and_never_selection(
     tmp_path: Path,
 ) -> None:
@@ -503,6 +585,94 @@ def test_review_generation_is_immutable_bound_and_idempotent(
     )
     assert changed.finalists_path != first.finalists_path
     assert selection_status(store, EXPERIMENT_ID).state is SelectionState.STALE
+
+
+def test_review_manifest_covers_complete_self_contained_human_review(
+    tmp_path: Path,
+) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create(EXPERIMENT_ID)
+    plan = _plan(("complete",))
+    run = _run(root, plan.variants[0], state=RunState.SUCCESS).model_copy(
+        update={"plan_hash": plan.plan_hash}
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        run.model_dump(mode="json"),
+    )
+
+    review = regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
+
+    generation = review.generation_manifest_path.parent
+    manifest = json.loads(
+        review.generation_manifest_path.read_text(encoding="utf-8")
+    )
+    entries = {entry["path"]: entry for entry in manifest["artifacts"]}
+    generation_files = {
+        path.relative_to(generation).as_posix(): path
+        for path in generation.rglob("*")
+        if path.is_file() and path.name != "manifest.json"
+    }
+    assert set(entries) == set(generation_files)
+    for relative_path, path in generation_files.items():
+        content = path.read_bytes()
+        assert entries[relative_path]["sha256"] == hashlib.sha256(
+            content
+        ).hexdigest()
+        assert entries[relative_path]["bytes"] == len(content)
+    assert run.outputs[0].local_relative_path in entries
+
+    gallery = generation / "comparisons" / "index.html"
+    parser = _LocalReviewLinks()
+    parser.feed(gallery.read_text(encoding="utf-8"))
+    assert parser.links
+    for link in parser.links:
+        target = (gallery.parent / unquote(link)).resolve(strict=True)
+        target.relative_to(generation.resolve(strict=True))
+        assert target.is_file()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "corrupt", "extra"])
+def test_canonical_review_rejects_incomplete_or_changed_manifest_tree(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create(EXPERIMENT_ID)
+    plan = _plan(("complete",))
+    run = _run(root, plan.variants[0], state=RunState.SUCCESS).model_copy(
+        update={"plan_hash": plan.plan_hash}
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        run.model_dump(mode="json"),
+    )
+    review = regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
+    comparisons = review.generation_manifest_path.parent / "comparisons"
+    if mutation == "missing":
+        (comparisons / "index.html").unlink()
+    elif mutation == "corrupt":
+        (comparisons / "contact-sheet.jpg").write_bytes(b"changed")
+    else:
+        (comparisons / "unreviewed-extra.txt").write_text(
+            "not in the manifest",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ArtifactIntegrityError, match="review.*artifact"):
+        load_canonical_review(store, EXPERIMENT_ID)
 
 
 def test_review_generation_conflict_does_not_clobber_immutable_content(
@@ -636,6 +806,40 @@ def test_select_is_explicit_and_changed_finalists_make_selection_stale(
     assert "finalists artifact SHA-256 changed" in (stale.reason or "")
     with pytest.raises(ArtifactIntegrityError, match="canonical review generation"):
         select_finalist(store, EXPERIMENT_ID, "complete")
+
+
+def test_selection_binds_exact_review_manifest_bytes(tmp_path: Path) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create(EXPERIMENT_ID)
+    plan = _plan(("complete",))
+    run = _run(root, plan.variants[0], state=RunState.SUCCESS).model_copy(
+        update={"plan_hash": plan.plan_hash}
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        run.model_dump(mode="json"),
+    )
+    review = regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
+
+    selection = select_finalist(store, EXPERIMENT_ID, "complete")
+
+    manifest_bytes = review.generation_manifest_path.read_bytes()
+    assert selection.review_generation_id == (
+        review.finalists.review_generation_id
+    )
+    assert selection.review_manifest_sha256 == hashlib.sha256(
+        manifest_bytes
+    ).hexdigest()
+    review.generation_manifest_path.write_bytes(manifest_bytes + b"\n")
+    status = selection_status(store, EXPERIMENT_ID)
+    assert status.state is SelectionState.STALE
+    assert "review manifest SHA-256 changed" in (status.reason or "")
 
 
 def test_select_rejects_tampered_finalist_content(tmp_path: Path) -> None:

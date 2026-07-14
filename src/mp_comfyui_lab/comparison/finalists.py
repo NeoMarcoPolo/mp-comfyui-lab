@@ -12,7 +12,15 @@ import shutil
 import tempfile
 from typing import Any, Callable, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from mp_comfyui_lab.experiments.models import (
     ExperimentPlan,
@@ -30,9 +38,14 @@ from .judgments import (
     judgment_document_bytes,
 )
 from .metrics import ComparisonReport, VariantComparison, compare_outputs
-from .paths import hash_stored_artifact, path_component_is_link_or_junction
+from .paths import (
+    hash_stored_artifact,
+    path_component_is_link_or_junction,
+    resolve_stored_artifact,
+)
 from .render import (
     _rename_directory_new,
+    comparison_artifact_bytes,
     comparison_facts_sha256,
     render_comparison,
 )
@@ -132,8 +145,35 @@ class FinalistsArtifact(_FrozenModel):
         return tuple(item.variant_id for item in self.finalists)
 
 
+class ReviewArtifactEntry(_FrozenModel):
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bytes: int = Field(ge=0)
+    media_type: str
+
+    @field_validator("path")
+    @classmethod
+    def safe_relative_path(cls, value: str) -> str:
+        path = Path(value)
+        if (
+            path.is_absolute()
+            or not path.parts
+            or ".." in path.parts
+            or path.as_posix() != value
+        ):
+            raise ValueError("review artifact path must be normalized and relative")
+        return value
+
+    @field_validator("media_type")
+    @classmethod
+    def nonblank_media_type(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("review artifact media type must not be blank")
+        return value
+
+
 class ReviewGenerationManifest(_FrozenModel):
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     generation_id: str
     experiment_id: str
     plan_hash: str
@@ -143,13 +183,23 @@ class ReviewGenerationManifest(_FrozenModel):
     judgments_sha256: str | None = None
     finalists_path: Literal["finalists.json"]
     finalists_sha256: str
+    artifacts: tuple[ReviewArtifactEntry, ...]
+
+    @model_validator(mode="after")
+    def deterministic_complete_artifact_index(self) -> ReviewGenerationManifest:
+        paths = tuple(item.path for item in self.artifacts)
+        if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+            raise ValueError("review artifacts must be uniquely path-sorted")
+        return self
 
 
 class HumanSelection(_FrozenModel):
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     experiment_id: str
     plan_hash: str
     finalists_artifact_sha256: str
+    review_generation_id: str
+    review_manifest_sha256: str
     variant_id: str
     timestamp: AwareDatetime
     selected_by: Literal["human_cli_input"] = "human_cli_input"
@@ -331,7 +381,18 @@ def _regenerate_review_artifacts_locked(
     judgment_bytes = (
         None if judgments is None else judgment_document_bytes(judgments)
     )
-    rendered = render_comparison(
+    canonical_judgments = None
+    if judgment_bytes is not None:
+        try:
+            canonical_judgments = JudgmentSubmission.model_validate_json(
+                judgment_bytes,
+                strict=True,
+            )
+        except ValidationError as error:
+            raise ArtifactIntegrityError(
+                "sanitized judgments do not match the strict schema"
+            ) from error
+    render_comparison(
         report,
         root,
         judgment_document=judgment_bytes,
@@ -361,7 +422,7 @@ def _regenerate_review_artifacts_locked(
         plan,
         runs=durable_runs,
         run_record_sha256=run_hashes,
-        judgments=judgments,
+        judgments=canonical_judgments,
     ).model_copy(
         update={
             "review_generation_id": generation_id,
@@ -376,27 +437,16 @@ def _regenerate_review_artifacts_locked(
         }
     )
     finalists_bytes = _json_document_bytes(finalists.model_dump(mode="json"))
-    manifest = {
-        "schema_version": "1",
-        "generation_id": generation_id,
-        "experiment_id": experiment_id,
-        "plan_hash": plan.plan_hash,
-        "comparison_facts_path": "comparisons/facts.json",
-        "comparison_facts_sha256": facts_sha256,
-        "judgments_path": (
-            None if judgment_bytes is None else "comparisons/judgments.json"
-        ),
-        "judgments_sha256": judgments_sha256,
-        "finalists_path": "finalists.json",
-        "finalists_sha256": hashlib.sha256(finalists_bytes).hexdigest(),
-    }
     generation = _publish_review_generation(
         root,
         generation_id,
-        rendered.experiment_root / "comparisons",
         finalists_bytes,
-        _json_document_bytes(manifest),
-        include_judgments=judgment_bytes is not None,
+        report=report,
+        experiment_id=experiment_id,
+        plan_hash=plan.plan_hash,
+        comparison_facts_sha256=facts_sha256,
+        judgments_sha256=judgments_sha256,
+        judgment_document=judgment_bytes,
         fault_injector=fault_injector,
     )
     _inject(fault_injector, "current:before_publish")
@@ -438,6 +488,10 @@ def select_finalist(
             plan_hash=review.finalists.plan_hash,
             finalists_artifact_sha256=hashlib.sha256(
                 review.finalists_bytes
+            ).hexdigest(),
+            review_generation_id=review.manifest.generation_id,
+            review_manifest_sha256=hashlib.sha256(
+                review.manifest_bytes
             ).hexdigest(),
             variant_id=variant_id,
             timestamp=now().astimezone(UTC),
@@ -551,6 +605,15 @@ def load_canonical_review(
         raise ArtifactIntegrityError(
             "current run or output evidence differs from the review generation"
         )
+    _verify_canonical_review_artifacts(
+        root / generation_relative,
+        manifest,
+        manifest_bytes,
+        finalists_bytes,
+        comparison,
+        judgments,
+        root,
+    )
     canonical = propose_finalists(
         comparison,
         plan,
@@ -619,6 +682,19 @@ def selection_status(
         finalists_bytes
     ).hexdigest():
         return _stale(selection, "finalists artifact SHA-256 changed")
+    if selection.review_generation_id != finalists.review_generation_id:
+        return _stale(selection, "review generation ID changed")
+    try:
+        manifest_bytes = store.read_bytes(
+            experiment_id,
+            f"reviews/{selection.review_generation_id}/manifest.json",
+        )
+    except (OSError, ValueError) as error:
+        return _stale(selection, f"review manifest is invalid: {error}")
+    if selection.review_manifest_sha256 != hashlib.sha256(
+        manifest_bytes
+    ).hexdigest():
+        return _stale(selection, "review manifest SHA-256 changed")
     if selection.selected_variant_id not in finalists.variant_ids:
         return _stale(selection, "selected variant is not a current finalist")
     return SelectionStatus(state=SelectionState.VALID, selection=selection)
@@ -776,7 +852,7 @@ def _review_generation_id(
     judgments_sha256: str | None,
 ) -> str:
     preimage = {
-        "schema_version": "1",
+        "schema_version": "2",
         "experiment_id": experiment_id,
         "plan_hash": plan_hash,
         "comparison_facts_sha256": comparison_facts_sha256,
@@ -788,11 +864,14 @@ def _review_generation_id(
 def _publish_review_generation(
     root: Path,
     generation_id: str,
-    comparison_source: Path,
     finalists_bytes: bytes,
-    manifest_bytes: bytes,
     *,
-    include_judgments: bool,
+    report: ComparisonReport,
+    experiment_id: str,
+    plan_hash: str,
+    comparison_facts_sha256: str,
+    judgments_sha256: str | None,
+    judgment_document: bytes | None,
     fault_injector: Callable[[str], None] | None,
 ) -> Path:
     reviews = root / "reviews"
@@ -804,11 +883,34 @@ def _publish_review_generation(
     stage = Path(tempfile.mkdtemp(prefix=".review-stage-", dir=reviews))
     destination = reviews / generation_id
     try:
-        shutil.copytree(comparison_source, stage / "comparisons")
-        staged_judgments = stage / "comparisons" / "judgments.json"
-        if not include_judgments and staged_judgments.exists():
-            staged_judgments.unlink()
+        comparison_stage = stage / "comparisons"
+        comparison_stage.mkdir()
+        for name, content in comparison_artifact_bytes(
+            report,
+            root,
+            judgment_document=judgment_document,
+        ).items():
+            _write_new_bytes(comparison_stage / name, content)
         _write_new_bytes(stage / "finalists.json", finalists_bytes)
+        media_types = _copy_review_media(root, stage, report)
+        artifacts = _review_artifact_entries(stage, media_types)
+        manifest = ReviewGenerationManifest(
+            generation_id=generation_id,
+            experiment_id=experiment_id,
+            plan_hash=plan_hash,
+            comparison_facts_path="comparisons/facts.json",
+            comparison_facts_sha256=comparison_facts_sha256,
+            judgments_path=(
+                None
+                if judgment_document is None
+                else "comparisons/judgments.json"
+            ),
+            judgments_sha256=judgments_sha256,
+            finalists_path="finalists.json",
+            finalists_sha256=hashlib.sha256(finalists_bytes).hexdigest(),
+            artifacts=artifacts,
+        )
+        manifest_bytes = _json_document_bytes(manifest.model_dump(mode="json"))
         _write_new_bytes(stage / "manifest.json", manifest_bytes)
         _fsync_tree(stage)
         _inject(fault_injector, "generation:before_publish")
@@ -826,6 +928,131 @@ def _publish_review_generation(
         shutil.rmtree(stage, ignore_errors=True)
 
 
+def _copy_review_media(
+    experiment_root: Path,
+    stage: Path,
+    report: ComparisonReport,
+) -> dict[str, str]:
+    media_types: dict[str, str] = {}
+    for variant_id in sorted(report.variants):
+        variant = report.variants[variant_id]
+        for output in sorted(variant.outputs, key=lambda item: item.output_ordinal):
+            if output.availability != "available":
+                continue
+            relative_path = output.artifact_relative_path
+            if (
+                relative_path is None
+                or output.sha256 is None
+                or output.bytes is None
+            ):
+                raise ArtifactIntegrityError(
+                    "available review media lacks canonical evidence"
+                )
+            source, availability = resolve_stored_artifact(
+                experiment_root,
+                relative_path,
+            )
+            if source is None:
+                raise ArtifactIntegrityError(
+                    f"review media is {availability}: {relative_path}"
+                )
+            destination = stage / relative_path
+            media_type = output.detected_mime_type or output.declared_mime_type
+            existing_media_type = media_types.get(relative_path)
+            if destination.exists():
+                try:
+                    digest, size = hash_stored_artifact(destination)
+                except OSError as error:
+                    raise ArtifactIntegrityError(
+                        "duplicate review media cannot be verified"
+                    ) from error
+                if (
+                    digest != output.sha256
+                    or size != output.bytes
+                    or existing_media_type != media_type
+                ):
+                    raise ArtifactIntegrityError(
+                        "review media paths collide with different evidence"
+                    )
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copyfile(source, destination)
+                digest, size = hash_stored_artifact(destination)
+            except OSError as error:
+                raise ArtifactIntegrityError(
+                    "review media cannot be copied safely"
+                ) from error
+            if digest != output.sha256 or size != output.bytes:
+                raise ArtifactIntegrityError(
+                    "review media changed during generation publication"
+                )
+            media_types[relative_path] = media_type
+    return media_types
+
+
+def _review_artifact_entries(
+    stage: Path,
+    media_types: Mapping[str, str],
+) -> tuple[ReviewArtifactEntry, ...]:
+    entries = []
+    try:
+        paths = tuple(stage.rglob("*"))
+    except OSError as error:
+        raise ArtifactIntegrityError(
+            "staged review artifacts cannot be listed"
+        ) from error
+    for path in sorted(paths, key=lambda item: item.as_posix()):
+        if path_component_is_link_or_junction(path):
+            raise ArtifactIntegrityError(
+                "staged review contains a symlink or junction"
+            )
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ArtifactIntegrityError(
+                "staged review contains a non-file artifact"
+            )
+        relative_path = path.relative_to(stage).as_posix()
+        try:
+            digest, size = hash_stored_artifact(path)
+        except OSError as error:
+            raise ArtifactIntegrityError(
+                "staged review artifact changed while hashing"
+            ) from error
+        entries.append(
+            ReviewArtifactEntry(
+                path=relative_path,
+                sha256=digest,
+                bytes=size,
+                media_type=media_types.get(
+                    relative_path,
+                    _review_artifact_media_type(path),
+                ),
+            )
+        )
+    return tuple(entries)
+
+
+def _review_artifact_media_type(path: Path) -> str:
+    return {
+        ".json": "application/json",
+        ".html": "text/html",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mov": "video/quicktime",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".flac": "audio/flac",
+        ".txt": "text/plain",
+    }.get(path.suffix.casefold(), "application/octet-stream")
+
+
 def _verify_generation_tree(expected: Path, actual: Path) -> None:
     if path_component_is_link_or_junction(actual) or not actual.is_dir():
         raise ReviewGenerationConflict(
@@ -834,6 +1061,133 @@ def _verify_generation_tree(expected: Path, actual: Path) -> None:
     if _tree_manifest(expected) != _tree_manifest(actual):
         raise ReviewGenerationConflict(
             "review generation already exists with different content"
+        )
+
+
+def _verify_canonical_review_artifacts(
+    generation: Path,
+    manifest: ReviewGenerationManifest,
+    manifest_bytes: bytes,
+    finalists_bytes: bytes,
+    comparison: ComparisonReport,
+    judgments: JudgmentSubmission | None,
+    experiment_root: Path,
+) -> None:
+    if path_component_is_link_or_junction(generation) or not generation.is_dir():
+        raise ArtifactIntegrityError(
+            "review generation artifact directory is unsafe"
+        )
+    judgment_bytes = (
+        None if judgments is None else judgment_document_bytes(judgments)
+    )
+    try:
+        comparison_artifacts = comparison_artifact_bytes(
+            comparison,
+            experiment_root,
+            judgment_document=judgment_bytes,
+        )
+    except (OSError, ValueError) as error:
+        raise ArtifactIntegrityError(
+            "canonical review artifacts cannot be reconstructed"
+        ) from error
+
+    expected: dict[str, ReviewArtifactEntry] = {}
+
+    def add(entry: ReviewArtifactEntry) -> None:
+        existing = expected.get(entry.path)
+        if existing is not None and existing != entry:
+            raise ArtifactIntegrityError(
+                "canonical review artifact paths collide"
+            )
+        expected[entry.path] = entry
+
+    for name, content in comparison_artifacts.items():
+        add(
+            ReviewArtifactEntry(
+                path=f"comparisons/{name}",
+                sha256=hashlib.sha256(content).hexdigest(),
+                bytes=len(content),
+                media_type=_review_artifact_media_type(Path(name)),
+            )
+        )
+    add(
+        ReviewArtifactEntry(
+            path="finalists.json",
+            sha256=hashlib.sha256(finalists_bytes).hexdigest(),
+            bytes=len(finalists_bytes),
+            media_type="application/json",
+        )
+    )
+    for variant in comparison.variants.values():
+        for output in variant.outputs:
+            if output.availability != "available":
+                continue
+            if (
+                output.artifact_relative_path is None
+                or output.sha256 is None
+                or output.bytes is None
+            ):
+                raise ArtifactIntegrityError(
+                    "canonical review media evidence is incomplete"
+                )
+            add(
+                ReviewArtifactEntry(
+                    path=output.artifact_relative_path,
+                    sha256=output.sha256,
+                    bytes=output.bytes,
+                    media_type=(
+                        output.detected_mime_type
+                        or output.declared_mime_type
+                    ),
+                )
+            )
+    expected_artifacts = tuple(expected[path] for path in sorted(expected))
+    expected_manifest = ReviewGenerationManifest(
+        generation_id=manifest.generation_id,
+        experiment_id=manifest.experiment_id,
+        plan_hash=manifest.plan_hash,
+        comparison_facts_path="comparisons/facts.json",
+        comparison_facts_sha256=comparison_facts_sha256(comparison),
+        judgments_path=(
+            None if judgments is None else "comparisons/judgments.json"
+        ),
+        judgments_sha256=(
+            None
+            if judgment_bytes is None
+            else hashlib.sha256(judgment_bytes).hexdigest()
+        ),
+        finalists_path="finalists.json",
+        finalists_sha256=hashlib.sha256(finalists_bytes).hexdigest(),
+        artifacts=expected_artifacts,
+    )
+    canonical_manifest_bytes = _json_document_bytes(
+        expected_manifest.model_dump(mode="json")
+    )
+    if manifest != expected_manifest or manifest_bytes != canonical_manifest_bytes:
+        raise ArtifactIntegrityError(
+            "review generation manifest is not canonical"
+        )
+    expected_tree = tuple(
+        sorted(
+            (
+                *((item.path, item.sha256, item.bytes) for item in expected_artifacts),
+                (
+                    "manifest.json",
+                    hashlib.sha256(manifest_bytes).hexdigest(),
+                    len(manifest_bytes),
+                ),
+            )
+        )
+    )
+    try:
+        actual_tree = _tree_manifest(generation)
+    except ReviewGenerationConflict as error:
+        raise ArtifactIntegrityError(
+            "review generation artifacts cannot be verified"
+        ) from error
+    if actual_tree != expected_tree:
+        raise ArtifactIntegrityError(
+            "review generation artifacts differ from the manifest"
         )
 
 

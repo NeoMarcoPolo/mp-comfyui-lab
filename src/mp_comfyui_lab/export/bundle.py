@@ -120,6 +120,9 @@ class BundleExporter:
             selection.plan_hash != review.plan.plan_hash
             or selection.finalists_artifact_sha256
             != hashlib.sha256(review.finalists_bytes).hexdigest()
+            or selection.review_generation_id != review.manifest.generation_id
+            or selection.review_manifest_sha256
+            != hashlib.sha256(review.manifest_bytes).hexdigest()
         ):
             raise StaleSelectionError(
                 "selection no longer matches the canonical review generation"
@@ -168,11 +171,23 @@ class BundleExporter:
             safe_filename(selection.selected_variant_id)
         except SafetyError as error:
             raise BundleIntegrityError("selected variant ID is unsafe") from error
-        destination = export_root / selection.selected_variant_id
+        variant_export_root = export_root / selection.selected_variant_id
+        try:
+            variant_export_root.mkdir(exist_ok=True)
+        except OSError as error:
+            raise BundleConflictError(
+                "variant export root cannot be created safely"
+            ) from error
+        self._require_safe_directory(
+            variant_export_root,
+            context="variant export root",
+        )
+        export_generation_id = hashlib.sha256(selection_bytes).hexdigest()
+        destination = variant_export_root / export_generation_id
         stage = Path(
             tempfile.mkdtemp(
-                prefix=f".{selection.selected_variant_id}.stage-",
-                dir=export_root,
+                prefix=f".{export_generation_id}.stage-",
+                dir=variant_export_root,
             )
         )
         try:
@@ -279,6 +294,7 @@ class BundleExporter:
             stage / "review-manifest.json",
             review.manifest_bytes,
         )
+        self._copy_review_artifacts(stage, review)
         self._write_bytes(stage / "selection.json", selection_bytes)
 
         description = self._brief_goal(root, plan)
@@ -415,11 +431,13 @@ class BundleExporter:
         variant: PlannedVariant,
     ) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
-        fixture_root = root / "runs" / run.run_id / "fixtures"
+        fixture_relative = Path("runs", run.run_id, "fixtures")
+        fixture_root = root / fixture_relative
         if not variant.fixture_fingerprints:
-            if fixture_root.exists():
-                self._require_safe_directory(
-                    fixture_root,
+            if fixture_root.exists() or fixture_root.is_symlink():
+                fixture_root = self._require_confined_directory(
+                    root,
+                    fixture_relative,
                     context="selected fixture snapshot directory",
                 )
                 if any(fixture_root.iterdir()):
@@ -427,8 +445,9 @@ class BundleExporter:
                         "selected run has unapproved fixture snapshots"
                     )
             return entries
-        self._require_safe_directory(
-            fixture_root,
+        fixture_root = self._require_confined_directory(
+            root,
+            fixture_relative,
             context="selected fixture snapshot directory",
         )
         for fixture in variant.fixture_fingerprints:
@@ -522,6 +541,29 @@ class BundleExporter:
                 }
             )
         return entries
+
+    def _copy_review_artifacts(
+        self,
+        stage: Path,
+        review: CanonicalReview,
+    ) -> None:
+        generation_root = review.manifest_path.parent
+        for artifact in review.manifest.artifacts:
+            source, availability = resolve_stored_artifact(
+                generation_root,
+                artifact.path,
+            )
+            if source is None:
+                raise BundleIntegrityError(
+                    f"review artifact is {availability}: {artifact.path}"
+                )
+            self._copy_verified(
+                source,
+                stage / "review" / artifact.path,
+                expected_sha256=artifact.sha256,
+                expected_size=artifact.bytes,
+                context="review artifact",
+            )
 
     def _brief_goal(self, root: Path, plan: ExperimentPlan) -> str:
         payload = thaw_json(plan.approval_payload)
@@ -743,6 +785,39 @@ class BundleExporter:
     def _require_safe_directory(path: Path, *, context: str) -> None:
         if path_component_is_link_or_junction(path) or not path.is_dir():
             raise BundleIntegrityError(f"{context} is not a safe local directory")
+
+    @staticmethod
+    def _require_confined_directory(
+        trusted_root: Path,
+        relative_path: Path,
+        *,
+        context: str,
+    ) -> Path:
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise BundleIntegrityError(f"{context} path is unsafe")
+        current = trusted_root
+        for component in relative_path.parts:
+            current /= component
+            try:
+                metadata = current.lstat()
+            except OSError as error:
+                raise BundleIntegrityError(
+                    f"{context} is not a safe local directory"
+                ) from error
+            if (
+                path_component_is_link_or_junction(current, metadata)
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                raise BundleIntegrityError(
+                    f"{context} contains an unsafe path component"
+                )
+        try:
+            trusted = trusted_root.resolve(strict=True)
+            resolved = current.resolve(strict=True)
+            resolved.relative_to(trusted)
+        except (OSError, ValueError) as error:
+            raise BundleIntegrityError(f"{context} escapes its trusted root") from error
+        return resolved
 
     @staticmethod
     def _fsync_tree(root: Path) -> None:

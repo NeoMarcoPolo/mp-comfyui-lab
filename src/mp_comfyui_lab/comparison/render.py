@@ -78,6 +78,62 @@ def render_comparison(
         raise SafetyError(
             "comparison report identity does not match experiment root"
         )
+    artifact_values = _comparison_artifact_values(report, root)
+    _publish_artifact_set(
+        root,
+        artifact_values,
+        judgment_document=judgment_document,
+        fault_injector=fault_injector,
+        replace_existing=replace_existing,
+    )
+    contact_page_names = tuple(
+        name
+        for name in artifact_values
+        if name == "contact-sheet.jpg" or name.startswith("contact-sheet-")
+    )
+    judgments_path = root / _COMPARISON_DIRECTORY / _JUDGMENTS_NAME
+    contact_sheets = tuple(
+        root / _COMPARISON_DIRECTORY / name for name in contact_page_names
+    )
+    return ComparisonArtifacts(
+        experiment_root=root,
+        facts=root / _COMPARISON_DIRECTORY / "facts.json",
+        duplicate_groups=(
+            root / _COMPARISON_DIRECTORY / "duplicate-groups.json"
+        ),
+        contact_sheet=contact_sheets[0],
+        contact_sheets=contact_sheets,
+        gallery=root / _COMPARISON_DIRECTORY / "index.html",
+        judgment_input=root / _COMPARISON_DIRECTORY / "judgment-input.json",
+        judgments=judgments_path if judgments_path.exists() else None,
+    )
+
+
+def comparison_artifact_bytes(
+    report: ComparisonReport,
+    experiment_root: str | Path,
+    *,
+    judgment_document: bytes | None = None,
+) -> dict[str, bytes]:
+    """Build the canonical bounded review artifacts without publishing them."""
+    root = Path(experiment_root).resolve()
+    if report.experiment_id != root.name:
+        raise SafetyError(
+            "comparison report identity does not match experiment root"
+        )
+    artifacts = {
+        name: _artifact_bytes(value)
+        for name, value in _comparison_artifact_values(report, root).items()
+    }
+    if judgment_document is not None:
+        artifacts[_JUDGMENTS_NAME] = judgment_document
+    return artifacts
+
+
+def _comparison_artifact_values(
+    report: ComparisonReport,
+    root: Path,
+) -> dict[str, ArtifactValue]:
     facts_bytes = _json_bytes(report.model_dump(mode="json"))
     duplicate_groups_bytes = _json_bytes(
         {
@@ -106,29 +162,7 @@ def render_comparison(
         artifact_values[page_name] = (
             lambda items=page_items: _contact_sheet_page_bytes(items, root)
         )
-    _publish_artifact_set(
-        root,
-        artifact_values,
-        judgment_document=judgment_document,
-        fault_injector=fault_injector,
-        replace_existing=replace_existing,
-    )
-    judgments_path = root / _COMPARISON_DIRECTORY / _JUDGMENTS_NAME
-    contact_sheets = tuple(
-        root / _COMPARISON_DIRECTORY / name for name in contact_page_names
-    )
-    return ComparisonArtifacts(
-        experiment_root=root,
-        facts=root / _COMPARISON_DIRECTORY / "facts.json",
-        duplicate_groups=(
-            root / _COMPARISON_DIRECTORY / "duplicate-groups.json"
-        ),
-        contact_sheet=contact_sheets[0],
-        contact_sheets=contact_sheets,
-        gallery=root / _COMPARISON_DIRECTORY / "index.html",
-        judgment_input=root / _COMPARISON_DIRECTORY / "judgment-input.json",
-        judgments=judgments_path if judgments_path.exists() else None,
-    )
+    return artifact_values
 
 
 def _json_bytes(value: Any) -> bytes:

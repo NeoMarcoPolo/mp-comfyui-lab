@@ -324,6 +324,78 @@ def test_resume_cli_wires_existing_run_id(capsys):
     assert payload["data"]["state"] == "FAILED"
 
 
+def test_run_cli_preserves_ambiguous_incomplete_recovery_without_review(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    run_path = (tmp_path / "store" / "runs" / "run-ambiguous.json").resolve()
+    record = RunRecord(
+        run_id="run-ambiguous",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.INCOMPLETE,
+        expected_output_count=1,
+        error={"kind": "ambiguous_submission"},
+    )
+    engine = FakeExperimentEngine(record, run_artifact_path=run_path)
+
+    code = main(
+        [
+            "run",
+            "plan-approved",
+            "baseline",
+            "--approve-plan-hash",
+            "a" * 64,
+        ],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.INCOMPLETE
+    assert engine.calls == [
+        ("run", "plan-approved", "baseline", "a" * 64),
+    ]
+    assert payload["data"]["run_id"] == "run-ambiguous"
+    assert payload["data"]["state"] == "INCOMPLETE"
+    assert payload["data"]["provider_task_id"] is None
+    assert payload["data"]["recovery_disposition"] == "reconcile_submission"
+    assert "comparison_path" not in payload["data"]
+    assert "finalists_path" not in payload["data"]
+    assert payload["artifacts"] == [{"kind": "run", "path": str(run_path)}]
+
+
+def test_resume_cli_preserves_pending_provider_recovery_without_review(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    run_path = (tmp_path / "store" / "runs" / "run-pending.json").resolve()
+    record = RunRecord(
+        run_id="run-pending",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.INCOMPLETE,
+        provider_task_id="provider-task-pending",
+        expected_output_count=1,
+        error={"kind": "poll_error"},
+    )
+    engine = FakeExperimentEngine(record, run_artifact_path=run_path)
+
+    code = main(
+        ["resume", "plan-approved", "run-pending"],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.INCOMPLETE
+    assert engine.calls == [("resume", "plan-approved", "run-pending")]
+    assert payload["data"]["run_id"] == "run-pending"
+    assert payload["data"]["provider_task_id"] == "provider-task-pending"
+    assert payload["data"]["recovery_disposition"] == "resume_provider_task"
+    assert "comparison_path" not in payload["data"]
+    assert "finalists_path" not in payload["data"]
+    assert payload["artifacts"] == [{"kind": "run", "path": str(run_path)}]
+
+
 def test_run_cli_returns_absolute_comparison_and_finalist_paths(
     tmp_path: Path,
     capsys,

@@ -77,6 +77,7 @@ from mp_comfyui_lab.experiments.models import (
     PlannedVariant,
     PlanningSource,
     RunRecord,
+    RunHistoryDisposition,
     RunState,
     SourceBundle,
 )
@@ -655,6 +656,13 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
         "run_id": record.run_id,
         "variant_id": record.variant_id,
         "state": record.state.value,
+        "recovery_disposition": (
+            None
+            if record.recovery_disposition is None
+            else record.recovery_disposition.value
+        ),
+        "plan_hash": record.plan_hash,
+        "exact_run_hash": record.exact_run_hash,
         "provider_task_id": record.provider_task_id,
         "expected_output_count": record.expected_output_count,
         "actual_output_count": record.actual_output_count,
@@ -1366,7 +1374,11 @@ def main(
                 }
             ]
             data = _run_payload(record)
-            if parsed.command in {"run", "resume"}:
+            if (
+                parsed.command in {"run", "resume"}
+                and record.history_disposition()
+                is RunHistoryDisposition.COMPLETED
+            ):
                 review_paths = engine.review_artifact_paths(
                     parsed.experiment_id
                 )

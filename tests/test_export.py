@@ -14,6 +14,7 @@ from mp_comfyui_lab.comparison.finalists import (
     regenerate_review_artifacts,
     select_finalist,
 )
+from mp_comfyui_lab.comparison.judgments import JudgmentSubmission
 from mp_comfyui_lab.cli.app import ExitCode, main
 from mp_comfyui_lab.experiments.models import (
     ApprovedSourceProvenance,
@@ -333,6 +334,7 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
         "comparison.json",
         "finalists.json",
         "review-manifest.json",
+        "review",
         "selection.json",
         "handoff.json",
     }
@@ -362,6 +364,10 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
     review_manifest = json.loads(
         (bundle / "review-manifest.json").read_text(encoding="utf-8")
     )
+    assert selection["review_generation_id"] == review_manifest["generation_id"]
+    assert selection["review_manifest_sha256"] == hashlib.sha256(
+        (bundle / "review-manifest.json").read_bytes()
+    ).hexdigest()
     assert review_manifest["finalists_sha256"] == selection[
         "finalists_artifact_sha256"
     ]
@@ -373,6 +379,11 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
         "comparison_facts_sha256"
     ]
     assert "judgments" in comparison
+    for artifact in review_manifest["artifacts"]:
+        review_artifact = bundle / "review" / artifact["path"]
+        content = review_artifact.read_bytes()
+        assert hashlib.sha256(content).hexdigest() == artifact["sha256"]
+        assert len(content) == artifact["bytes"]
     assert {root: _snapshot_tree(root) for root in production_roots} == before
 
 
@@ -400,6 +411,46 @@ def test_export_rejects_symlinked_fixture_snapshot(tmp_path: Path) -> None:
         BundleExporter(store).export(EXPERIMENT_ID)
 
 
+def test_export_rejects_symlinked_fixture_ancestor_outside_experiment(
+    tmp_path: Path,
+) -> None:
+    store, root = _persist_selected_experiment(tmp_path)
+    run_root = root / "runs" / "run-selected"
+    outside_run = tmp_path / "outside-run-selected"
+    run_root.rename(outside_run)
+    try:
+        run_root.symlink_to(outside_run, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        outside_run.rename(run_root)
+        pytest.skip("test environment does not permit directory symlinks")
+
+    with pytest.raises(BundleIntegrityError, match="fixture"):
+        BundleExporter(store).export(EXPERIMENT_ID)
+
+
+def test_export_rejects_platform_link_fixture_ancestor(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store, root = _persist_selected_experiment(tmp_path)
+    run_root = root / "runs" / "run-selected"
+    original = bundle_module.path_component_is_link_or_junction
+
+    def reports_run_root_as_link(path, metadata=None):
+        if path == run_root:
+            return True
+        return original(path, metadata)
+
+    monkeypatch.setattr(
+        bundle_module,
+        "path_component_is_link_or_junction",
+        reports_run_root_as_link,
+    )
+
+    with pytest.raises(BundleIntegrityError, match="fixture"):
+        BundleExporter(store).export(EXPERIMENT_ID)
+
+
 def test_existing_changed_bundle_conflicts_without_clobber(tmp_path: Path) -> None:
     store, _ = _persist_selected_experiment(tmp_path)
     exporter = BundleExporter(store)
@@ -411,6 +462,104 @@ def test_existing_changed_bundle_conflicts_without_clobber(tmp_path: Path) -> No
         exporter.export(EXPERIMENT_ID)
 
     assert selected.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_reselection_publishes_new_immutable_export_and_preserves_old_bundle(
+    tmp_path: Path,
+) -> None:
+    store, _ = _persist_selected_experiment(tmp_path)
+    exporter = BundleExporter(store)
+    first = exporter.export(EXPERIMENT_ID)
+    first_snapshot = _snapshot_tree(first)
+    select_finalist(
+        store,
+        EXPERIMENT_ID,
+        VARIANT_ID,
+        now=lambda: datetime(2026, 7, 14, 17, 0, tzinfo=UTC),
+    )
+
+    second = exporter.export(EXPERIMENT_ID)
+
+    assert second != first
+    assert _snapshot_tree(first) == first_snapshot
+    assert (second / "handoff.json").is_file()
+    assert (second / "review-manifest.json").is_file()
+
+
+def test_later_review_generation_gets_new_export_and_preserves_old_bundle(
+    tmp_path: Path,
+) -> None:
+    store, root = _persist_selected_experiment(tmp_path)
+    exporter = BundleExporter(store)
+    first = exporter.export(EXPERIMENT_ID)
+    first_snapshot = _snapshot_tree(first)
+    current = store.read_json(EXPERIMENT_ID, "finalists.json")
+    plan = ExperimentPlan.model_validate_json(
+        store.read_bytes(EXPERIMENT_ID, f"plans/{current['plan_hash']}.json")
+    )
+    run = RunRecord.model_validate_json(
+        store.read_bytes(EXPERIMENT_ID, "runs/run-selected.json")
+    )
+    judgments = JudgmentSubmission.model_validate(
+        {
+            "schema_version": "1",
+            "experiment_id": EXPERIMENT_ID,
+            "facts_sha256": current["comparison_facts_sha256"],
+            "judgments": [
+                {
+                    "variant_id": VARIANT_ID,
+                    "identity_fidelity": 5,
+                    "prompt_adherence": 5,
+                    "visual_quality": 5,
+                    "creative_usefulness": 5,
+                    "reasons": ["selected after complete human review"],
+                    "referenced_output_ids": [f"{VARIANT_ID}/0"],
+                }
+            ],
+        }
+    )
+    later_review = regenerate_review_artifacts(
+        store,
+        EXPERIMENT_ID,
+        plan,
+        (run,),
+        judgments=judgments,
+    )
+    assert later_review.finalists.review_generation_id != current[
+        "review_generation_id"
+    ]
+    select_finalist(
+        store,
+        EXPERIMENT_ID,
+        VARIANT_ID,
+        now=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=UTC),
+    )
+
+    second = exporter.export(EXPERIMENT_ID)
+
+    assert second != first
+    assert _snapshot_tree(first) == first_snapshot
+    second_manifest = json.loads(
+        (second / "review-manifest.json").read_text(encoding="utf-8")
+    )
+    assert second_manifest["generation_id"] == (
+        later_review.finalists.review_generation_id
+    )
+
+
+def test_export_rejects_changed_human_review_artifact(tmp_path: Path) -> None:
+    store, root = _persist_selected_experiment(tmp_path)
+    current = store.read_json(EXPERIMENT_ID, "finalists.json")
+    gallery = (
+        root
+        / current["review_generation_path"]
+        / "comparisons"
+        / "index.html"
+    )
+    gallery.write_text("<html>changed</html>\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactIntegrityError, match="review.*artifact"):
+        BundleExporter(store).export(EXPERIMENT_ID)
 
 
 def test_changed_finalists_make_selection_stale_for_export(tmp_path: Path) -> None:
