@@ -41,6 +41,13 @@ POSITIVE_WEIGHT_FIELDS = (
 # Stable public-evidence mix: reuse is the strongest signal, while likes and
 # collections contribute equally. Each metric is log1p-normalized independently.
 ENGAGEMENT_METRIC_MIX = {"uses": 0.6, "likes": 0.2, "collects": 0.2}
+INTRINSIC_WEIGHT_FIELDS = (
+    "relevance",
+    "engagement",
+    "output_evidence",
+    "recency",
+    "experimentability",
+)
 MAX_EXPLANATION_LENGTH = 1_024
 _LOG_TWO = log(2.0)
 _LOG_MANTISSA_BITS = 53
@@ -568,6 +575,90 @@ def _canonical_candidates(
     }
 
 
+def _intrinsic_scores(
+    plan: ExpandedQuery,
+    details: Sequence[WorkflowDetail],
+    weights: RankingWeights,
+    evidence_by_id: Mapping[str, GraphEvidence],
+) -> dict[str, dict[str, float]]:
+    engagement_maxima = _engagement_maxima(details)
+    recency_scores = _recency_scores(details)
+    weight_total = sum(getattr(weights, field) for field in INTRINSIC_WEIGHT_FIELDS)
+    scores: dict[str, dict[str, float]] = {}
+    for detail in details:
+        workflow_id = detail.candidate.workflow_id
+        components = {
+            "relevance": _relevance(plan, detail),
+            "engagement": _metric_score(
+                detail.candidate.engagement,
+                engagement_maxima,
+            ),
+            "output_evidence": _output_evidence(
+                detail,
+                evidence_by_id.get(workflow_id),
+            ),
+            "recency": recency_scores[workflow_id],
+            "experimentability": _experimentability(
+                detail,
+                evidence_by_id.get(workflow_id),
+            ),
+        }
+        components["score"] = (
+            sum(
+                getattr(weights, field) * components[field]
+                for field in INTRINSIC_WEIGHT_FIELDS
+            )
+            / weight_total
+            if weight_total > 0.0
+            else 0.0
+        )
+        scores[workflow_id] = components
+    return scores
+
+
+def select_group_representatives(
+    query: str | ExpandedQuery,
+    details: Sequence[WorkflowDetail],
+    weights: RankingWeights,
+    group_keys: Mapping[str, str | None],
+    *,
+    graph_evidence: Mapping[str, GraphEvidence] | None = None,
+) -> dict[str, str]:
+    """Choose stable duplicate representatives from pre-penalty evidence."""
+    if not isinstance(weights, RankingWeights):
+        raise TypeError("weights must be RankingWeights")
+    plan = expand_query(query) if isinstance(query, str) else query
+    ordered_details = tuple(
+        sorted(details, key=lambda item: item.candidate.workflow_id)
+    )
+    intrinsic = _intrinsic_scores(
+        plan,
+        ordered_details,
+        weights,
+        dict(graph_evidence or {}),
+    )
+    details_by_id = {
+        detail.candidate.workflow_id: detail for detail in ordered_details
+    }
+    groups: dict[str, list[str]] = defaultdict(list)
+    for workflow_id, group_key in group_keys.items():
+        if group_key is not None and workflow_id in details_by_id:
+            groups[group_key].append(workflow_id)
+    return {
+        group_key: min(
+            workflow_ids,
+            key=lambda workflow_id: (
+                -intrinsic[workflow_id]["score"],
+                -_count(details_by_id[workflow_id].candidate.engagement, "uses"),
+                -_count(details_by_id[workflow_id].candidate.engagement, "likes"),
+                -_count(details_by_id[workflow_id].candidate.engagement, "collects"),
+                workflow_id,
+            ),
+        )
+        for group_key, workflow_ids in sorted(groups.items())
+    }
+
+
 def rank_candidates(
     query: str | ExpandedQuery,
     candidates: Sequence[WorkflowCandidate],
@@ -591,27 +682,22 @@ def rank_candidates(
     for workflow_id, key in duplicate_keys.items():
         if key is not None:
             groups[key].append(workflow_id)
-    representatives: dict[str, str] = {}
     for key, workflow_ids in groups.items():
         if len(workflow_ids) < 2:
             duplicate_keys[workflow_ids[0]] = None
-            continue
-        representatives[key] = min(
-            workflow_ids,
-            key=lambda workflow_id: (
-                -_count(details[workflow_id].candidate.engagement, "uses"),
-                -_count(details[workflow_id].candidate.engagement, "likes"),
-                -_count(details[workflow_id].candidate.engagement, "collects"),
-                workflow_id,
-                details[workflow_id].candidate.canonical_url,
-            ),
-        )
+    representatives = select_group_representatives(
+        plan,
+        ordered_details,
+        weights,
+        duplicate_keys,
+        graph_evidence=evidence_by_id,
+    )
     representative_ids = {
         workflow_id
         for workflow_id, key in duplicate_keys.items()
         if key is None
     } | set(representatives.values())
-    engagement_maxima = _engagement_maxima(ordered_details)
+    intrinsic = _intrinsic_scores(plan, ordered_details, weights, evidence_by_id)
     creator_scores = _creator_scores(
         tuple(
             detail
@@ -619,8 +705,6 @@ def rank_candidates(
             if detail.candidate.workflow_id in representative_ids
         )
     )
-    recency_scores = _recency_scores(ordered_details)
-
     raw: dict[str, dict[str, float]] = {}
     for detail in ordered_details:
         candidate = detail.candidate
@@ -630,17 +714,14 @@ def rank_candidates(
             or f"workflow:{candidate.workflow_id}"
         )
         raw[candidate.workflow_id] = {
-            "relevance": _relevance(plan, detail),
-            "engagement": _metric_score(candidate.engagement, engagement_maxima),
-            "output_evidence": _output_evidence(
-                detail,
-                evidence_by_id.get(candidate.workflow_id),
-            ),
-            "recency": recency_scores[candidate.workflow_id],
+            "relevance": intrinsic[candidate.workflow_id]["relevance"],
+            "engagement": intrinsic[candidate.workflow_id]["engagement"],
+            "output_evidence": intrinsic[candidate.workflow_id]["output_evidence"],
+            "recency": intrinsic[candidate.workflow_id]["recency"],
             "creator_track_record": creator_scores.get(creator, 0.0),
-            "experimentability": _experimentability(
-                detail, evidence_by_id.get(candidate.workflow_id)
-            ),
+            "experimentability": intrinsic[candidate.workflow_id][
+                "experimentability"
+            ],
             "novelty": 1.0,
         }
 

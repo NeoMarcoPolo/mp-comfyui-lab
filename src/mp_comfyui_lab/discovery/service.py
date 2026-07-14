@@ -25,6 +25,7 @@ from mp_comfyui_lab.discovery.ranking import (
     coarse_duplicate_group,
     load_default_ranking_weights,
     rank_candidates,
+    select_group_representatives,
 )
 from mp_comfyui_lab.discovery.urls import parse_runninghub_url
 from mp_comfyui_lab.executors.base import (
@@ -47,7 +48,10 @@ from mp_comfyui_lab.security import (
 
 DEFAULT_SORTS = ("", "REPUTATION", "HOTTEST", "NEWEST")
 MAX_DERIVATIONS = 16
-MAX_DERIVATION_LENGTH = 128
+MAX_DIAGNOSTIC_SAMPLE = 16
+# RunningHub accepts compact free-text searches; 512 keeps category evidence
+# representable while bounding every provider request and persisted model field.
+MAX_DERIVATION_LENGTH = 512
 
 BoundedText = Annotated[
     str,
@@ -65,14 +69,23 @@ DerivationText = Annotated[
 
 
 class DiscoveryNotFoundError(LookupError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        experiment_id: str | None = None,
+        artifacts: tuple[Artifact, ...] = (),
+    ) -> None:
+        super().__init__(sanitize_untrusted_diagnostic(message)[:512])
+        self.experiment_id = experiment_id
+        self.artifacts = artifacts
 
 
 class DiscoveryEvidenceError(ValueError):
     pass
 
 
-class DiscoveryIncompleteError(RuntimeError):
+class _ArtifactDiscoveryError(RuntimeError):
     def __init__(
         self,
         message: str,
@@ -88,6 +101,14 @@ class DiscoveryIncompleteError(RuntimeError):
         self.diagnostics = diagnostics
 
 
+class DiscoveryIncompleteError(_ArtifactDiscoveryError):
+    pass
+
+
+class DiscoveryExecutionError(_ArtifactDiscoveryError):
+    pass
+
+
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(
         frozen=True,
@@ -100,6 +121,7 @@ class _FrozenModel(BaseModel):
 class DerivationEvidence(_FrozenModel):
     source: BoundedText
     value: DerivationText
+    omitted_count: int = Field(default=0, ge=0, le=1_000_000)
 
 
 class DiscoveryAttempt(_FrozenModel):
@@ -112,6 +134,8 @@ class DiscoveryAttempt(_FrozenModel):
     workflow_id: str | None = None
     error_kind: str | None = None
     message: str | None = None
+    result_ids: tuple[BoundedText, ...] = Field(default=(), max_length=10_000)
+    artifact_paths: tuple[BoundedText, ...] = Field(default=(), max_length=64)
 
 
 class DiscoveryResult(_FrozenModel):
@@ -124,9 +148,11 @@ class DiscoveryResult(_FrozenModel):
     )
     artifacts: tuple[Artifact, ...] = ()
     incomplete: bool = False
+    diagnostic_count: int = Field(default=0, ge=0)
+    diagnostics_artifact: Artifact | None = None
     diagnostics: tuple[DiscoveryAttempt, ...] = Field(
         default=(),
-        max_length=1_024,
+        max_length=MAX_DIAGNOSTIC_SAMPLE,
     )
 
 
@@ -179,18 +205,24 @@ class _DiscoveryJournal:
         self.derivations = derivations
         self.requests: list[SearchRequest] = []
         self.pages: list[SearchPage] = []
-        self.attempts: list[DiscoveryAttempt] = []
+        self.attempt_count = 0
+        self.diagnostic_count = 0
+        self._diagnostics: list[DiscoveryAttempt] = []
         self.results: tuple[RankedWorkflow, ...] = ()
         self.status = "running"
         snapshot_path = service.store.root(experiment_id) / "search-results.json"
+        attempts_path = service.store.root(experiment_id) / "attempts.jsonl"
+        service.store.write_text(experiment_id, "attempts.jsonl", "")
+        self.diagnostics_artifact = Artifact(kind="attempts", path=str(attempts_path))
         self.artifacts: list[Artifact] = [
-            Artifact(kind="search", path=str(snapshot_path))
+            Artifact(kind="search", path=str(snapshot_path)),
+            self.diagnostics_artifact,
         ]
         self.checkpoint()
 
     @property
     def diagnostics(self) -> tuple[DiscoveryAttempt, ...]:
-        return tuple(item for item in self.attempts if item.status == "failed")
+        return tuple(self._diagnostics)
 
     def set_plan(
         self,
@@ -212,6 +244,8 @@ class _DiscoveryJournal:
         query: str | None = None,
         sort: str | None = None,
         workflow_id: str | None = None,
+        result_ids: Sequence[str] = (),
+        artifact_paths: Sequence[str] = (),
         error: Exception | None = None,
         error_kind: str | None = None,
         message: str | None = None,
@@ -229,29 +263,41 @@ class _DiscoveryJournal:
             sanitized_message = sanitize_untrusted_diagnostic(message)[:512]
             if not sanitized_message:
                 sanitized_message = f"{operation} failed"
-        self.attempts.append(
-            DiscoveryAttempt(
-                order=len(self.attempts) + 1,
-                timestamp=(
-                    self.service.clock()
-                    .astimezone(UTC)
-                    .isoformat()
-                    .replace("+00:00", "Z")
-                ),
-                operation=operation,
-                status=status,
-                query=query,
-                sort=sort,
-                workflow_id=workflow_id,
-                error_kind=sanitized_kind,
-                message=sanitized_message,
-            )
+        attempt = DiscoveryAttempt(
+            order=self.attempt_count + 1,
+            timestamp=(
+                self.service.clock()
+                .astimezone(UTC)
+                .isoformat()
+                .replace("+00:00", "Z")
+            ),
+            operation=operation,
+            status=status,
+            query=query,
+            sort=sort,
+            workflow_id=workflow_id,
+            error_kind=sanitized_kind,
+            message=sanitized_message,
+            result_ids=tuple(result_ids),
+            artifact_paths=tuple(artifact_paths),
         )
+        self.service.store.append_jsonl(
+            self.experiment_id,
+            "attempts.jsonl",
+            attempt.model_dump(mode="json"),
+        )
+        self.attempt_count += 1
+        if status == "failed":
+            self.diagnostic_count += 1
+            if len(self._diagnostics) < MAX_DIAGNOSTIC_SAMPLE:
+                self._diagnostics.append(attempt)
+
+    def phase(self) -> None:
         self.checkpoint()
 
     def finish(self, results: tuple[RankedWorkflow, ...]) -> None:
         self.results = results
-        self.status = "partial" if self.diagnostics else "complete"
+        self.status = "partial" if self.diagnostic_count else "complete"
         self.checkpoint()
 
     def fail(self) -> None:
@@ -279,24 +325,27 @@ class _DiscoveryJournal:
                 "derivations": [
                     item.model_dump(mode="json") for item in self.derivations
                 ],
-                "provider_requests": [
-                    item.model_dump(mode="json") for item in self.requests
-                ],
-                "provider_pages": [
-                    item.model_dump(mode="json") for item in self.pages
-                ],
-                "attempts": [
-                    item.model_dump(mode="json") for item in self.attempts
-                ],
-                "diagnostics": [
+                "provider_request_count": len(self.requests),
+                "provider_page_count": len(self.pages),
+                "attempt_count": self.attempt_count,
+                "diagnostic_count": self.diagnostic_count,
+                "diagnostics_artifact": self.diagnostics_artifact.path,
+                "diagnostics_sample": [
                     item.model_dump(mode="json") for item in self.diagnostics
                 ],
                 "results": [
-                    item.model_dump(mode="json") for item in self.results
+                    {
+                        "workflow_id": item.candidate.workflow_id,
+                        "url": item.candidate.canonical_url,
+                        "score": item.score,
+                    }
+                    for item in self.results[:100]
                 ],
+                "result_count": len(self.results),
                 "artifacts": [
                     item.model_dump(mode="json") for item in unique_artifacts
-                ],
+                ][:128],
+                "artifact_count": len(unique_artifacts),
             },
         )
 
@@ -334,13 +383,18 @@ class DiscoveryService:
             operation="search",
             query_plan=plan,
         )
-        return self._discover(
-            journal,
-            sort=sort,
-            page=page,
-            size=size,
-            include_graphs=include_graphs,
-        )
+        try:
+            return self._discover(
+                journal,
+                sort=sort,
+                page=page,
+                size=size,
+                include_graphs=include_graphs,
+            )
+        except (DiscoveryIncompleteError, DiscoveryExecutionError):
+            raise
+        except Exception as error:
+            raise self._terminal_error(journal, error) from error
 
     def inspect(self, url: str) -> InspectResult:
         parsed = parse_runninghub_url(url)
@@ -382,19 +436,50 @@ class DiscoveryService:
             initial_query=parsed.canonical_url,
         )
         try:
+            return self._similar_from_journal(
+                journal,
+                parsed.workflow_id,
+                parsed.canonical_url,
+                sort=sort,
+                page=page,
+                size=size,
+                include_graphs=include_graphs,
+            )
+        except (
+            DiscoveryIncompleteError,
+            DiscoveryExecutionError,
+            DiscoveryNotFoundError,
+        ):
+            raise
+        except Exception as error:
+            raise self._terminal_error(journal, error) from error
+
+    def _similar_from_journal(
+        self,
+        journal: _DiscoveryJournal,
+        workflow_id: str,
+        canonical_url: str,
+        *,
+        sort: str | None,
+        page: int,
+        size: int,
+        include_graphs: bool,
+    ) -> DiscoveryResult:
+        experiment_id = journal.experiment_id
+        try:
             source = self._inspect_into(
                 experiment_id,
                 WorkflowRef(
                     executor=self.executor.name,
-                    workflow_id=parsed.workflow_id,
-                    canonical_url=parsed.canonical_url,
+                    workflow_id=workflow_id,
+                    canonical_url=canonical_url,
                 ),
             )
         except Exception as error:
             journal.record(
                 "graph",
                 "failed",
-                workflow_id=parsed.workflow_id,
+                workflow_id=workflow_id,
                 error=error,
             )
             journal.fail()
@@ -409,17 +494,25 @@ class DiscoveryService:
             journal.record(
                 "graph",
                 "failed",
-                workflow_id=parsed.workflow_id,
+                workflow_id=workflow_id,
                 error_kind="GraphCanonicalizationError",
                 message=source.evidence.canonicalization_error,
+                artifact_paths=tuple(item.path for item in source.artifacts),
             )
         else:
-            journal.record("graph", "success", workflow_id=parsed.workflow_id)
+            journal.record(
+                "graph",
+                "success",
+                workflow_id=workflow_id,
+                artifact_paths=tuple(item.path for item in source.artifacts),
+            )
         derivations = self._derive_searches(source)
         if not derivations:
             journal.fail()
             raise DiscoveryNotFoundError(
-                f"workflow {parsed.workflow_id} has no derivable public capability evidence"
+                f"workflow {workflow_id} has no derivable public capability evidence",
+                experiment_id=experiment_id,
+                artifacts=self._unique_artifacts(journal.artifacts),
             )
         query_plan = self._derivation_query_plan(derivations)
         journal.set_plan(query_plan, derivations)
@@ -429,9 +522,23 @@ class DiscoveryService:
             page=page,
             size=size,
             include_graphs=include_graphs,
-            initial_enriched={parsed.workflow_id: source},
+            initial_enriched={workflow_id: source},
         )
         return discovered
+
+    def _terminal_error(
+        self,
+        journal: _DiscoveryJournal,
+        error: Exception,
+    ) -> DiscoveryExecutionError:
+        journal.fail()
+        message = sanitize_untrusted_diagnostic(str(error))[:384]
+        return DiscoveryExecutionError(
+            f"discovery execution failed: {message or type(error).__name__}",
+            experiment_id=journal.experiment_id,
+            artifacts=self._unique_artifacts(journal.artifacts),
+            diagnostics=journal.diagnostics,
+        )
 
     def _discover(
         self,
@@ -480,7 +587,17 @@ class DiscoveryService:
                     "success",
                     query=provider_query,
                     sort=provider_sort,
+                    result_ids=tuple(
+                        sorted(
+                            {
+                                candidate.workflow_id
+                                for candidate in page_result.records
+                            }
+                        )
+                    ),
                 )
+
+        journal.phase()
 
         if successful_searches == 0:
             journal.fail()
@@ -519,20 +636,42 @@ class DiscoveryService:
                     )
                     continue
                 details[workflow_id] = detail
-                journal.add_artifacts((self._persist_detail(experiment_id, detail),))
-                journal.record("detail", "success", workflow_id=workflow_id)
+                detail_artifact = self._persist_detail(experiment_id, detail)
+                journal.add_artifacts((detail_artifact,))
+                journal.record(
+                    "detail",
+                    "success",
+                    workflow_id=workflow_id,
+                    artifact_paths=(detail_artifact.path,),
+                )
 
+        journal.phase()
+
+        weights = load_default_ranking_weights(
+            self.config.ranking.model_dump(exclude_none=True)
+        )
         if include_graphs:
             graph_groups: dict[str, list[str]] = {}
             for workflow_id, detail in details.items():
                 group = coarse_duplicate_group(detail) or f"workflow:{workflow_id}"
                 graph_groups.setdefault(group, []).append(workflow_id)
+            group_keys = {
+                workflow_id: group
+                for group, workflow_ids in graph_groups.items()
+                for workflow_id in workflow_ids
+            }
+            selected = select_group_representatives(
+                query_plan,
+                tuple(details.values()),
+                weights,
+                group_keys,
+                graph_evidence=evidence,
+            )
             graph_representatives: list[str] = []
-            for workflow_ids in graph_groups.values():
-                workflow_ids = sorted(workflow_ids)
+            for group, workflow_ids in graph_groups.items():
                 if any(workflow_id in enriched_cache for workflow_id in workflow_ids):
                     continue
-                graph_representatives.append(workflow_ids[0])
+                graph_representatives.append(selected[group])
             for representative in sorted(graph_representatives):
                 try:
                     enriched = self._inspect_into(
@@ -568,17 +707,21 @@ class DiscoveryService:
                         workflow_id=representative,
                         error_kind="GraphCanonicalizationError",
                         message=enriched.evidence.canonicalization_error,
+                        artifact_paths=tuple(
+                            item.path for item in enriched.artifacts
+                        ),
                     )
                 else:
                     journal.record(
                         "graph",
                         "success",
                         workflow_id=representative,
+                        artifact_paths=tuple(
+                            item.path for item in enriched.artifacts
+                        ),
                     )
+            journal.phase()
 
-        weights = load_default_ranking_weights(
-            self.config.ranking.model_dump(exclude_none=True)
-        )
         ranked = rank_candidates(
             query_plan,
             tuple(merged.values()),
@@ -593,7 +736,9 @@ class DiscoveryService:
             results=ranked,
             derivations=journal.derivations,
             artifacts=self._unique_artifacts(journal.artifacts),
-            incomplete=bool(journal.diagnostics),
+            incomplete=journal.diagnostic_count > 0,
+            diagnostic_count=journal.diagnostic_count,
+            diagnostics_artifact=journal.diagnostics_artifact,
             diagnostics=journal.diagnostics,
         )
 
@@ -663,7 +808,7 @@ class DiscoveryService:
         source: _Enriched,
     ) -> tuple[DerivationEvidence, ...]:
         report = self.executor.inspect_capabilities(source.fetched)
-        candidates: list[tuple[str, str]] = []
+        candidates: list[tuple[str, str, int]] = []
         self._append_category(
             candidates,
             "model",
@@ -743,13 +888,19 @@ class DiscoveryService:
 
         unique: list[DerivationEvidence] = []
         seen_term_sets: set[frozenset[str]] = set()
-        for kind, raw_value in candidates:
+        for kind, raw_value, omitted_count in candidates:
             value = raw_value.strip()
             terms = frozenset(query_tokens(value))
             if not value or not terms or terms in seen_term_sets:
                 continue
             seen_term_sets.add(terms)
-            unique.append(DerivationEvidence(source=kind, value=value))
+            unique.append(
+                DerivationEvidence(
+                    source=kind,
+                    value=value,
+                    omitted_count=omitted_count,
+                )
+            )
         if len(unique) > 1:
             summary_tokens: list[str] = []
             for derivation in unique:
@@ -766,7 +917,7 @@ class DiscoveryService:
 
     @staticmethod
     def _append_category(
-        candidates: list[tuple[str, str]],
+        candidates: list[tuple[str, str, int]],
         category: str,
         values: Sequence[str],
     ) -> None:
@@ -780,9 +931,26 @@ class DiscoveryService:
                 unique.append(value)
         if not unique:
             return
-        combined = " ".join(unique)
-        DiscoveryService._require_derivation_length(category, combined)
-        candidates.append((category, combined))
+        included: list[str] = []
+        omitted_count = 0
+        for value in unique:
+            if len(value) > MAX_DERIVATION_LENGTH:
+                raise DiscoveryEvidenceError(
+                    f"{category} evidence item cannot be represented within "
+                    f"{MAX_DERIVATION_LENGTH} characters"
+                )
+            candidate = " ".join((*included, value))
+            if len(candidate) <= MAX_DERIVATION_LENGTH:
+                included.append(value)
+            else:
+                omitted_count += 1
+        combined = " ".join(included)
+        if not combined:
+            raise DiscoveryEvidenceError(
+                f"{category} evidence cannot be represented within "
+                f"{MAX_DERIVATION_LENGTH} characters"
+            )
+        candidates.append((category, combined, omitted_count))
 
     @staticmethod
     def _require_derivation_length(category: str, value: str) -> None:
@@ -821,7 +989,7 @@ class DiscoveryService:
                 continue
             seen_term_sets.add(term_set)
             expanded = expand_query(derivation.value)
-            queries.extend(expanded.queries)
+            queries.append(derivation.value)
             for record in expanded.expansions:
                 key = (record.concept, record.source.casefold())
                 if key not in expansion_keys:

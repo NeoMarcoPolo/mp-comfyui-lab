@@ -18,6 +18,7 @@ from mp_comfyui_lab.discovery.ranking import (
 )
 from mp_comfyui_lab.discovery.service import (
     DerivationEvidence,
+    DiscoveryExecutionError,
     DiscoveryNotFoundError,
     DiscoveryResult,
     InspectResult,
@@ -280,6 +281,33 @@ def test_cli_maps_incomplete_discovery_and_preserves_artifact_paths(capsys):
     ]
 
 
+def test_cli_maps_terminal_discovery_to_execution_with_artifacts(capsys):
+    service = FakeCliService()
+    artifacts = (
+        Artifact(kind="search", path="/tmp/failed-search-results.json"),
+        Artifact(kind="attempts", path="/tmp/attempts.jsonl"),
+    )
+    service.error = DiscoveryExecutionError(
+        "similar evidence cannot be represented",
+        experiment_id="similar-fixedid",
+        artifacts=artifacts,
+        diagnostics=(),
+    )
+
+    code = main(
+        ["similar", "https://www.runninghub.ai/post/1980860923768426497"],
+        service=service,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.EXECUTION
+    assert payload["error"]["kind"] == "execution"
+    assert payload["artifacts"] == [
+        {"kind": "search", "path": "/tmp/failed-search-results.json"},
+        {"kind": "attempts", "path": "/tmp/attempts.jsonl"},
+    ]
+
+
 def test_inspect_and_similar_cli_argument_wiring(capsys):
     service = FakeCliService()
     url = "https://www.runninghub.ai/post/1980860923768426497"
@@ -296,7 +324,7 @@ def test_inspect_and_similar_cli_argument_wiring(capsys):
     assert inspect_payload["data"]["url"] == url
     assert inspect_payload["data"]["source_hash"] == "a" * 64
     assert similar_payload["data"]["derivations"] == [
-        {"source": "model", "value": "qwen"}
+        {"source": "model", "value": "qwen", "omitted_count": 0}
     ]
     assert service.calls == [
         ("inspect", url, {}),

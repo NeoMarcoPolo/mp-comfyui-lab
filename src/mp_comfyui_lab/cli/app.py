@@ -12,6 +12,7 @@ from mp_comfyui_lab.config import LabConfig, LabConfigError
 from mp_comfyui_lab.discovery.query import QueryExpansionConfigError
 from mp_comfyui_lab.discovery.ranking import RankedWorkflow, RankingConfigError
 from mp_comfyui_lab.discovery.service import (
+    DiscoveryExecutionError,
     DiscoveryIncompleteError,
     DiscoveryNotFoundError,
     DiscoveryResult,
@@ -150,6 +151,12 @@ def _discovery_payload(result: DiscoveryResult) -> dict[str, object]:
             item.model_dump(mode="json") for item in result.derivations
         ],
         "incomplete": result.incomplete,
+        "diagnostic_count": result.diagnostic_count,
+        "diagnostics_artifact": (
+            result.diagnostics_artifact.model_dump(mode="json")
+            if result.diagnostics_artifact is not None
+            else None
+        ),
         "diagnostics": [
             item.model_dump(mode="json") for item in result.diagnostics
         ],
@@ -254,8 +261,21 @@ def main(
             [item.model_dump(mode="json") for item in error.artifacts],
         )
         return ExitCode.INCOMPLETE
+    except DiscoveryExecutionError as error:
+        emit_error(
+            parsed.command,
+            "execution",
+            sanitize_untrusted_diagnostic(str(error)),
+            [item.model_dump(mode="json") for item in error.artifacts],
+        )
+        return ExitCode.EXECUTION
     except DiscoveryNotFoundError as error:
-        emit_error(parsed.command, "not_found", sanitize_untrusted_diagnostic(str(error)))
+        emit_error(
+            parsed.command,
+            "not_found",
+            sanitize_untrusted_diagnostic(str(error)),
+            [item.model_dump(mode="json") for item in error.artifacts],
+        )
         return ExitCode.NOT_FOUND
     except (UnsupportedSourceError, SafetyError) as error:
         emit_error(parsed.command, "safety", sanitize_untrusted_diagnostic(str(error)))

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import json
 from math import isclose, isfinite, log1p
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from pydantic import ValidationError
@@ -32,6 +33,7 @@ from mp_comfyui_lab.discovery.ranking import (
     RankingWeights,
     load_default_ranking_weights,
     rank_candidates,
+    select_group_representatives,
 )
 from mp_comfyui_lab.discovery import ranking as ranking_module
 from mp_comfyui_lab.discovery import service as service_module
@@ -704,6 +706,75 @@ def test_coarse_duplicate_uses_ordered_models_and_sorted_node_inventory() -> Non
     assert "duplicate penalty" in by_id["402"].explanation
 
 
+def test_intrinsic_representative_prefers_exact_relevance_before_engagement() -> None:
+    relevant = _candidate("403", name="Next Scene workflow", uses=1, covers=False)
+    popular = _candidate("404", name="Unrelated Qwen workflow", uses=100, covers=False)
+    details = {
+        candidate.workflow_id: _detail(
+            candidate,
+            used_models=("shared-model",),
+            primitive_nodes=("KSampler",),
+        )
+        for candidate in (relevant, popular)
+    }
+    group_keys = {"403": "coarse:shared", "404": "coarse:shared"}
+    plan = expand_query("next scene")
+    weights = load_default_ranking_weights()
+
+    selected = select_group_representatives(
+        plan,
+        tuple(reversed(tuple(details.values()))),
+        weights,
+        group_keys,
+    )
+    ranked = rank_candidates(
+        plan,
+        (popular, relevant),
+        details,
+        weights,
+    )
+    reversed_ranked = rank_candidates(
+        plan,
+        (relevant, popular),
+        dict(reversed(tuple(details.items()))),
+        weights,
+    )
+
+    assert selected == {"coarse:shared": "403"}
+    assert {item.candidate.workflow_id: item.components.penalty for item in ranked} == {
+        "403": 0.0,
+        "404": 1.0,
+    }
+    assert [item.candidate.workflow_id for item in ranked] == [
+        item.candidate.workflow_id for item in reversed_ranked
+    ]
+
+
+def test_graph_enrichment_uses_ranking_intrinsic_representative(tmp_path: Path) -> None:
+    relevant = _candidate("405", name="Next Scene workflow", uses=1, covers=False)
+    popular = _candidate("406", name="Unrelated Qwen workflow", uses=100, covers=False)
+    details = {
+        candidate.workflow_id: _detail(
+            candidate,
+            used_models=("shared-model",),
+            primitive_nodes=("KSampler",),
+        )
+        for candidate in (relevant, popular)
+    }
+    executor = FakeDiscoveryExecutor((popular, relevant), details)
+
+    result = _service(tmp_path, executor).search(
+        "next scene",
+        sort="HOTTEST",
+        include_graphs=True,
+    )
+
+    assert [item.workflow_id for item in executor.fetch_calls] == ["405"]
+    by_id = {item.candidate.workflow_id: item for item in result.results}
+    assert by_id["405"].components.penalty == 0.0
+    assert by_id["406"].components.penalty == 1.0
+
+
 def test_creator_track_record_counts_each_duplicate_group_once() -> None:
     representative = _candidate(
         "4100",
@@ -1117,10 +1188,12 @@ def test_discovery_one_sort_failure_returns_partial_with_durable_attempts(
 
     result = _service(tmp_path, executor).search("qwen")
 
-    assert observed_checkpoints[0]["attempts"] == []
+    assert observed_checkpoints[0]["attempt_count"] == 0
     assert result.incomplete is True
     assert len(result.results) == 2
     assert len(result.diagnostics) == 1
+    assert result.diagnostic_count == 1
+    assert result.diagnostics_artifact.kind == "attempts"
     failure = result.diagnostics[0]
     assert (failure.operation, failure.status, failure.sort) == (
         "search",
@@ -1133,8 +1206,13 @@ def test_discovery_one_sort_failure_returns_partial_with_durable_attempts(
     snapshot = json.loads(expected_snapshot.read_text(encoding="utf-8"))
     assert snapshot["status"] == "partial"
     assert snapshot["incomplete"] is True
-    assert len(snapshot["attempts"]) == 6
-    assert [item["order"] for item in snapshot["attempts"]] == list(range(1, 7))
+    assert snapshot["attempt_count"] == 6
+    assert snapshot["diagnostic_count"] == 1
+    assert "attempts" not in snapshot
+    attempts_path = Path(result.diagnostics_artifact.path)
+    attempts = [json.loads(line) for line in attempts_path.read_text().splitlines()]
+    assert [item["order"] for item in attempts] == list(range(1, 7))
+    assert attempts[0]["result_ids"] == [NEXT_SCENE_ID, QWEN_ID]
 
 
 def test_discovery_detail_failure_skips_candidate_with_diagnostic(
@@ -1230,16 +1308,97 @@ def test_discovery_all_search_failures_raise_incomplete_with_artifact(
 
     error = raised.value
     assert error.experiment_id == "search-20260203t040506z-fixedid"
-    assert len(error.artifacts) == 1
-    snapshot = Path(error.artifacts[0].path)
+    assert {item.kind for item in error.artifacts} == {"search", "attempts"}
+    snapshot = next(Path(item.path) for item in error.artifacts if item.kind == "search")
+    attempts_path = next(
+        Path(item.path) for item in error.artifacts if item.kind == "attempts"
+    )
     payload = json.loads(snapshot.read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
     assert payload["incomplete"] is True
     assert payload["results"] == []
-    assert len(payload["attempts"]) == 4
-    assert {item["status"] for item in payload["attempts"]} == {"failed"}
+    assert payload["attempt_count"] == 4
+    assert payload["diagnostic_count"] == 4
+    attempts = [json.loads(line) for line in attempts_path.read_text().splitlines()]
+    assert {item["status"] for item in attempts} == {"failed"}
     assert "provider-secret" not in snapshot.read_text(encoding="utf-8")
     assert executor.detail_calls == []
+
+
+def test_discovery_attempt_journal_is_linear_for_400_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = tuple(
+        _candidate(str(20_000 + index), name=f"candidate {index}", covers=False)
+        for index in range(400)
+    )
+    details = {item.workflow_id: _detail(item) for item in candidates}
+    executor = FakeDiscoveryExecutor(tuple(reversed(candidates)), details)
+    service = _service(tmp_path, executor)
+    snapshot_writes = 0
+    original_write_json = service.store.write_json
+
+    def count_snapshot_writes(experiment_id, relative_path, value):
+        nonlocal snapshot_writes
+        if Path(relative_path) == Path("search-results.json"):
+            snapshot_writes += 1
+        return original_write_json(experiment_id, relative_path, value)
+
+    monkeypatch.setattr(service.store, "write_json", count_snapshot_writes)
+    started = perf_counter()
+
+    result = service.search("candidate", sort="HOTTEST", size=100)
+
+    elapsed = perf_counter() - started
+    attempts_path = Path(result.diagnostics_artifact.path)
+    attempts = [json.loads(line) for line in attempts_path.read_text().splitlines()]
+    assert elapsed < 30.0
+    assert snapshot_writes <= 5
+    assert len(attempts) == 401
+    assert attempts[0]["operation"] == "search"
+    assert len(attempts[0]["result_ids"]) == 400
+    assert all(item["artifact_paths"] for item in attempts[1:])
+    assert len(result.results) == 400
+
+
+def test_thousands_of_detail_failures_have_authoritative_bounded_diagnostics(
+    tmp_path: Path,
+) -> None:
+    candidates = tuple(
+        _candidate(str(30_000 + index), name=f"failure {index}", covers=False)
+        for index in range(2_000)
+    )
+    details = {item.workflow_id: _detail(item) for item in candidates}
+    errors = {
+        item.workflow_id: RuntimeError(
+            f"detail {item.workflow_id} failed auth_token=provider-secret"
+        )
+        for item in candidates
+    }
+    executor = FakeDiscoveryExecutor(candidates, details, detail_errors=errors)
+
+    result = _service(tmp_path, executor).search(
+        "failure",
+        sort="HOTTEST",
+        size=100,
+    )
+
+    assert result.incomplete is True
+    assert result.results == ()
+    assert result.diagnostic_count == 2_000
+    assert 0 < len(result.diagnostics) <= 16
+    attempts_path = Path(result.diagnostics_artifact.path)
+    attempts = [json.loads(line) for line in attempts_path.read_text().splitlines()]
+    assert len(attempts) == 2_001
+    assert sum(item["status"] == "failed" for item in attempts) == 2_000
+    snapshot = next(Path(item.path) for item in result.artifacts if item.kind == "search")
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert payload["diagnostic_count"] == 2_000
+    assert payload["attempt_count"] == 2_001
+    assert len(payload["diagnostics_sample"]) <= 16
+    assert payload["diagnostics_artifact"] == str(attempts_path)
+    assert "provider-secret" not in attempts_path.read_text(encoding="utf-8")
 
 
 def test_service_persists_sanitized_search_and_detail_without_graph(
@@ -1371,8 +1530,10 @@ def test_inspect_persists_secret_safe_graph_with_reproducible_hashes(
             "class_type": "RemoteModel",
             "inputs": {
                 "endpoint": (
-                    "https://models.example/base?revision=1&format=fp16&"
-                    "X-Amz-Credential=aws-secret&X-Amz-Signature=aws-signature"
+                    "https://alice:authority-secret@[2001:db8::1]:8443/base"
+                    "?revision=1&format=fp16&X-Amz-Credential=aws-secret&"
+                    "X-Amz-Signature=aws-signature#section=weights&"
+                    "auth_token=fragment-secret"
                 ),
                 "password": "password-secret",
                 "auth_token": "auth-secret",
@@ -1408,6 +1569,10 @@ def test_inspect_persists_secret_safe_graph_with_reproducible_hashes(
     assert "revision=1&format=fp16" in paths["graph.json"].read_text(
         encoding="utf-8"
     )
+    assert (
+        persisted_graph["1"]["inputs"]["endpoint"]
+        == "https://[2001:db8::1]:8443/base?revision=1&format=fp16#section=weights"
+    )
     assert "A secret garden, preserve this ordinary prompt text" in serialized_artifacts
     for secret in (
         "password-secret",
@@ -1415,6 +1580,9 @@ def test_inspect_persists_secret_safe_graph_with_reproducible_hashes(
         "api-secret",
         "aws-secret",
         "aws-signature",
+        "authority-secret",
+        "fragment-secret",
+        "alice",
         "X-Amz-Credential",
         "X-Amz-Signature",
     ):
@@ -1484,7 +1652,11 @@ def test_similar_many_evidence_items_stays_category_bounded(
     source = _candidate(
         "1085",
         name="source",
-        tags=tuple(f"tag{index}" for index in range(10)),
+        tags=(
+            "next scene",
+            "multi angle",
+            *(f"tag{index}" for index in range(40)),
+        ),
         covers=False,
     )
     models = tuple(f"model{index}.safetensors" for index in range(10))
@@ -1494,7 +1666,6 @@ def test_similar_many_evidence_items_stays_category_bounded(
 
     result = _service(tmp_path, executor).similar(
         "https://www.runninghub.ai/post/1085",
-        sort="HOTTEST",
     )
 
     assert [item.source for item in result.derivations] == [
@@ -1505,23 +1676,77 @@ def test_similar_many_evidence_items_stays_category_bounded(
         "capability_role",
         "summary",
     ]
-    assert len(executor.search_calls) == 6
+    assert len(executor.search_calls) == 24
     assert len(result.query_plan.queries) == 6
-    assert len({call.query.casefold() for call in executor.search_calls}) == 6
-    assert all(len(call.query) <= 128 for call in executor.search_calls)
+    assert len({(call.query.casefold(), call.sort) for call in executor.search_calls}) == 24
+    assert {item.concept for item in result.query_plan.expansions} >= {
+        "next_scene",
+        "multi_angle",
+    }
+    assert all(call.query in result.query_plan.source_queries for call in executor.search_calls)
+    assert all(len(call.query) <= 512 for call in executor.search_calls)
+    assert len(executor.detail_calls) <= len({item.workflow_id for item in executor.candidates})
 
 
-def test_similar_overlong_category_evidence_fails_before_search(tmp_path: Path) -> None:
+def test_similar_accepts_provider_safe_140_character_model_name(tmp_path: Path) -> None:
     source = _candidate("1086", name="source", covers=False)
     detail = _detail(source, used_models=(f"{'x' * 140}.safetensors",))
     executor = FakeDiscoveryExecutor((source,), {"1086": detail})
 
-    with pytest.raises(service_module.DiscoveryEvidenceError, match="model"):
+    result = _service(tmp_path, executor).similar(
+        "https://www.runninghub.ai/post/1086",
+        sort="HOTTEST",
+    )
+
+    model_query = next(item for item in result.derivations if item.source == "model")
+    assert len(model_query.value) == 140
+    assert model_query.omitted_count == 0
+    assert model_query.value in {item.query for item in executor.search_calls}
+
+
+def test_similar_fits_large_categories_and_records_omitted_evidence(
+    tmp_path: Path,
+) -> None:
+    source = _candidate(
+        "1087",
+        name="source",
+        tags=tuple(f"tag-{index:03d}-{'x' * 20}" for index in range(100)),
+        covers=False,
+    )
+    executor = FakeDiscoveryExecutor((source,), {"1087": _detail(source)})
+
+    result = _service(tmp_path, executor).similar(
+        "https://www.runninghub.ai/post/1087",
+        sort="HOTTEST",
+    )
+
+    tag_query = next(item for item in result.derivations if item.source == "tag")
+    assert len(tag_query.value) <= 512
+    assert tag_query.omitted_count > 0
+    assert [call.query for call in executor.search_calls].count(tag_query.value) == 1
+
+
+def test_similar_unrepresentable_evidence_fails_terminally_with_artifacts(
+    tmp_path: Path,
+) -> None:
+    source = _candidate("1088", name="source", covers=False)
+    detail = _detail(source, used_models=(f"{'x' * 513}.safetensors",))
+    executor = FakeDiscoveryExecutor((source,), {"1088": detail})
+
+    with pytest.raises(service_module.DiscoveryExecutionError) as raised:
         _service(tmp_path, executor).similar(
-            "https://www.runninghub.ai/post/1086",
+            "https://www.runninghub.ai/post/1088",
             sort="HOTTEST",
         )
 
+    error = raised.value
+    assert error.experiment_id == "similar-20260203t040506z-fixedid"
+    assert {item.kind for item in error.artifacts} >= {"search", "attempts"}
+    snapshot = next(Path(item.path) for item in error.artifacts if item.kind == "search")
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["incomplete"] is True
+    assert payload["attempt_count"] == 1
     assert executor.search_calls == []
 
 

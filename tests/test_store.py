@@ -194,6 +194,61 @@ def test_graph_persistence_sanitizer_redacts_credentials_and_keeps_material_quer
     assert "aws-secret" in graph["1"]["inputs"]["aws_url"]
 
 
+def test_graph_persistence_sanitizer_removes_url_authority_and_fragment_secrets():
+    graph = {
+        "direct": (
+            "https://alice:password-secret@[2001:db8::1]:8443/model"
+            "?revision=1&access_token=query-secret"
+            "#section=weights&password=fragment-secret&format=fp16"
+        ),
+        "embedded": (
+            "load https://bob:authority-secret@models.example/base"
+            "?revision=1#tab=files&auth_token=fragment-token now"
+        ),
+        "malformed_material": "https://models.example:notaport/base?revision=1",
+        "malformed_secret": (
+            "https://models.example:notaport/base?revision=1&access_token=hidden"
+        ),
+        "encoded_fragment": (
+            "https://models.example/base?revision=1"
+            "#access_token%3Dencoded-secret%26section%3Dweights"
+        ),
+    }
+
+    sanitized = security_module.sanitize_graph_for_persistence(graph)
+
+    assert sanitized == {
+        "direct": (
+            "https://[2001:db8::1]:8443/model?revision=1"
+            "#section=weights&format=fp16"
+        ),
+        "embedded": (
+            "load https://models.example/base?revision=1#tab=files now"
+        ),
+        "malformed_material": "https://models.example:notaport/base?revision=1",
+        "malformed_secret": "https://models.example:notaport/base?revision=1",
+        "encoded_fragment": (
+            "https://models.example/base?revision=1#section=weights"
+        ),
+    }
+    serialized = json.dumps(sanitized, sort_keys=True)
+    for secret in (
+        "alice",
+        "password-secret",
+        "query-secret",
+        "fragment-secret",
+        "bob",
+        "authority-secret",
+        "fragment-token",
+        "hidden",
+        "encoded-secret",
+        "access_token",
+        "auth_token",
+    ):
+        assert secret not in serialized
+    assert security_module.sanitize_graph_for_persistence(sanitized) == sanitized
+
+
 def test_sanitize_for_persistence_strips_any_http_url_query():
     value = {
         "outputUrl": (
@@ -665,6 +720,66 @@ def test_write_json_persists_unicode_sorted_and_with_trailing_newline(tmp_path):
         '{\n  "a": "日本語",\n  "z": "café"\n}\n'
     )
     assert not list(destination.parent.glob("*.tmp"))
+
+
+def test_append_jsonl_is_sanitized_bounded_and_concurrency_safe(tmp_path):
+    store = ExperimentStore(tmp_path)
+    store.create("journal-001")
+
+    def append(index: int) -> None:
+        store.append_jsonl(
+            "journal-001",
+            "attempts.jsonl",
+            {
+                "order": index,
+                "message": f"attempt {index} apiKey=inline-secret",
+                "auth_token": "mapping-secret",
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(append, range(200)))
+
+    destination = tmp_path / "journal-001" / "attempts.jsonl"
+    content = destination.read_text(encoding="utf-8")
+    records = [json.loads(line) for line in content.splitlines()]
+    assert content.endswith("\n")
+    assert len(records) == 200
+    assert {item["order"] for item in records} == set(range(200))
+    assert {item["auth_token"] for item in records} == {"[REDACTED]"}
+    assert "mapping-secret" not in content
+
+
+def test_append_jsonl_interrupted_write_leaves_existing_lines_parseable(
+    tmp_path,
+    monkeypatch,
+):
+    store = ExperimentStore(tmp_path)
+    store.create("journal-002")
+    destination = store.append_jsonl(
+        "journal-002",
+        "attempts.jsonl",
+        {"order": 1, "status": "success"},
+    )
+    original_write = store_module.os.write
+
+    def short_write(descriptor, value):
+        written = original_write(descriptor, value[:5])
+        assert written == 5
+        return written
+
+    monkeypatch.setattr(store_module.os, "write", short_write)
+
+    with pytest.raises(OSError, match="incomplete JSONL append"):
+        store.append_jsonl(
+            "journal-002",
+            "attempts.jsonl",
+            {"order": 2, "status": "failed"},
+        )
+
+    assert [json.loads(line) for line in destination.read_text().splitlines()] == [
+        {"order": 1, "status": "success"}
+    ]
 
 
 def test_write_text_creates_parent_directories_atomically(tmp_path):

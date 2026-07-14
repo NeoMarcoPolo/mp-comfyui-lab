@@ -2,7 +2,7 @@ import json
 import re
 from typing import Any
 import unicodedata
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 
 CANONICAL_SECRET_KEYS = frozenset(
@@ -268,28 +268,82 @@ def _sanitize_graph_url(value: str) -> str:
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return value
+        return REDACTED if _unparseable_graph_url_has_secret(value) else value
     if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
         return value
     try:
         query_items = parse_qsl(parsed.query, keep_blank_values=True)
     except ValueError:
-        return _strip_url_query(value)
+        return REDACTED if parsed.username is not None else _strip_url_query(value)
     rejected = authentication_query_keys(query_items)
     retained = [
         (key, _sanitize_graph_url(item) if HTTP_URL_START.match(item) else item)
         for key, item in query_items
         if canonical_security_key(key) not in rejected
     ]
+    fragment = _sanitize_graph_fragment(parsed.fragment)
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        if parsed.username is not None:
+            return REDACTED
+        if not rejected and fragment == parsed.fragment:
+            return value
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                urlencode(retained, doseq=True),
+                fragment,
+            )
+        )
+    if hostname is None:
+        return REDACTED if parsed.username is not None else value
+    authority = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        authority = f"{authority}:{port}"
     return urlunsplit(
         (
             parsed.scheme,
-            parsed.netloc,
+            authority,
             parsed.path,
             urlencode(retained, doseq=True),
-            parsed.fragment,
+            fragment,
         )
     )
+
+
+def _unparseable_graph_url_has_secret(value: str) -> bool:
+    authority = value.partition("://")[2].split("/", 1)[0]
+    if "@" in authority:
+        return True
+    return any(
+        _is_secret_key(match.group("key"))
+        for match in DIAGNOSTIC_ASSIGNMENT_START.finditer(value)
+    )
+
+
+def _sanitize_graph_fragment(value: str) -> str:
+    if not value:
+        return value
+    value = unquote(value)
+    if HTTP_URL_START.match(value):
+        return _sanitize_graph_text(value)
+    if "=" not in value:
+        return _redact_diagnostic_assignments(_sanitize_graph_text(value))
+    try:
+        items = parse_qsl(value, keep_blank_values=True)
+    except ValueError:
+        return _redact_diagnostic_assignments(_sanitize_graph_text(value))
+    rejected = authentication_query_keys(items)
+    retained = [
+        (key, _sanitize_graph_url(item) if HTTP_URL_START.match(item) else item)
+        for key, item in items
+        if canonical_security_key(key) not in rejected
+    ]
+    return urlencode(retained, doseq=True)
 
 
 def _sanitize_graph_text(value: str) -> str:

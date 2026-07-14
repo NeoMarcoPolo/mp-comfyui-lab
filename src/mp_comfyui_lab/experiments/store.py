@@ -3,17 +3,20 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 from typing import Any
 
 from mp_comfyui_lab.security import (
     SafetyError,
     safe_filename,
     sanitize_for_persistence,
+    sanitize_untrusted_diagnostic,
 )
 
 
 EXPERIMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
 MAX_EXPERIMENT_ID_LENGTH = 96
+MAX_JSONL_RECORD_BYTES = 131_072
 WINDOWS_MOUNT_POINT_REPARSE_TAG = 0xA0000003
 EXPERIMENT_DIRECTORIES = (
     "sources",
@@ -30,6 +33,8 @@ EXPERIMENT_DIRECTORIES = (
 class ExperimentStore:
     def __init__(self, root: Path) -> None:
         self._store_root = Path(root).resolve()
+        self._append_locks: dict[Path, threading.Lock] = {}
+        self._append_locks_guard = threading.Lock()
 
     def root(self, experiment_id: str) -> Path:
         self._validate_experiment_id(experiment_id)
@@ -92,6 +97,64 @@ class ExperimentStore:
     ) -> Path:
         destination = self._artifact_path(experiment_id, relative_path)
         return self._write_json_value(destination, value)
+
+    def append_jsonl(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+        value: Any,
+    ) -> Path:
+        destination = self._artifact_path(experiment_id, relative_path)
+        sanitized = self._sanitize_jsonl_value(sanitize_for_persistence(value))
+        serialized = json.dumps(
+            sanitized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+        encoded = f"{serialized}\n".encode("utf-8")
+        if len(encoded) > MAX_JSONL_RECORD_BYTES:
+            raise SafetyError(
+                f"JSONL record exceeds {MAX_JSONL_RECORD_BYTES} byte limit"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination = self._artifact_path(experiment_id, relative_path)
+        with self._append_lock(destination):
+            flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+            flags |= getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(destination, flags, 0o600)
+            try:
+                start = os.lseek(descriptor, 0, os.SEEK_END)
+                try:
+                    written = os.write(descriptor, encoded)
+                    if written != len(encoded):
+                        raise OSError("incomplete JSONL append")
+                    os.fsync(descriptor)
+                except BaseException:
+                    os.ftruncate(descriptor, start)
+                    os.fsync(descriptor)
+                    raise
+            finally:
+                os.close(descriptor)
+        return destination
+
+    def _append_lock(self, destination: Path) -> threading.Lock:
+        with self._append_locks_guard:
+            return self._append_locks.setdefault(destination, threading.Lock())
+
+    @classmethod
+    def _sanitize_jsonl_value(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: cls._sanitize_jsonl_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._sanitize_jsonl_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._sanitize_jsonl_value(item) for item in value)
+        if isinstance(value, str):
+            return sanitize_untrusted_diagnostic(value)
+        return value
 
     def _write_json_value(self, destination: Path, value: Any) -> Path:
         serialized = json.dumps(
