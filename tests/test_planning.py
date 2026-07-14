@@ -42,8 +42,11 @@ from mp_comfyui_lab.mutations import (
     SemanticPatch,
     SetRoleInput,
 )
-from mp_comfyui_lab.mutations.planner import validate_candidate_patch
-from mp_comfyui_lab.mutations.planner import compile_observed_candidates
+from mp_comfyui_lab.mutations.planner import (
+    classify_graph_dimension_changes,
+    compile_observed_candidates,
+    validate_candidate_patch,
+)
 from mp_comfyui_lab.graph.patch import materialize_variant
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph
@@ -136,6 +139,58 @@ def _lora_stack_graph(
         previous_node_id = str(index)
     graph["6"]["inputs"]["model"] = [previous_node_id, 0]
     return graph
+
+
+def test_graph_dimension_changes_preserve_known_checkpoint_and_lora_deltas() -> None:
+    checkpoint_before = _graph()
+    checkpoint_after = json.loads(json.dumps(checkpoint_before))
+    checkpoint_after["4"]["inputs"]["ckpt_name"] = "revised.safetensors"
+    lora_before = _lora_stack_graph((("old.safetensors", 1.0, 1.0),))
+    lora_after = _lora_stack_graph((("new.safetensors", 1.0, 1.0),))
+
+    assert classify_graph_dimension_changes(
+        checkpoint_before,
+        checkpoint_after,
+    ) == ("checkpoint",)
+    assert classify_graph_dimension_changes(lora_before, lora_after) == (
+        "lora_stack",
+    )
+
+
+def test_graph_dimension_changes_mark_disconnected_custom_node_unclassified() -> None:
+    before = _graph()
+    after = json.loads(json.dumps(before))
+    after["4"]["inputs"]["ckpt_name"] = "revised.safetensors"
+    after["90"] = {
+        "class_type": "UnapprovedCustomNode",
+        "inputs": {"mode": "checkpoint"},
+    }
+
+    expected = ("checkpoint", "unclassified")
+    assert classify_graph_dimension_changes(before, after) == expected
+    assert classify_graph_dimension_changes(after, before) == expected
+
+
+@pytest.mark.parametrize("delta_kind", ["input", "topology"])
+def test_graph_dimension_changes_mark_mixed_unexplained_delta_unclassified(
+    delta_kind: str,
+) -> None:
+    before = _graph()
+    after = json.loads(json.dumps(before))
+    after["4"]["inputs"]["ckpt_name"] = "revised.safetensors"
+    if delta_kind == "input":
+        after["6"]["inputs"]["unapproved_mode"] = "experimental"
+    else:
+        after["90"] = {
+            "class_type": "UnapprovedCustomNode",
+            "inputs": {"mode": "experimental"},
+        }
+        after["6"]["inputs"]["unapproved_source"] = ["90", 0]
+
+    assert classify_graph_dimension_changes(before, after) == (
+        "checkpoint",
+        "unclassified",
+    )
 
 
 def _brief(**overrides: object) -> ExperimentBrief:

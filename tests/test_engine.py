@@ -4192,8 +4192,13 @@ def test_correction_outside_approved_dimensions_changes_hash_and_requires_reappr
     ) == []
 
 
+@pytest.mark.parametrize(
+    "delta_kind",
+    ["unapproved-sampler", "unclassified-node"],
+)
 def test_actual_unapproved_correction_dimension_requires_reapproval(
     tmp_path: Path,
+    delta_kind: str,
 ) -> None:
     config, original_plan = _persist_wave_plan(
         tmp_path,
@@ -4204,11 +4209,16 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
         coverage=(DimensionName.CHECKPOINT,),
     )
 
-    def graph(sampler: str) -> dict[str, object]:
-        return {
+    def graph(
+        sampler: str,
+        *,
+        checkpoint: str = "base.safetensors",
+        custom_node: bool = False,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
             "1": {
                 "class_type": "CheckpointLoaderSimple",
-                "inputs": {"ckpt_name": "base.safetensors"},
+                "inputs": {"ckpt_name": checkpoint},
             },
             "8": {
                 "class_type": "KSampler",
@@ -4224,6 +4234,12 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
                 "inputs": {"images": ["8", 0]},
             },
         }
+        if custom_node:
+            result["90"] = {
+                "class_type": "UnapprovedCustomNode",
+                "inputs": {"mode": "checkpoint"},
+            }
+        return result
 
     failed_draft = PlannedVariant.model_validate(
         {
@@ -4252,11 +4268,20 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
         original_plan.variants[1].execution_parameters
     )
     candidate_parameters["correction"] = correction
+    candidate_graph = (
+        graph("dpmpp_2m")
+        if delta_kind == "unapproved-sampler"
+        else graph(
+            "euler",
+            checkpoint="revised.safetensors",
+            custom_node=True,
+        )
+    )
     candidate_draft = PlannedVariant.model_validate(
         {
             **original_plan.variants[1].model_dump(mode="python"),
-            "materialized_graph": graph("dpmpp_2m"),
-            "capability_hash": graph_capability_hash(graph("dpmpp_2m")),
+            "materialized_graph": candidate_graph,
+            "capability_hash": graph_capability_hash(candidate_graph),
             "execution_parameters": candidate_parameters,
             "exact_run_hash": "0" * 64,
         }

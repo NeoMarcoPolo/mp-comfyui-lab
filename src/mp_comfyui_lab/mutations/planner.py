@@ -10,7 +10,7 @@ import json
 from typing import TYPE_CHECKING
 
 from mp_comfyui_lab.graph.hashing import capability_hash
-from mp_comfyui_lab.graph.models import SemanticRole
+from mp_comfyui_lab.graph.models import NormalizedGraph, SemanticRole
 from mp_comfyui_lab.graph.normalize import GraphNormalizationError, normalize_graph
 from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.mutations.models import (
@@ -56,6 +56,43 @@ _ROLE_DIMENSIONS = {
     SemanticRole.DIMENSIONS: "output_dimensions",
     SemanticRole.SEED: "seed_variance",
 }
+_GRAPH_DIMENSION_ROLES = {
+    DimensionName.CHECKPOINT: (
+        SemanticRole.CHECKPOINT,
+        SemanticRole.MODEL,
+        SemanticRole.UNET,
+    ),
+    DimensionName.LORA_STACK: (SemanticRole.LORA,),
+    DimensionName.LORA_STRENGTH: (SemanticRole.LORA,),
+    DimensionName.PROMPT_GRAMMAR: (
+        SemanticRole.PROMPT_SOURCE,
+        SemanticRole.PROMPT_FANOUT,
+    ),
+    DimensionName.SAMPLER: (SemanticRole.SAMPLER,),
+    DimensionName.SCHEDULER: (SemanticRole.SCHEDULER,),
+    DimensionName.ENCODER: (SemanticRole.ENCODER,),
+    DimensionName.REFERENCE_STRATEGY: (SemanticRole.REFERENCE_IMAGE,),
+    DimensionName.OUTPUT_DIMENSIONS: (
+        SemanticRole.DIMENSIONS,
+        SemanticRole.OUTPUT,
+    ),
+    DimensionName.SEED_VARIANCE: (SemanticRole.SEED,),
+}
+_MASKED_CLASS_BY_ROLE = {
+    SemanticRole.CHECKPOINT: "CheckpointLoaderSimple",
+    SemanticRole.MODEL: "CheckpointLoaderSimple",
+    SemanticRole.UNET: "CheckpointLoaderSimple",
+    SemanticRole.PROMPT_SOURCE: "CLIPTextEncode",
+    SemanticRole.PROMPT_FANOUT: "easy promptLine",
+    SemanticRole.SAMPLER: "KSampler",
+    SemanticRole.SCHEDULER: "KSampler",
+    SemanticRole.ENCODER: "CLIPTextEncode",
+    SemanticRole.REFERENCE_IMAGE: "LoadImage",
+    SemanticRole.DIMENSIONS: "EmptyLatentImage",
+    SemanticRole.OUTPUT: "SaveImage",
+    SemanticRole.SEED: "KSampler",
+}
+_UNCLASSIFIED_DIMENSION = "unclassified"
 _TOPOLOGY_ROLES = {
     DimensionName.CHECKPOINT: (
         SemanticRole.CHECKPOINT,
@@ -627,7 +664,7 @@ def mutation_dimensions(mutation, source: PlanningSource) -> set[str] | None:
 def classify_graph_dimension_changes(
     before_graph: Mapping[str, object],
     after_graph: Mapping[str, object],
-) -> frozenset[DimensionName] | None:
+) -> tuple[str, ...] | None:
     """Return canonical semantic dimensions changed by two approved graphs."""
     try:
         before = normalize_graph(before_graph)
@@ -638,27 +675,9 @@ def classify_graph_dimension_changes(
         return None
 
     dimensions: set[DimensionName] = set()
-    role_dimensions = {
-        DimensionName.CHECKPOINT: (
-            SemanticRole.CHECKPOINT,
-            SemanticRole.MODEL,
-            SemanticRole.UNET,
-        ),
-        DimensionName.PROMPT_GRAMMAR: (
-            SemanticRole.PROMPT_SOURCE,
-            SemanticRole.PROMPT_FANOUT,
-        ),
-        DimensionName.SAMPLER: (SemanticRole.SAMPLER,),
-        DimensionName.SCHEDULER: (SemanticRole.SCHEDULER,),
-        DimensionName.ENCODER: (SemanticRole.ENCODER,),
-        DimensionName.REFERENCE_STRATEGY: (SemanticRole.REFERENCE_IMAGE,),
-        DimensionName.OUTPUT_DIMENSIONS: (
-            SemanticRole.DIMENSIONS,
-            SemanticRole.OUTPUT,
-        ),
-        DimensionName.SEED_VARIANCE: (SemanticRole.SEED,),
-    }
-    for dimension, roles in role_dimensions.items():
+    for dimension, roles in _GRAPH_DIMENSION_ROLES.items():
+        if dimension in {DimensionName.LORA_STACK, DimensionName.LORA_STRENGTH}:
+            continue
         if _role_dimension_signature(before, roles) != _role_dimension_signature(
             after,
             roles,
@@ -670,9 +689,24 @@ def classify_graph_dimension_changes(
         _normalized_lora_effective_values(after),
     )
     if lora_dimensions is None:
-        return None
+        return (_UNCLASSIFIED_DIMENSION,)
     dimensions.update(DimensionName(item) for item in lora_dimensions)
-    return frozenset(dimensions) if dimensions else None
+    before_residual = _mask_recognized_graph_dimensions(before, dimensions)
+    after_residual = _mask_recognized_graph_dimensions(after, dimensions)
+    unexplained = before_residual is None or after_residual is None
+    if not unexplained:
+        try:
+            unexplained = capability_hash(before_residual) != capability_hash(
+                after_residual
+            )
+        except (GraphNormalizationError, ValueError):
+            unexplained = True
+    ordered = [
+        dimension.value for dimension in DimensionName if dimension in dimensions
+    ]
+    if unexplained:
+        ordered.append(_UNCLASSIFIED_DIMENSION)
+    return tuple(ordered)
 
 
 def _role_dimension_signature(
@@ -696,6 +730,106 @@ def _role_dimension_signature(
         for binding in graph.bindings(role)
     }
     return tuple(sorted(values))
+
+
+def _mask_recognized_graph_dimensions(
+    normalized: NormalizedGraph,
+    dimensions: set[DimensionName],
+) -> dict[str, object] | None:
+    graph: dict[str, object] = {
+        node.node_id: {
+            "class_type": node.class_type,
+            "inputs": thaw_json(node.inputs),
+        }
+        for node in normalized.nodes
+    }
+    if dimensions & {DimensionName.LORA_STACK, DimensionName.LORA_STRENGTH}:
+        if not _strip_lora_topology(graph, normalized):
+            return None
+
+    for dimension in DimensionName:
+        if dimension not in dimensions:
+            continue
+        for role in _GRAPH_DIMENSION_ROLES[dimension]:
+            if role is SemanticRole.LORA:
+                continue
+            for binding in normalized.bindings(role):
+                raw_node = graph.get(binding.node_id)
+                if not isinstance(raw_node, dict):
+                    continue
+                raw_node["class_type"] = _MASKED_CLASS_BY_ROLE[role]
+                if binding.field_name == "$class_type":
+                    continue
+                raw_inputs = raw_node.get("inputs")
+                if isinstance(raw_inputs, dict):
+                    raw_inputs[binding.field_name] = (
+                        f"__masked_{dimension.value}__"
+                    )
+    return graph
+
+
+def _strip_lora_topology(
+    graph: dict[str, object],
+    normalized: NormalizedGraph,
+) -> bool:
+    lora_node_ids = {
+        binding.node_id for binding in normalized.bindings(SemanticRole.LORA)
+    }
+    if not lora_node_ids:
+        return True
+
+    def resolve_link(
+        source_node_id: str,
+        output_index: int,
+        seen: frozenset[str] = frozenset(),
+    ) -> list[object] | None:
+        if source_node_id not in lora_node_ids:
+            return [source_node_id, output_index]
+        if source_node_id in seen:
+            return None
+        raw_node = graph.get(source_node_id)
+        if not isinstance(raw_node, dict):
+            return None
+        raw_inputs = raw_node.get("inputs")
+        if not isinstance(raw_inputs, dict):
+            return None
+        upstream_field = "model" if output_index == 0 else "clip" if output_index == 1 else None
+        upstream = raw_inputs.get(upstream_field) if upstream_field is not None else None
+        if not _is_graph_link(upstream):
+            return None
+        return resolve_link(
+            upstream[0],
+            upstream[1],
+            seen | {source_node_id},
+        )
+
+    for node_id, raw_node in graph.items():
+        if node_id in lora_node_ids or not isinstance(raw_node, dict):
+            continue
+        raw_inputs = raw_node.get("inputs")
+        if not isinstance(raw_inputs, dict):
+            return False
+        for field_name, value in tuple(raw_inputs.items()):
+            if not _is_graph_link(value) or value[0] not in lora_node_ids:
+                continue
+            resolved = resolve_link(value[0], value[1])
+            if resolved is None:
+                return False
+            raw_inputs[field_name] = resolved
+    for node_id in lora_node_ids:
+        graph.pop(node_id, None)
+    return True
+
+
+def _is_graph_link(value: object) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and isinstance(value[0], str)
+        and isinstance(value[1], int)
+        and not isinstance(value[1], bool)
+        and value[1] >= 0
+    )
 
 
 def _lora_effective_values(source: PlanningSource) -> tuple[tuple[str, float | None, float | None], ...]:

@@ -784,6 +784,10 @@ def _correction_dimension_conflict(
     )
     if actual is None or not actual:
         return True
-    if set(correction.changed_dimensions) != set(actual):
+    try:
+        actual_dimensions = {DimensionName(item) for item in actual}
+    except ValueError:
         return True
-    return approved is not None and not actual <= approved
+    if set(correction.changed_dimensions) != actual_dimensions:
+        return True
+    return approved is not None and not actual_dimensions <= approved
