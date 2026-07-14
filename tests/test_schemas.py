@@ -1,12 +1,16 @@
 import json
 import os
 from pathlib import Path
+import stat
+import subprocess
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 import mp_comfyui_lab.schemas as schema_module
 from mp_comfyui_lab.cli.app import ExitCode, main
+from mp_comfyui_lab.comparison.paths import path_component_is_link_or_junction
 from mp_comfyui_lab.schemas import (
     SchemaCheckError,
     check_schemas,
@@ -128,6 +132,34 @@ def test_export_restores_exact_prior_schema_set_after_publish_failure(
     }
 
 
+@pytest.mark.parametrize("failed_child", ("stage", "backup"))
+def test_export_cleans_transaction_root_when_child_creation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_child: str,
+) -> None:
+    output = tmp_path / "schemas"
+    paths = export_schemas(output)
+    prior = {path.name: path.read_bytes() for path in paths}
+    original_mkdir = Path.mkdir
+
+    def fail_child_creation(path: Path, *args, **kwargs) -> None:
+        if path.name == failed_child:
+            raise OSError(f"injected {failed_child} creation failure")
+        original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_child_creation)
+
+    with pytest.raises(OSError, match=f"injected {failed_child} creation failure"):
+        export_schemas(output)
+
+    assert {path.name for path in output.iterdir()} == set(prior)
+    assert {
+        path.name: path.read_bytes()
+        for path in output.iterdir()
+    } == prior
+
+
 def test_export_is_idempotent_and_leaves_only_the_complete_schema_set(
     tmp_path: Path,
 ) -> None:
@@ -140,6 +172,154 @@ def test_export_is_idempotent_and_leaves_only_the_complete_schema_set(
     assert second_paths == first_paths
     assert {path.name: path.read_bytes() for path in second_paths} == first_content
     assert {path.name for path in output.iterdir()} == SCHEMA_NAMES
+
+
+@pytest.mark.parametrize("operation", (export_schemas, check_schemas))
+def test_schema_operations_reject_symlink_target_without_mutation(
+    tmp_path: Path,
+    operation,
+) -> None:
+    output = tmp_path / "schemas"
+    output.mkdir()
+    target = tmp_path / "outside-brief.json"
+    target.write_bytes(b'{"outside":true}\n')
+    linked = output / "brief.schema.json"
+    try:
+        linked.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("file symlinks are not supported")
+    link_value = os.readlink(linked)
+
+    with pytest.raises(
+        schema_module.SchemaPublicationError,
+        match="link|reparse",
+    ):
+        operation(output)
+
+    assert linked.is_symlink()
+    assert os.readlink(linked) == link_value
+    assert target.read_bytes() == b'{"outside":true}\n'
+    assert {path.name for path in output.iterdir()} == {"brief.schema.json"}
+
+
+@pytest.mark.parametrize("operation", (export_schemas, check_schemas))
+def test_schema_operations_reject_symlinked_output_root_without_mutation(
+    tmp_path: Path,
+    operation,
+) -> None:
+    target = tmp_path / "outside-schemas"
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    linked = tmp_path / "schemas"
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("directory symlinks are not supported")
+    link_value = os.readlink(linked)
+
+    with pytest.raises(
+        schema_module.SchemaPublicationError,
+        match="link|reparse",
+    ):
+        operation(linked)
+
+    assert linked.is_symlink()
+    assert os.readlink(linked) == link_value
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert {path.name for path in target.iterdir()} == {"sentinel.txt"}
+
+
+@pytest.mark.parametrize("operation", (export_schemas, check_schemas))
+def test_schema_operations_reject_linked_output_ancestor_without_mutation(
+    tmp_path: Path,
+    operation,
+) -> None:
+    target = tmp_path / "outside-parent"
+    target.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    try:
+        linked_parent.symlink_to(target, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("directory symlinks are not supported")
+
+    with pytest.raises(
+        schema_module.SchemaPublicationError,
+        match="link|reparse",
+    ):
+        operation(linked_parent / "schemas")
+
+    assert linked_parent.is_symlink()
+    assert list(target.iterdir()) == []
+
+
+def test_path_helper_rejects_generic_windows_reparse_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "is_junction", None, raising=False)
+    monkeypatch.setattr(os.path, "isjunction", None, raising=False)
+    metadata = SimpleNamespace(
+        st_mode=stat.S_IFREG,
+        st_reparse_tag=0,
+        st_file_attributes=0x400,
+    )
+
+    assert path_component_is_link_or_junction(tmp_path / "reparse", metadata)
+
+
+@pytest.mark.parametrize("operation", (export_schemas, check_schemas))
+def test_schema_operations_reject_non_regular_target_without_mutation(
+    tmp_path: Path,
+    operation,
+) -> None:
+    output = tmp_path / "schemas"
+    output.mkdir()
+    non_regular = output / "brief.schema.json"
+    non_regular.mkdir()
+
+    with pytest.raises(
+        schema_module.SchemaPublicationError,
+        match="regular file",
+    ):
+        operation(output)
+
+    assert non_regular.is_dir()
+    assert list(non_regular.iterdir()) == []
+    assert {path.name for path in output.iterdir()} == {"brief.schema.json"}
+
+
+@pytest.mark.parametrize("operation", (export_schemas, check_schemas))
+def test_schema_operations_reject_windows_junction_output_root(
+    tmp_path: Path,
+    operation,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("directory junctions are Windows-specific")
+    target = tmp_path / "junction-target"
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    junction = tmp_path / "schemas-junction"
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("directory junctions are not supported")
+    try:
+        with pytest.raises(
+            schema_module.SchemaPublicationError,
+            match="link|reparse",
+        ):
+            operation(junction)
+
+        assert sentinel.read_text(encoding="utf-8") == "unchanged"
+        assert {path.name for path in target.iterdir()} == {"sentinel.txt"}
+    finally:
+        junction.rmdir()
 
 
 def test_check_waits_for_complete_schema_transaction(

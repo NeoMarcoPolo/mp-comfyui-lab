@@ -8,7 +8,11 @@ from typing import Literal
 
 
 _READ_CHUNK_BYTES = 1024 * 1024
-_WINDOWS_MOUNT_POINT_REPARSE_TAG = 0xA0000003
+_WINDOWS_REPARSE_ATTRIBUTE = getattr(
+    stat,
+    "FILE_ATTRIBUTE_REPARSE_POINT",
+    0x400,
+)
 
 
 def path_component_is_link_or_junction(
@@ -27,9 +31,12 @@ def path_component_is_link_or_junction(
     os_path_is_junction = getattr(os.path, "isjunction", None)
     if callable(os_path_is_junction) and os_path_is_junction(path):
         return True
-    return (
-        getattr(current, "st_reparse_tag", None)
-        == _WINDOWS_MOUNT_POINT_REPARSE_TAG
+    return bool(
+        getattr(current, "st_reparse_tag", 0)
+        or (
+            getattr(current, "st_file_attributes", 0)
+            & _WINDOWS_REPARSE_ATTRIBUTE
+        )
     )
 
 

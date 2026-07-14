@@ -107,7 +107,7 @@ class ExperimentEngine:
         self._executor_factory = executor_factory
         self._downloader = downloader
         self._sleep = sleep
-        self._now = now or (lambda: datetime.now(UTC))
+        self._now = now if now is not None else (lambda: datetime.now(UTC))
         if (
             isinstance(max_output_bytes, bool)
             or not isinstance(max_output_bytes, int)

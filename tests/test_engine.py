@@ -311,6 +311,46 @@ def _persist_plan_revision(
     return plan
 
 
+def test_engine_preserves_falsey_injected_clock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = datetime(2001, 2, 3, 4, 5, tzinfo=UTC)
+
+    class FalseyClock:
+        def __bool__(self) -> bool:
+            return False
+
+        def __call__(self) -> datetime:
+            return sentinel
+
+    class ForbiddenWallClock:
+        @staticmethod
+        def now(_timezone) -> datetime:
+            raise AssertionError(
+                "falsey injected clock triggered wall-clock fallback"
+            )
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    monkeypatch.setattr(engine_module, "datetime", ForbiddenWallClock)
+    config = LabConfig.model_validate(
+        {"experiments_root": tmp_path / "experiments"},
+        context={"base_dir": tmp_path},
+    )
+    clock = FalseyClock()
+
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: None,
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+        now=clock,
+    )
+
+    assert engine._now is clock
+    assert engine._now() == sentinel
+
+
 def test_wrong_approved_hash_has_zero_paid_calls_and_creates_no_run(
     tmp_path: Path,
 ) -> None:
