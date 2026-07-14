@@ -15,6 +15,7 @@ import unicodedata
 from urllib.parse import urlsplit
 
 from mp_runninghub_api.config import load_default_config
+from mp_runninghub_api.errors import RunningHubApiError
 from mp_runninghub_api.runninghub import (
     create_task,
     get_task_info,
@@ -23,7 +24,6 @@ from mp_runninghub_api.runninghub import (
     get_workflow_json,
 )
 from mp_runninghub_api.types import NodeInfo
-from mp_runninghub_api.upload import upload_file
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 import requests
 
@@ -73,6 +73,8 @@ SEARCH_ENDPOINT = "/api/search/workflow"
 DETAIL_ENDPOINT = "/api/portal/workflow/detail"
 GRAPH_ENDPOINT = "/api/openapi/getJsonApiFormat"
 PUBLIC_REQUEST_TIMEOUT = (10, 60)
+UPLOAD_ENDPOINT = f"{BASE_URL}/task/openapi/upload"
+UPLOAD_REQUEST_TIMEOUT = 300
 PROVIDER_NUMERIC_STRING_MAX_LENGTH = 64
 MAX_GRAPH_DEPTH = 256
 MAX_GRAPH_NODES = 100_000
@@ -117,6 +119,7 @@ _UPLOAD_MEDIA_TYPES = {
     "audio/ogg": "audio",
     "application/zip": "zip",
 }
+_UPLOAD_FILE_TYPES = frozenset(_UPLOAD_MEDIA_TYPES.values())
 _FIXTURE_PLACEHOLDER = re.compile(r"^fixture://([0-9]+)$")
 _PROVIDER_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$")
 _PAID_PROVIDER_STATES = {
@@ -142,6 +145,82 @@ _OUTPUT_MEDIA_TYPES = {
     "zip": "application/zip",
     **{media_type: media_type for media_type in _UPLOAD_MEDIA_TYPES},
 }
+
+
+def upload_file_bytes(
+    api_key: str | None,
+    content: bytes,
+    file_name: str,
+    file_type: str,
+    *,
+    timeout: int = UPLOAD_REQUEST_TIMEOUT,
+    session: requests.Session | None = None,
+) -> str:
+    """Upload immutable fixture bytes without reopening a local path."""
+    if not api_key:
+        try:
+            api_key = load_default_config().apiKey
+        except Exception as error:
+            raise RunningHubApiError(
+                "Upload credentials could not be loaded"
+            ) from error
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise RunningHubApiError("Upload credentials are missing an API key")
+    if type(content) is not bytes:
+        raise RunningHubApiError("Upload content must be immutable bytes")
+    try:
+        safe_name = safe_filename(file_name)
+    except SafetyError as error:
+        raise RunningHubApiError("Upload filename is unsafe") from error
+    if safe_name != safe_name.strip():
+        raise RunningHubApiError("Upload filename is unsafe")
+    if file_type not in _UPLOAD_FILE_TYPES:
+        raise RunningHubApiError("Upload file type is unsupported")
+
+    post = requests.post if session is None else session.post
+    try:
+        response = post(
+            UPLOAD_ENDPOINT,
+            data={"apiKey": api_key, "fileType": file_type},
+            files={"file": (safe_name, content)},
+            timeout=timeout,
+        )
+    except requests.RequestException:
+        raise RunningHubApiError("Upload request failed") from None
+
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        raise RunningHubApiError(
+            f"Upload returned non-JSON response (HTTP {response.status_code})"
+        ) from None
+    if not isinstance(payload, Mapping):
+        raise RunningHubApiError("Upload returned a malformed response")
+    if response.status_code != 200:
+        raise RunningHubApiError(
+            f"Upload failed: HTTP {response.status_code}"
+        )
+
+    code = payload.get("code")
+    if not (
+        (type(code) is int and code == 0)
+        or (type(code) is str and code == "0")
+    ):
+        raise RunningHubApiError("Upload API rejected the request")
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise RunningHubApiError("Upload response is missing data.fileName")
+    uploaded_name = data.get("fileName")
+    if (
+        not isinstance(uploaded_name, str)
+        or not uploaded_name.strip()
+        or uploaded_name != uploaded_name.strip()
+    ):
+        raise RunningHubApiError("Upload response is missing data.fileName")
+    try:
+        return safe_filename(uploaded_name)
+    except SafetyError as error:
+        raise RunningHubApiError("Upload returned an unsafe fileName") from error
 
 
 def _provider_aware_timestamp(value: str) -> str:
@@ -993,7 +1072,7 @@ class RunningHubExecutor(Executor):
         graph_fetcher: GraphFetcher | None = None,
         *,
         credential_loader: CredentialLoader = load_default_config,
-        upload_call: UploadCall = upload_file,
+        upload_call: UploadCall = upload_file_bytes,
         create_task_call: CreateTaskCall = create_task,
         status_call: StatusCall = get_task_status,
         info_call: InfoCall = get_task_info,
@@ -1362,8 +1441,10 @@ class RunningHubExecutor(Executor):
         errors, bindings = self._fixture_bindings(variant, fixtures)
         if errors:
             raise ExecutorError("RunningHub variant validation failed before submit")
-        for fixture in fixtures.items:
-            self._verify_fixture_snapshot(fixture)
+        approved_uploads = {
+            fixture.binding_index: self._read_fixture_snapshot(fixture)
+            for fixture in fixtures.items
+        }
         try:
             config = self._credential_loader()
         except Exception as error:
@@ -1377,16 +1458,16 @@ class RunningHubExecutor(Executor):
         for fixture in fixtures.items:
             node_id, field_name = bindings[fixture.binding_index]
             file_type = _UPLOAD_MEDIA_TYPES[fixture.media_type]
-            self._verify_fixture_snapshot(fixture)
+            content, file_name = approved_uploads[fixture.binding_index]
             try:
                 uploaded_name = self._upload_call(
                     api_key=None,
-                    file_path=str(fixture.path),
+                    content=content,
+                    file_name=file_name,
                     file_type=file_type,
                 )
             except Exception as error:
                 raise ExecutorError("RunningHub fixture upload failed") from error
-            self._verify_fixture_snapshot(fixture)
             if not isinstance(uploaded_name, str):
                 raise ExecutorError("RunningHub upload returned an invalid filename")
             uploaded_name = uploaded_name.strip()
@@ -1439,7 +1520,7 @@ class RunningHubExecutor(Executor):
         )
 
     @staticmethod
-    def _verify_fixture_snapshot(fixture: Any) -> None:
+    def _read_fixture_snapshot(fixture: Any) -> tuple[bytes, str]:
         try:
             descriptor = os.open(
                 fixture.path,
@@ -1454,10 +1535,12 @@ class RunningHubExecutor(Executor):
             if not stat.S_ISREG(before.st_mode):
                 raise ExecutorError("RunningHub fixture snapshot is not a regular file")
             digest = hashlib.sha256()
+            chunks: list[bytes] = []
             while True:
                 chunk = os.read(descriptor, 65_536)
                 if not chunk:
                     break
+                chunks.append(chunk)
                 digest.update(chunk)
             after = os.fstat(descriptor)
         finally:
@@ -1468,6 +1551,13 @@ class RunningHubExecutor(Executor):
             or digest.hexdigest() != fixture.sha256
         ):
             raise ExecutorError("RunningHub fixture snapshot failed integrity check")
+        try:
+            file_name = safe_filename(fixture.path.name)
+        except SafetyError as error:
+            raise ExecutorError(
+                "RunningHub fixture snapshot has an unsafe filename"
+            ) from error
+        return b"".join(chunks), file_name
 
     @staticmethod
     def _ambiguous_request_error(error: BaseException) -> bool:

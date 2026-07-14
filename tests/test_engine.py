@@ -8,7 +8,9 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
+from mp_runninghub_api.errors import RunningHubApiError
 import pytest
 
 from helpers import FakeExecutor
@@ -22,6 +24,7 @@ from mp_comfyui_lab.executors.base import (
     ValidationIssue,
     ValidationReport,
 )
+from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
 from mp_comfyui_lab.experiments.models import (
     ExperimentPlan,
     FixtureFingerprint,
@@ -463,6 +466,70 @@ def test_ambiguous_submission_is_incomplete_and_never_retried(
     assert persisted == record
 
 
+@pytest.mark.parametrize(
+    "create_result",
+    [
+        pytest.param(SimpleNamespace(taskStatus="QUEUED"), id="missing"),
+        pytest.param(
+            SimpleNamespace(taskId="", taskStatus="QUEUED"),
+            id="blank",
+        ),
+        pytest.param(
+            SimpleNamespace(taskId="None", taskStatus="QUEUED"),
+            id="none-string",
+        ),
+        pytest.param(
+            SimpleNamespace(taskId="malformed task", taskStatus="QUEUED"),
+            id="malformed",
+        ),
+    ],
+)
+def test_real_runninghub_invalid_task_id_is_durable_ambiguous_without_retry(
+    tmp_path: Path,
+    create_result: SimpleNamespace,
+) -> None:
+    config, plan = _persist_plan(tmp_path, with_fixture=True)
+    creates: list[str] = []
+
+    def create_task_call(**_kwargs):
+        creates.append("create")
+        return create_result
+
+    executor = RunningHubExecutor(
+        credential_loader=lambda: SimpleNamespace(apiKey="secret"),
+        upload_call=lambda **_kwargs: "uploaded.png",
+        create_task_call=create_task_call,
+        status_call=lambda **_kwargs: pytest.fail("ambiguous run polled"),
+        info_call=lambda **_kwargs: pytest.fail("ambiguous run fetched info"),
+        outputs_call=lambda **_kwargs: pytest.fail("ambiguous run collected"),
+    )
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert record.provider_task_id is None
+    assert thaw_json(record.error)["kind"] == "ambiguous_submission"
+    assert creates == ["create"]
+    persisted = (
+        config.experiments_root
+        / "plan-approved"
+        / "runs"
+        / f"{record.run_id}.json"
+    ).read_text(encoding="utf-8")
+    assert "ambiguous_submission" in persisted
+
+
 def test_submit_intent_recovers_crash_after_remote_return_without_resubmit(
     tmp_path: Path,
 ) -> None:
@@ -583,26 +650,44 @@ def test_resume_polls_existing_task_id_without_validation_or_submission(
 
 
 @pytest.mark.parametrize(
-    "state",
-    [RunState.SUCCESS, RunState.FAILED, RunState.CANCELLED],
+    ("state", "error"),
+    [
+        pytest.param(RunState.SUCCESS, None, id="success"),
+        pytest.param(RunState.FAILED, None, id="failed"),
+        pytest.param(RunState.CANCELLED, None, id="cancelled"),
+        pytest.param(
+            RunState.INCOMPLETE,
+            {"kind": "ambiguous_submission"},
+            id="ambiguous-incomplete",
+        ),
+        pytest.param(
+            RunState.INCOMPLETE,
+            {"kind": "output_count_mismatch"},
+            id="nonambiguous-incomplete",
+        ),
+    ],
 )
 def test_terminal_resume_is_read_only_without_executor(
     tmp_path: Path,
     state: RunState,
+    error: dict[str, str] | None,
 ) -> None:
     config, _ = _persist_plan(tmp_path)
+    error_kind = "none" if error is None else error["kind"]
     record = RunRecord(
-        run_id=f"run-terminal-{state.value.casefold()}",
+        run_id=f"run-terminal-{state.value.casefold()}-{error_kind}",
         experiment_id="plan-approved",
         variant_id="baseline",
         state=state,
         provider_task_id=(
             "provider-task-1"
             if state in {RunState.SUCCESS, RunState.CANCELLED}
+            or error_kind == "output_count_mismatch"
             else None
         ),
         expected_output_count=1,
         actual_output_count=1 if state is RunState.SUCCESS else 0,
+        error=error,
     )
     ExperimentStore(config.experiments_root).write_json_new(
         "plan-approved",
@@ -1155,6 +1240,68 @@ def test_collection_and_download_retries_never_resubmit(tmp_path: Path) -> None:
     assert len(record.diagnostics) == 6
 
 
+def test_production_downloader_retries_runninghub_error_then_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, plan = _persist_plan(tmp_path)
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output.png?sig=live-signed-secret",
+        media_type="image/png",
+        provider_order=0,
+    )
+    executor = FakeExecutor.success(outputs=(output,))
+    attempts: list[int] = []
+    output_bytes = b"production wrapper output"
+
+    def download_file(_url: str, target: Path) -> Path:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) <= 3:
+            raise RunningHubApiError(
+                "download failed api_key=durable-secret "
+                "Bearer bearer-secret "
+                "https://cdn.example/output.png?sig=signed-secret"
+            )
+        target.write_bytes(output_bytes)
+        return target
+
+    cli_app = importlib.import_module("mp_comfyui_lab.cli.app")
+    monkeypatch.setattr(cli_app, "download_file", download_file)
+    waits: list[float] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=cli_app._download_runninghub_output,
+        sleep=waits.append,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.SUCCESS
+    assert attempts == [1, 2, 3, 4]
+    assert waits == [1, 2, 4]
+    assert len(record.diagnostics) == 3
+    assert executor.calls.count("submit") == 1
+    durable_bytes = b"\n".join(
+        path.read_bytes()
+        for path in (config.experiments_root / "plan-approved").rglob("*")
+        if path.is_file()
+    )
+    for secret in (
+        b"durable-secret",
+        b"bearer-secret",
+        b"signed-secret",
+        b"live-signed-secret",
+    ):
+        assert secret not in durable_bytes
+
+
 def test_resume_reuses_matching_durable_output_without_overwrite(
     tmp_path: Path,
 ) -> None:
@@ -1601,6 +1748,68 @@ def test_exhausted_download_retries_are_durable_incomplete(
     assert len(record.diagnostics) == 4
     assert waits == [1, 2, 4]
     assert attempts == [1, 2, 3, 4]
+
+
+def test_production_downloader_exhaustion_is_durable_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, plan = _persist_plan(tmp_path)
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output.png?sig=live-signed-secret",
+        media_type="image/png",
+        provider_order=0,
+    )
+    executor = FakeExecutor.success(outputs=(output,))
+    attempts: list[int] = []
+
+    def download_file(_url: str, _target: Path) -> None:
+        attempts.append(len(attempts) + 1)
+        raise RunningHubApiError(
+            "download failed api_key=durable-secret "
+            "Bearer bearer-secret "
+            "https://cdn.example/output.png?sig=signed-secret"
+        )
+
+    cli_app = importlib.import_module("mp_comfyui_lab.cli.app")
+    monkeypatch.setattr(cli_app, "download_file", download_file)
+    waits: list[float] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=cli_app._download_runninghub_output,
+        sleep=waits.append,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert thaw_json(record.error) == {
+        "kind": "retry_exhausted",
+        "operation": "download_output",
+    }
+    assert attempts == [1, 2, 3, 4]
+    assert waits == [1, 2, 4]
+    assert len(record.diagnostics) == 4
+    assert executor.calls.count("submit") == 1
+    durable_bytes = b"\n".join(
+        path.read_bytes()
+        for path in (config.experiments_root / "plan-approved").rglob("*")
+        if path.is_file()
+    )
+    for secret in (
+        b"durable-secret",
+        b"bearer-secret",
+        b"signed-secret",
+        b"live-signed-secret",
+    ):
+        assert secret not in durable_bytes
 
 
 def test_nontransient_poll_contract_error_is_not_retried(

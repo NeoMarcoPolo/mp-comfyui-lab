@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from mp_runninghub_api.errors import RunningHubApiError
 from mp_runninghub_api.types import NodeInfo
 import pytest
 import requests
@@ -14,7 +15,11 @@ from mp_comfyui_lab.executors.base import (
     ExecutorError,
     ProviderTaskState,
 )
-from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
+from mp_comfyui_lab.executors.runninghub import (
+    UPLOAD_ENDPOINT,
+    RunningHubExecutor,
+    upload_file_bytes,
+)
 from mp_comfyui_lab.experiments.models import (
     MaterializedVariant,
     ResolvedFixture,
@@ -108,7 +113,8 @@ def test_submit_uploads_and_uses_exact_create_task_shape(tmp_path: Path) -> None
         calls.append(("upload", kwargs))
         assert kwargs == {
             "api_key": None,
-            "file_path": str(tmp_path / "portrait.png"),
+            "content": b"fixture",
+            "file_name": "portrait.png",
             "file_type": "image",
         }
         return "uploaded-portrait.png"
@@ -154,6 +160,43 @@ def test_submit_uploads_and_uses_exact_create_task_shape(tmp_path: Path) -> None
     assert "fixture://0" not in captured_create["workflow"]
 
 
+def test_submit_binds_snapshot_bytes_before_injected_upload_can_mutate_path(
+    tmp_path: Path,
+) -> None:
+    fixtures = _fixtures(tmp_path)
+    approved_bytes = fixtures.items[0].path.read_bytes()
+    captured_uploads: list[bytes] = []
+    creates: list[str] = []
+
+    def upload_call(*, api_key, content, file_name, file_type):
+        assert api_key is None
+        assert file_name == "portrait.png"
+        assert file_type == "image"
+        fixtures.items[0].path.write_bytes(b"attacker replacement")
+        captured_uploads.append(content)
+        fixtures.items[0].path.write_bytes(approved_bytes)
+        return "uploaded-portrait.png"
+
+    def create_task_call(**_kwargs):
+        creates.append("create")
+        return SimpleNamespace(taskId="provider-task-1", taskStatus="QUEUED")
+
+    executor = RunningHubExecutor(
+        credential_loader=lambda: SimpleNamespace(apiKey="secret"),
+        upload_call=upload_call,
+        create_task_call=create_task_call,
+        status_call=lambda **_kwargs: None,
+        info_call=lambda **_kwargs: None,
+        outputs_call=lambda **_kwargs: None,
+    )
+
+    receipt = executor.submit(_variant(), fixtures)
+
+    assert receipt.provider_task_id == "provider-task-1"
+    assert captured_uploads == [approved_bytes]
+    assert creates == ["create"]
+
+
 def test_submit_rejects_tampered_fixture_before_credentials_or_create(
     tmp_path: Path,
 ) -> None:
@@ -183,37 +226,117 @@ def test_submit_rejects_tampered_fixture_before_credentials_or_create(
     assert calls == []
 
 
-def test_submit_reverifies_snapshot_immediately_before_upload(
+def test_submit_binds_snapshot_before_credentials_can_mutate_path(
     tmp_path: Path,
 ) -> None:
     fixtures = _fixtures(tmp_path)
     calls: list[str] = []
+    uploaded: list[bytes] = []
 
     def load_credentials():
         calls.append("credentials")
         fixtures.items[0].path.write_bytes(b"changed after credential gate")
         return SimpleNamespace(apiKey="secret")
 
-    def forbidden(name: str):
-        def call(*_args, **_kwargs):
-            calls.append(name)
-            raise AssertionError(f"changed snapshot touched {name}")
+    def upload_call(**kwargs):
+        calls.append("upload")
+        uploaded.append(kwargs["content"])
+        return "uploaded.png"
 
-        return call
+    def create_task_call(**_kwargs):
+        calls.append("create")
+        return SimpleNamespace(taskId="provider-task-1", taskStatus="QUEUED")
 
     executor = RunningHubExecutor(
         credential_loader=load_credentials,
-        upload_call=forbidden("upload"),
-        create_task_call=forbidden("create"),
-        status_call=forbidden("status"),
-        info_call=forbidden("info"),
-        outputs_call=forbidden("outputs"),
+        upload_call=upload_call,
+        create_task_call=create_task_call,
+        status_call=lambda **_kwargs: None,
+        info_call=lambda **_kwargs: None,
+        outputs_call=lambda **_kwargs: None,
     )
 
-    with pytest.raises(ExecutorError, match="fixture snapshot"):
-        executor.submit(_variant(), fixtures)
+    receipt = executor.submit(_variant(), fixtures)
 
-    assert calls == ["credentials"]
+    assert receipt.provider_task_id == "provider-task-1"
+    assert uploaded == [b"fixture"]
+    assert calls == ["credentials", "upload", "create"]
+
+
+def test_upload_file_bytes_sends_exact_multipart_content() -> None:
+    calls: list[dict[str, object]] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"code": 0, "data": {"fileName": "provider-file.png"}}
+
+    class Session:
+        @staticmethod
+        def post(url, **kwargs):
+            calls.append({"url": url, **kwargs})
+            return Response()
+
+    content = b"approved immutable bytes"
+
+    uploaded_name = upload_file_bytes(
+        "api-secret",
+        content,
+        "portrait.png",
+        "image",
+        session=Session(),
+    )
+
+    assert uploaded_name == "provider-file.png"
+    assert calls == [
+        {
+            "url": UPLOAD_ENDPOINT,
+            "data": {"apiKey": "api-secret", "fileType": "image"},
+            "files": {"file": ("portrait.png", content)},
+            "timeout": 300,
+        }
+    ]
+    assert type(calls[0]["files"]["file"][1]) is bytes
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"data": {"fileName": "provider-file.png"}},
+        {"code": True, "data": {"fileName": "provider-file.png"}},
+        {"code": 0.0, "data": {"fileName": "provider-file.png"}},
+        {"code": 0, "data": []},
+        {"code": 0, "data": {"fileName": 7}},
+        {"code": 0, "data": {"fileName": "../provider-file.png"}},
+    ],
+)
+def test_upload_file_bytes_strictly_rejects_malformed_provider_response(
+    payload: object,
+) -> None:
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return payload
+
+    class Session:
+        @staticmethod
+        def post(*_args, **_kwargs):
+            return Response()
+
+    with pytest.raises(RunningHubApiError) as raised:
+        upload_file_bytes(
+            "api-secret",
+            b"approved immutable bytes",
+            "portrait.png",
+            "image",
+            session=Session(),
+        )
+
+    assert "api-secret" not in str(raised.value)
 
 
 def test_poll_maps_known_status_and_sanitizes_info() -> None:
