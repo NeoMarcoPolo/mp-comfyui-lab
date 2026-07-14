@@ -88,7 +88,7 @@ class ReadOnlyPlanningBundleLoader:
         fetched = self._executor.fetch_workflow(ref)
         # Inspection is intentional evidence collection, not provider validation.
         capability_report = self._executor.inspect_capabilities(fetched)
-        graph = sanitize_for_persistence(fetched.graph)
+        graph = sanitize_for_persistence(thaw_json(fetched.graph))
         source = PlanningSource(
             workflow_id=fetched.detail.candidate.workflow_id,
             canonical_url=fetched.detail.candidate.canonical_url,
@@ -366,11 +366,16 @@ def _plan_artifacts(
                 "capability_hash": item.capability_hash,
                 "evidence_ids": list(item.evidence_ids),
                 "engagement": item.engagement,
+                "raw_graph": thaw_json(item.raw_graph),
+                "normalized_graph": item.normalized_graph.model_dump(mode="json"),
             }
             for item in source_bundle.sources
         ],
         "candidates": [item.model_dump(mode="json") for item in source_bundle.candidates],
     }
+    for item in source_snapshot["sources"]:
+        if source_graph_hash(item["raw_graph"]) != item["source_hash"] or capability_hash(item["raw_graph"]) != item["capability_hash"]:
+            raise PlanningValidationError("source snapshot graph hashes do not match validated source")
     evidence_graph = evidence_graph_for_bundle(source_bundle)
     paths = [
         "brief.yaml",
@@ -385,7 +390,7 @@ def _plan_artifacts(
     written = [
         store.write_text_new(experiment_id, "brief.yaml", brief_document),
         store.write_json_new(experiment_id, "search-results.json", discovery_snapshot),
-        store.write_json_new(experiment_id, "sources/source-bundle.json", source_snapshot),
+        store.write_sanitized_json_new(experiment_id, "sources/source-bundle.json", source_snapshot),
         store.write_json_new(
             experiment_id,
             "evidence/graph.json",

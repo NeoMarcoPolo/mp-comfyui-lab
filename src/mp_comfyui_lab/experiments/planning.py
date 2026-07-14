@@ -81,6 +81,21 @@ def _hash(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def recompute_exact_run_hash(variant: PlannedVariant) -> str:
+    """Recompute a persisted variant's exact hash from its durable fields."""
+    parameters = thaw_json(variant.execution_parameters)
+    return _hash({
+        "graph": thaw_json(variant.materialized_graph),
+        "source_hash": variant.source_hash,
+        "fixtures": [item.model_dump(mode="json") for item in variant.fixture_fingerprints],
+        "prompt_lines": parameters["prompt_lines"],
+        "execution_parameters": parameters,
+        "expected_output_count": variant.expected_output_count,
+        "output_node_ids": list(variant.output_node_ids),
+        "expected_media_types": list(variant.expected_media_types),
+    })
+
+
 def _validate_manifest_value(value: Any) -> None:
     stack = [(value, "manifest", 0)]
     count = 0

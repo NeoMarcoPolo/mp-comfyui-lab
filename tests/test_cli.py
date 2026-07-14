@@ -39,7 +39,9 @@ from mp_comfyui_lab.evidence.models import (
     EvidenceSourceKind,
 )
 from mp_comfyui_lab.evidence.build import build_evidence_graph
-from mp_comfyui_lab.experiments.models import PlanningSource, SourceBundle
+from mp_comfyui_lab.experiments.models import ExperimentPlan, PlanningSource, SourceBundle
+from mp_comfyui_lab.experiments.planning import recompute_exact_run_hash
+from mp_comfyui_lab.security import sanitize_for_persistence
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
 
@@ -581,6 +583,7 @@ def test_default_read_only_planning_loader_uses_only_public_discovery_methods():
 
 def test_plan_main_constructs_only_read_only_default_executor(tmp_path, capsys, monkeypatch):
     graph = json.loads((Path(__file__).parent / "fixtures" / "runninghub" / "qwen_graph.json").read_text(encoding="utf-8"))
+    graph[next(iter(graph))]["inputs"]["signed_input"] = "https://cdn.example/input.png?token=secret&revision=1"
     executor = ReadOnlyExecutor(graph)
     monkeypatch.setattr(app, "RunningHubExecutor", lambda: executor)
     manifest = tmp_path / "plan.yaml"
@@ -598,5 +601,20 @@ dimensions:
   checkpoint: approved
 """, encoding="utf-8")
     assert main(["plan", str(manifest)], cwd=tmp_path) == ExitCode.OK
-    _single_json_document(capsys.readouterr())
+    document = _single_json_document(capsys.readouterr())
     assert set(call[0] for call in executor.calls) == {"search", "fetch_workflow", "inspect_capabilities"}
+    paths = [Path(item["path"]) for item in document["artifacts"]]
+    source_snapshot = json.loads(next(path for path in paths if path.name == "source-bundle.json").read_text(encoding="utf-8"))
+    assert "token=secret" not in json.dumps(source_snapshot)
+    persisted_source = source_snapshot["sources"][0]
+    assert source_graph_hash(persisted_source["raw_graph"]) == persisted_source["source_hash"]
+    assert capability_hash(persisted_source["raw_graph"]) == persisted_source["capability_hash"]
+    plan_path = next(path for path in paths if path.parent.name == "plans")
+    persisted = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert sanitize_for_persistence(persisted) == persisted
+    plan = ExperimentPlan.model_validate_json(plan_path.read_text(encoding="utf-8"), strict=True)
+    assert plan.recompute_plan_hash() == plan.plan_hash == plan_path.stem
+    assert recompute_exact_run_hash(plan.variants[0]) == plan.variants[0].exact_run_hash
+    persisted["variants"][0]["materialized_graph"][next(iter(persisted["variants"][0]["materialized_graph"]))]["inputs"]["signed_input"] = "tampered"
+    with pytest.raises(Exception):
+        ExperimentPlan.model_validate(persisted)

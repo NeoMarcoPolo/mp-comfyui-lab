@@ -707,6 +707,11 @@ class PlannedVariant(_FrozenModel):
     execution_parameters: FrozenJsonObject
     fixture_fingerprints: tuple[FixtureFingerprint, ...] = Field(default=(), max_length=MAX_FIXTURES)
 
+    @field_validator("evidence_ids", "warnings", "output_node_ids", "expected_media_types", "fixture_fingerprints", mode="before")
+    @classmethod
+    def json_arrays(cls, value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
+
 
 class ExperimentPlan(_FrozenModel):
     plan_hash: Sha256
@@ -715,6 +720,11 @@ class ExperimentPlan(_FrozenModel):
     capability_coverage: tuple[DimensionName, ...] = Field(default=(), max_length=len(DimensionName))
     warnings: tuple[str, ...] = Field(default=(), max_length=512)
     approval_payload: SanitizedJsonObject
+
+    @field_validator("source_hashes", "variants", "capability_coverage", "warnings", mode="before")
+    @classmethod
+    def json_arrays(cls, value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
 
     @model_validator(mode="after")
     def validate_plan_hash(self) -> Self:

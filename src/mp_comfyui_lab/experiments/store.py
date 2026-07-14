@@ -115,6 +115,12 @@ class ExperimentStore:
         self._atomic_write_new(destination, f"{serialized}\n")
         return destination
 
+    def write_sanitized_json_new(self, experiment_id: str, relative_path: str | Path, value: Any) -> Path:
+        destination = self._artifact_path(experiment_id, relative_path)
+        serialized = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+        self._atomic_write_new(destination, f"{serialized}\n")
+        return destination
+
     def write_sanitized_json(
         self,
         experiment_id: str,
