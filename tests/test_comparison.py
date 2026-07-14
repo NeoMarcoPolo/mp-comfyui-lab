@@ -1793,6 +1793,11 @@ def test_compare_cli_is_store_only_and_returns_judgment_input(
             (experiment_root / "comparisons/judgment-input.json").resolve()
         ),
         "judgments": None,
+        "finalists_path": str(
+            (experiment_root / "finalists.json").resolve()
+        ),
+        "finalist_variant_ids": ["mixed"],
+        "requires_human_selection": True,
     }
     assert [item["path"] for item in payload["artifacts"]] == [
         str((experiment_root / "comparisons/facts.json").resolve()),
@@ -1800,6 +1805,7 @@ def test_compare_cli_is_store_only_and_returns_judgment_input(
         str((experiment_root / "comparisons/contact-sheet.jpg").resolve()),
         str((experiment_root / "comparisons/index.html").resolve()),
         str((experiment_root / "comparisons/judgment-input.json").resolve()),
+        str((experiment_root / "finalists.json").resolve()),
     ]
     assert (experiment_root / "comparisons/facts.json").exists()
 
@@ -1849,6 +1855,7 @@ def test_compare_cli_returns_rendered_absolute_paths_from_custom_store(
         expected["contact_sheet"],
         expected["gallery"],
         expected["judgment_input"],
+        (experiment_root / "finalists.json").resolve(),
     ]
 
     submission = _valid_judgments(experiment_root)

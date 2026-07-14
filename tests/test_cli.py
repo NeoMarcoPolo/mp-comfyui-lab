@@ -114,14 +114,22 @@ def test_unknown_command_preserves_argparse_diagnostic(capsys):
     assert document["error"]["message"] == (
         "argument command: invalid choice: 'unknown' "
         "(choose from version, search, inspect, similar, plan, run, resume, "
-        "status, reconcile, compare)"
+        "status, reconcile, compare, finalists, select, export)"
     )
 
 
 class FakeExperimentEngine:
-    def __init__(self, record: RunRecord) -> None:
+    def __init__(
+        self,
+        record: RunRecord,
+        *,
+        comparison_path: Path | None = None,
+        finalists_path: Path | None = None,
+    ) -> None:
         self.record = record
         self.calls: list[tuple] = []
+        self.comparison_path = comparison_path
+        self.finalists_path = finalists_path
 
     def run(self, experiment_id, variant_id, *, approved_plan_hash):
         self.calls.append(
@@ -160,6 +168,17 @@ class FakeExperimentEngine:
         self.calls.append(("reconcile", experiment_id, run_id, task_id))
         return self.record
 
+    def review_artifact_paths(self, experiment_id):
+        self.calls.append(("review_artifact_paths", experiment_id))
+        return type(
+            "ReviewPaths",
+            (),
+            {
+                "comparison_path": self.comparison_path,
+                "finalists_path": self.finalists_path,
+            },
+        )()
+
 
 def test_run_cli_requires_and_passes_exact_plan_approval(capsys):
     record = RunRecord(
@@ -187,7 +206,8 @@ def test_run_cli_requires_and_passes_exact_plan_approval(capsys):
     payload = _single_json_document(capsys.readouterr())
     assert code == ExitCode.OK
     assert engine.calls == [
-        ("run", "plan-approved", "baseline", "a" * 64)
+        ("run", "plan-approved", "baseline", "a" * 64),
+        ("review_artifact_paths", "plan-approved"),
     ]
     assert payload["command"] == "run"
     assert payload["data"]["run_id"] == "run-cli"
@@ -240,7 +260,8 @@ def test_run_cli_rerun_requires_reason_and_wires_original_variant(capsys):
             "baseline",
             "a" * 64,
             "measure output variance",
-        )
+        ),
+        ("review_artifact_paths", "plan-approved"),
     ]
     assert payload["data"]["run_id"] == "run-rerun"
 
@@ -288,9 +309,54 @@ def test_resume_cli_wires_existing_run_id(capsys):
 
     payload = _single_json_document(capsys.readouterr())
     assert code == ExitCode.EXECUTION
-    assert engine.calls == [("resume", "plan-approved", "run-resume")]
+    assert engine.calls == [
+        ("resume", "plan-approved", "run-resume"),
+        ("review_artifact_paths", "plan-approved"),
+    ]
     assert payload["data"]["run_id"] == "run-resume"
     assert payload["data"]["state"] == "FAILED"
+
+
+def test_run_cli_returns_absolute_comparison_and_finalist_paths(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    comparison_path = (tmp_path / "facts.json").resolve()
+    finalists_path = (tmp_path / "finalists.json").resolve()
+    record = RunRecord(
+        run_id="run-review-paths",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.SUCCESS,
+        provider_task_id="provider-task-paths",
+        expected_output_count=1,
+        actual_output_count=1,
+    )
+    engine = FakeExperimentEngine(
+        record,
+        comparison_path=comparison_path,
+        finalists_path=finalists_path,
+    )
+
+    code = main(
+        [
+            "run",
+            "plan-approved",
+            "baseline",
+            "--approve-plan-hash",
+            "a" * 64,
+        ],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.OK
+    assert Path(payload["data"]["comparison_path"]) == comparison_path
+    assert Path(payload["data"]["finalists_path"]) == finalists_path
+    assert payload["artifacts"][-2:] == [
+        {"kind": "comparison_facts", "path": str(comparison_path)},
+        {"kind": "finalists", "path": str(finalists_path)},
+    ]
 
 
 def test_reconcile_cli_wires_operator_task_id(capsys):

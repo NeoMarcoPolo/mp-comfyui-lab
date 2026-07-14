@@ -3403,6 +3403,68 @@ def test_run_wave_executes_all_novel_capabilities_and_persists_decision(
     assert len(persisted["run_ids"]) == 2
 
 
+def test_completed_wave_regenerates_review_artifacts_without_selection(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(tmp_path)
+    executor = FakeExecutor.success(
+        outputs=(
+            ProviderOutput(
+                node_id="9",
+                url="memory://result.png",
+                media_type="image/png",
+            ),
+        )
+    )
+    engine = _wave_engine(config, executor)
+
+    engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    root = config.experiments_root / "wave-approved"
+    paths = engine.review_artifact_paths("wave-approved")
+    assert paths.comparison_path == (root / "comparisons/facts.json").resolve()
+    assert paths.finalists_path == (root / "finalists.json").resolve()
+    assert paths.comparison_path.exists()
+    finalists = json.loads(paths.finalists_path.read_text(encoding="utf-8"))
+    assert [item["variant_id"] for item in finalists["finalists"]] == [
+        "other",
+        "strong",
+    ]
+    assert finalists["requires_human_selection"] is True
+    assert not (root / "selection.json").exists()
+
+
+def test_completed_failed_wave_still_writes_empty_finalists(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("failed", "d" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    executor = FakeExecutor(
+        poll_sequences={"fake-task-1": (ProviderTaskState.FAILED,)}
+    )
+    engine = _wave_engine(config, executor)
+
+    engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    paths = engine.review_artifact_paths("wave-approved")
+    finalists = json.loads(paths.finalists_path.read_text(encoding="utf-8"))
+    assert finalists["finalists"] == []
+    assert finalists["excluded"] == {"failed": "run_status_failed"}
+    assert not (
+        config.experiments_root / "wave-approved" / "selection.json"
+    ).exists()
+
+
 def test_completed_saturation_wave_resumes_without_regenerating_runs(
     tmp_path: Path,
 ) -> None:

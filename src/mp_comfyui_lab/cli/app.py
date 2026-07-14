@@ -16,6 +16,12 @@ import requests
 
 from mp_comfyui_lab import __version__
 from mp_comfyui_lab.cli.output import emit_error, emit_success
+from mp_comfyui_lab.comparison.finalists import (
+    FinalistSelectionError,
+    propose_finalists,
+    select_finalist,
+    write_finalists,
+)
 from mp_comfyui_lab.comparison.judgments import (
     JudgmentValidationError,
     judgment_document_bytes,
@@ -54,6 +60,12 @@ from mp_comfyui_lab.executors.runninghub import (
     RunningHubExecutor,
 )
 from mp_comfyui_lab.experiments.store import ExperimentStore
+from mp_comfyui_lab.export.bundle import (
+    BundleConflictError,
+    BundleExporter,
+    BundleIntegrityError,
+    SelectionRequiredError,
+)
 from mp_comfyui_lab.experiments.engine import (
     MAX_OUTPUT_BYTES,
     ApprovalError,
@@ -337,6 +349,26 @@ def _build_parser() -> StructuredArgumentParser:
     )
     compare.add_argument("experiment_id", metavar="EXPERIMENT_ID")
     compare.add_argument("--judgments", metavar="JSON")
+
+    finalists = subparsers.add_parser(
+        "finalists",
+        usage="%(prog)s EXPERIMENT_ID [--judgments JSON]",
+    )
+    finalists.add_argument("experiment_id", metavar="EXPERIMENT_ID")
+    finalists.add_argument("--judgments", metavar="JSON")
+
+    select = subparsers.add_parser(
+        "select",
+        usage="%(prog)s EXPERIMENT_ID VARIANT_ID",
+    )
+    select.add_argument("experiment_id", metavar="EXPERIMENT_ID")
+    select.add_argument("variant_id", metavar="VARIANT_ID")
+
+    export = subparsers.add_parser(
+        "export",
+        usage="%(prog)s EXPERIMENT_ID",
+    )
+    export.add_argument("experiment_id", metavar="EXPERIMENT_ID")
     return parser
 
 
@@ -795,12 +827,22 @@ def _compare_command(
     config = LabConfig.load(repository_root)
     store = ExperimentStore(config.experiments_root)
     experiment_root = store.root(parsed.experiment_id)
-    runs = _load_comparison_runs(store, parsed.experiment_id)
+    all_runs = _load_comparison_runs(store, parsed.experiment_id)
+    plan = _load_review_plan(store, parsed.experiment_id, all_runs)
+    current_variants = {
+        (variant.variant_id, variant.exact_run_hash) for variant in plan.variants
+    }
+    runs = tuple(
+        record
+        for record in all_runs
+        if (record.variant_id, record.exact_run_hash) in current_variants
+    )
     report = compare_outputs(
         runs,
         experiment_root,
         experiment_id=parsed.experiment_id,
     )
+    submission = None
     judgment_bytes: bytes | None = None
     if parsed.judgments is not None:
         source = Path(parsed.judgments)
@@ -812,12 +854,32 @@ def _compare_command(
             expected_facts_sha256=comparison_facts_sha256(report),
         )
         judgment_bytes = judgment_document_bytes(submission)
+    else:
+        stored_judgments = experiment_root / "comparisons" / "judgments.json"
+        if stored_judgments.exists() or stored_judgments.is_symlink():
+            try:
+                submission = load_and_validate_judgments(
+                    stored_judgments,
+                    report,
+                    expected_facts_sha256=comparison_facts_sha256(report),
+                )
+            except JudgmentValidationError as error:
+                if "facts_sha256 does not match" not in str(error):
+                    raise
     rendered = render_comparison(
         report,
         experiment_root,
         judgment_document=judgment_bytes,
+        replace_existing=True,
     )
+    finalists = propose_finalists(report, plan, judgments=submission)
+    finalists_path = write_finalists(store, finalists)
     artifacts = _comparison_artifacts_payload(rendered)
+    finalist_artifact = {"kind": "finalists", "path": str(finalists_path)}
+    if artifacts and artifacts[-1]["kind"] == "judgments":
+        artifacts.insert(-1, finalist_artifact)
+    else:
+        artifacts.append(finalist_artifact)
     return (
         {
             "experiment_id": parsed.experiment_id,
@@ -835,8 +897,91 @@ def _compare_command(
                 if rendered.judgments is None
                 else str(rendered.judgments)
             ),
+            "finalists_path": str(finalists_path),
+            "finalist_variant_ids": list(finalists.variant_ids),
+            "requires_human_selection": True,
         },
         artifacts,
+    )
+
+
+def _load_review_plan(
+    store: ExperimentStore,
+    experiment_id: str,
+    runs: tuple[RunRecord, ...],
+) -> ExperimentPlan:
+    root = store.root(experiment_id)
+    waves_root = root / "plans" / "waves"
+    wave_paths: list[Path] = []
+    if waves_root.exists() or waves_root.is_symlink():
+        if path_component_is_link_or_junction(waves_root) or not waves_root.is_dir():
+            raise SafetyError("waves path must be a regular local directory")
+        try:
+            candidates = tuple(waves_root.glob("*.json"))
+        except OSError as error:
+            raise SafetyError("wave artifacts cannot be listed") from error
+        for path in candidates:
+            if not path.stem.isdigit():
+                raise SafetyError("wave artifact filename is not an ordinal")
+            ordinal = int(path.stem)
+            if ordinal < 1 or path.name != f"{ordinal}.json":
+                raise SafetyError("wave artifact filename is not canonical")
+            if path_component_is_link_or_junction(path) or not path.is_file():
+                raise SafetyError("wave artifact must be a regular local JSON file")
+            wave_paths.append(path)
+        wave_paths.sort(key=lambda path: int(path.stem))
+    plan_hash: str | None = None
+    if wave_paths:
+        latest = store.read_json(
+            experiment_id,
+            Path("plans", "waves", wave_paths[-1].name),
+        )
+        if isinstance(latest, dict) and isinstance(latest.get("plan_hash"), str):
+            plan_hash = latest["plan_hash"]
+    if plan_hash is None:
+        run_plan_hashes = [
+            record.plan_hash for record in runs if record.plan_hash is not None
+        ]
+        if run_plan_hashes:
+            plan_hash = run_plan_hashes[-1]
+    if plan_hash is None:
+        plan_paths = tuple((root / "plans").glob("*.json"))
+        if len(plan_paths) == 1:
+            plan_hash = plan_paths[0].stem
+    if plan_hash is None:
+        raise ComparisonNotFoundError(
+            "a current approved experiment plan is required for review"
+        )
+    try:
+        plan = ExperimentPlan.model_validate_json(
+            store.read_text(experiment_id, f"plans/{plan_hash}.json"),
+            strict=True,
+        )
+    except (FileNotFoundError, OSError, ValueError, ValidationError) as error:
+        raise SafetyError("current approved experiment plan is invalid") from error
+    if plan.plan_hash != plan_hash:
+        raise SafetyError("current approved plan hash changed")
+    return plan
+
+
+def _finalists_command(
+    parsed: argparse.Namespace,
+    repository_root: Path,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    data, artifacts = _compare_command(parsed, repository_root)
+    finalists_path = data["finalists_path"]
+    return (
+        {
+            "experiment_id": parsed.experiment_id,
+            "comparison_path": data["facts"],
+            "finalists_path": finalists_path,
+            "variant_ids": data["finalist_variant_ids"],
+            "requires_human_selection": True,
+        },
+        [
+            {"kind": "comparison_facts", "path": data["facts"]},
+            {"kind": "finalists", "path": finalists_path},
+        ],
     )
 
 
@@ -998,43 +1143,151 @@ def main(
         emit_success("version", {"version": __version__})
         return ExitCode.OK
 
-    if parsed.command == "compare":
+    if parsed.command in {"compare", "finalists"}:
         try:
             root = Path.cwd() if cwd is None else Path(cwd)
-            data, artifacts = _compare_command(parsed, root)
-            emit_success("compare", data, artifacts)
+            if parsed.command == "compare":
+                data, artifacts = _compare_command(parsed, root)
+            else:
+                data, artifacts = _finalists_command(parsed, root)
+            emit_success(parsed.command, data, artifacts)
             return ExitCode.OK
         except JudgmentValidationError as error:
             emit_error(
-                "compare",
+                parsed.command,
                 "usage",
                 sanitize_untrusted_diagnostic(str(error)),
             )
             return ExitCode.USAGE
         except ComparisonNotFoundError as error:
             emit_error(
-                "compare",
+                parsed.command,
                 "not_found",
                 sanitize_untrusted_diagnostic(str(error)),
             )
             return ExitCode.NOT_FOUND
         except LabConfigError as error:
             emit_error(
-                "compare",
+                parsed.command,
                 "usage",
                 sanitize_untrusted_diagnostic(str(error)),
             )
             return ExitCode.USAGE
         except SafetyError as error:
             emit_error(
-                "compare",
+                parsed.command,
                 "safety",
                 sanitize_untrusted_diagnostic(str(error)),
             )
             return ExitCode.SAFETY
         except Exception as error:
             emit_error(
-                "compare",
+                parsed.command,
+                "execution",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.EXECUTION
+
+    if parsed.command == "select":
+        try:
+            root = Path.cwd() if cwd is None else Path(cwd)
+            config = LabConfig.load(root)
+            store = ExperimentStore(config.experiments_root)
+            selection = select_finalist(
+                store,
+                parsed.experiment_id,
+                parsed.variant_id,
+            )
+            selection_path = (
+                store.root(parsed.experiment_id) / "selection.json"
+            ).resolve()
+            emit_success(
+                "select",
+                {
+                    "experiment_id": selection.experiment_id,
+                    "plan_hash": selection.plan_hash,
+                    "variant_id": selection.selected_variant_id,
+                    "timestamp": selection.selected_at.isoformat(),
+                    "selected_by": selection.selected_by,
+                    "finalists_artifact_sha256": (
+                        selection.finalists_artifact_sha256
+                    ),
+                    "selection_path": str(selection_path),
+                },
+                [{"kind": "selection", "path": str(selection_path)}],
+            )
+            return ExitCode.OK
+        except FinalistSelectionError as error:
+            emit_error(
+                "select",
+                "selection",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.SELECTION
+        except (LabConfigError, SafetyError) as error:
+            emit_error(
+                "select",
+                "safety",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.SAFETY
+        except Exception as error:
+            emit_error(
+                "select",
+                "execution",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.EXECUTION
+
+    if parsed.command == "export":
+        try:
+            root = Path.cwd() if cwd is None else Path(cwd)
+            config = LabConfig.load(root)
+            bundle = BundleExporter(
+                ExperimentStore(config.experiments_root)
+            ).export(parsed.experiment_id)
+            emit_success(
+                "export",
+                {
+                    "experiment_id": parsed.experiment_id,
+                    "bundle": str(bundle),
+                },
+                [{"kind": "handoff_bundle", "path": str(bundle)}],
+            )
+            return ExitCode.OK
+        except SelectionRequiredError as error:
+            message = sanitize_untrusted_diagnostic(str(error))
+            kind = (
+                "stale_selection"
+                if "changed" in str(error) or "not a current finalist" in str(error)
+                else "selection_required"
+            )
+            emit_error("export", kind, message)
+            return ExitCode.SELECTION
+        except BundleIntegrityError as error:
+            emit_error(
+                "export",
+                "integrity",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.SAFETY
+        except BundleConflictError as error:
+            emit_error(
+                "export",
+                "conflict",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.EXECUTION
+        except (LabConfigError, SafetyError) as error:
+            emit_error(
+                "export",
+                "safety",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.SAFETY
+        except Exception as error:
+            emit_error(
+                "export",
                 "execution",
                 sanitize_untrusted_diagnostic(str(error)),
             )
@@ -1077,7 +1330,37 @@ def main(
                     "path": f"runs/{record.run_id}.json",
                 }
             ]
-            emit_success(parsed.command, _run_payload(record), artifacts)
+            data = _run_payload(record)
+            if parsed.command in {"run", "resume"}:
+                review_paths = engine.review_artifact_paths(
+                    parsed.experiment_id
+                )
+                comparison_path = getattr(
+                    review_paths,
+                    "comparison_path",
+                    None,
+                )
+                finalists_path = getattr(
+                    review_paths,
+                    "finalists_path",
+                    None,
+                )
+                if comparison_path is not None and finalists_path is not None:
+                    data["comparison_path"] = str(comparison_path)
+                    data["finalists_path"] = str(finalists_path)
+                    artifacts.extend(
+                        [
+                            {
+                                "kind": "comparison_facts",
+                                "path": str(comparison_path),
+                            },
+                            {
+                                "kind": "finalists",
+                                "path": str(finalists_path),
+                            },
+                        ]
+                    )
+            emit_success(parsed.command, data, artifacts)
             return (
                 ExitCode.OK
                 if parsed.command == "status"

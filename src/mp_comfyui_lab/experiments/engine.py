@@ -16,6 +16,10 @@ import uuid
 from pydantic import ValidationError
 import requests
 
+from mp_comfyui_lab.comparison.finalists import (
+    ReviewArtifactPaths,
+    regenerate_review_artifacts,
+)
 from mp_comfyui_lab.config import LabConfig
 from mp_comfyui_lab.executors.base import (
     AmbiguousSubmissionError,
@@ -124,11 +128,13 @@ class ExperimentEngine:
             approved_plan_hash,
         )
         with self._store.run_lock(experiment_id, "wave-execution"):
-            return self._run_locked(
+            record = self._run_locked(
                 experiment_id,
                 variant_id,
                 approved_plan_hash=approved_plan_hash,
             )
+        self._regenerate_review_for_completed_record(record)
+        return record
 
     def _run_locked(
         self,
@@ -327,12 +333,14 @@ class ExperimentEngine:
                 reason=reason,
                 original_run_ids=original_run_ids,
             )
-            return self._run_locked(
+            record = self._run_locked(
                 experiment_id,
                 variant_id,
                 approved_plan_hash=approved_plan_hash,
                 rerun_request=rerun_request,
             )
+        self._regenerate_review_for_completed_record(record)
+        return record
 
     def run_wave(
         self,
@@ -354,6 +362,7 @@ class ExperimentEngine:
                 and completed_waves[-1].saturation_reason is not None
                 and not recovered_records
             ):
+                self._regenerate_review_for_plan(experiment_id, plan)
                 return completed_waves[-1]
 
             history = self._load_history(experiment_id, plan)
@@ -408,10 +417,64 @@ class ExperimentEngine:
                 f"plans/waves/{ordinal}.json",
                 artifact.model_dump(mode="json"),
             )
+            self._regenerate_review_for_plan(experiment_id, plan)
             return artifact
 
     def resume(self, experiment_id: str, run_id: str) -> RunRecord:
-        return self._resume(experiment_id, run_id, return_when_active=False)
+        record = self._resume(experiment_id, run_id, return_when_active=False)
+        self._regenerate_review_for_completed_record(record)
+        return record
+
+    def review_artifact_paths(self, experiment_id: str) -> ReviewArtifactPaths:
+        root = self._store.root(experiment_id)
+        return ReviewArtifactPaths(
+            comparison_path=(root / "comparisons" / "facts.json").resolve(),
+            finalists_path=(root / "finalists.json").resolve(),
+        )
+
+    def _regenerate_review_for_completed_record(
+        self,
+        record: RunRecord,
+    ) -> None:
+        if (
+            record.plan_hash is None
+            or record.history_disposition()
+            is not RunHistoryDisposition.COMPLETED
+        ):
+            return
+        plan_path = (
+            self._store.root(record.experiment_id)
+            / "plans"
+            / f"{record.plan_hash}.json"
+        )
+        if not plan_path.exists() and not plan_path.is_symlink():
+            return
+        plan = self._load_approved_plan_document(
+            record.experiment_id,
+            record.plan_hash,
+        )
+        self._regenerate_review_for_plan(record.experiment_id, plan)
+
+    def _regenerate_review_for_plan(
+        self,
+        experiment_id: str,
+        plan: ExperimentPlan,
+    ) -> None:
+        current_variants = {
+            (variant.variant_id, variant.exact_run_hash)
+            for variant in plan.variants
+        }
+        runs = tuple(
+            record
+            for record in self._load_run_records(experiment_id)
+            if (record.variant_id, record.exact_run_hash) in current_variants
+        )
+        regenerate_review_artifacts(
+            self._store,
+            experiment_id,
+            plan,
+            runs,
+        )
 
     def _resume(
         self,

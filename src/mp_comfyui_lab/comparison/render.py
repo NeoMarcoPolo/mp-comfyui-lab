@@ -70,6 +70,7 @@ def render_comparison(
     *,
     judgment_document: bytes | None = None,
     fault_injector: FaultInjector | None = None,
+    replace_existing: bool = False,
 ) -> ComparisonArtifacts:
     """Render a deterministic, local-only comparison artifact set."""
     root = Path(experiment_root).resolve()
@@ -110,6 +111,7 @@ def render_comparison(
         artifact_values,
         judgment_document=judgment_document,
         fault_injector=fault_injector,
+        replace_existing=replace_existing,
     )
     judgments_path = root / _COMPARISON_DIRECTORY / _JUDGMENTS_NAME
     contact_sheets = tuple(
@@ -152,14 +154,27 @@ def _publish_artifact_set(
     *,
     judgment_document: bytes | None,
     fault_injector: FaultInjector | None,
+    replace_existing: bool,
 ) -> None:
     destination = root / _COMPARISON_DIRECTORY
     if destination.exists() or destination.is_symlink():
-        _verify_existing_artifact_set(
-            destination,
-            objective_artifacts,
-            context="preexisting",
-        )
+        try:
+            _verify_existing_artifact_set(
+                destination,
+                objective_artifacts,
+                context="preexisting",
+            )
+        except ComparisonArtifactConflict:
+            if not replace_existing:
+                raise
+            _replace_artifact_set(
+                root,
+                destination,
+                objective_artifacts,
+                judgment_document=judgment_document,
+                fault_injector=fault_injector,
+            )
+            return
         if judgment_document is not None:
             _append_judgments(
                 root,
@@ -202,6 +217,52 @@ def _publish_artifact_set(
             _fsync_directory(root)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
+
+
+def _replace_artifact_set(
+    root: Path,
+    destination: Path,
+    objective_artifacts: dict[str, ArtifactValue],
+    *,
+    judgment_document: bytes | None,
+    fault_injector: FaultInjector | None,
+) -> None:
+    if path_component_is_link_or_junction(destination) or not destination.is_dir():
+        raise ComparisonArtifactConflict(
+            "preexisting comparisons path is not a safe local directory"
+        )
+    stage = Path(tempfile.mkdtemp(prefix=".comparison-stage-", dir=root))
+    backup = Path(tempfile.mkdtemp(prefix=".comparison-backup-", dir=root))
+    backup.rmdir()
+    staged_artifacts: dict[str, ArtifactValue] = dict(objective_artifacts)
+    if judgment_document is not None:
+        staged_artifacts[_JUDGMENTS_NAME] = judgment_document
+    moved_existing = False
+    published = False
+    try:
+        for name, content in staged_artifacts.items():
+            _inject(fault_injector, f"stage:{name}")
+            _write_staged_file(stage / name, _artifact_bytes(content))
+        _inject(fault_injector, "fsync:staging")
+        _fsync_directory(stage)
+        _inject(fault_injector, "replace:backup")
+        os.rename(destination, backup)
+        moved_existing = True
+        _inject(fault_injector, "replace:publish")
+        _rename_directory_new(stage, destination)
+        published = True
+        _fsync_directory(root)
+    except Exception:
+        if moved_existing and not published and not destination.exists():
+            os.rename(backup, destination)
+            moved_existing = False
+            _fsync_directory(root)
+        raise
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        if published:
+            shutil.rmtree(backup, ignore_errors=True)
+            _fsync_directory(root)
 
 
 def _verify_existing_artifact_set(
