@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from mp_comfyui_lab.graph.hashing import capability_hash as graph_capability_hash
 from mp_comfyui_lab.experiments.models import (
     DimensionName,
     ExperimentPlan,
@@ -384,12 +385,19 @@ def test_prose_only_corrective_hypothesis_cannot_bypass_repeated_failure() -> No
 
 def test_machine_verified_correction_selects_changed_candidate_and_affects_hashes() -> None:
     signature = "missing-node:TextEncodeQwen"
-    failed = _variant(
+    failed_draft = _variant(
         "failed-encoder",
-        capability_hash="8" * 64,
+        capability_hash="0" * 64,
         exact_run_hash="5" * 64,
         hypothesis=DimensionName.ENCODER,
         required_nodes=("TextEncodeQwen", "SaveImage"),
+    )
+    failed = failed_draft.model_copy(
+        update={
+            "capability_hash": graph_capability_hash(
+                failed_draft.materialized_graph
+            )
+        }
     )
     correction = {
         "schema_version": 1,
@@ -410,14 +418,19 @@ def test_machine_verified_correction_selects_changed_candidate_and_affects_hashe
     )
     draft = _variant(
         "corrected-encoder",
-        capability_hash="9" * 64,
+        capability_hash="0" * 64,
         exact_run_hash="0" * 64,
         hypothesis=DimensionName.ENCODER,
         required_nodes=("CLIPTextEncode", "SaveImage"),
         correction=correction,
     )
     corrected = draft.model_copy(
-        update={"exact_run_hash": recompute_exact_run_hash(draft)}
+        update={
+            "exact_run_hash": recompute_exact_run_hash(draft),
+            "capability_hash": graph_capability_hash(
+                draft.materialized_graph
+            ),
+        }
     )
     history = ExperimentHistory()
     history.record_failure(failed, signature=signature, run_id="run-a")
@@ -431,6 +444,47 @@ def test_machine_verified_correction_selects_changed_candidate_and_affects_hashe
     assert [item.variant_id for item in decision.variants] == ["corrected-encoder"]
     assert recompute_exact_run_hash(uncorrected) != corrected.exact_run_hash
     assert _plan(uncorrected).plan_hash != _plan(corrected).plan_hash
+
+
+def test_same_graph_correction_cannot_fabricate_changed_capability_hash() -> None:
+    signature = "provider-failed:unsupported configuration"
+    failed_draft = _variant(
+        "failed-baseline",
+        capability_hash="0" * 64,
+        exact_run_hash="5" * 64,
+    )
+    failed = failed_draft.model_copy(
+        update={
+            "capability_hash": graph_capability_hash(
+                failed_draft.materialized_graph
+            )
+        }
+    )
+    candidate = _variant(
+        "candidate",
+        capability_hash="f" * 64,
+        exact_run_hash="6" * 64,
+        correction={
+            "schema_version": 1,
+            "failure_signature": signature,
+            "failed_variant_id": failed.variant_id,
+            "failed_exact_run_hash": failed.exact_run_hash,
+            "failed_capability_hash": failed.capability_hash,
+            "candidate_variant_id": "candidate",
+            "changed_dimensions": [DimensionName.CHECKPOINT.value],
+        },
+    )
+    assert candidate.materialized_graph == failed.materialized_graph
+    history = ExperimentHistory()
+    history.record_failure(failed, signature=signature, run_id="run-a")
+    history.record_failure(failed, signature=signature, run_id="run-b")
+
+    decision = next_wave(_plan(candidate), history)
+
+    assert decision.variants == ()
+    assert decision.reasons[candidate.variant_id] == (
+        "repeated_failure_requires_new_corrective_hypothesis"
+    )
 
 
 @pytest.mark.parametrize(

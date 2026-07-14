@@ -26,6 +26,7 @@ from mp_comfyui_lab.executors.base import (
     ValidationReport,
 )
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
+from mp_comfyui_lab.graph.hashing import capability_hash as graph_capability_hash
 from mp_comfyui_lab.experiments.models import (
     DimensionName,
     ExperimentPlan,
@@ -87,18 +88,19 @@ def _persist_plan(
             ),
         )
         graph_inputs["image"] = "fixture://0"
+    graph = {
+        "9": {
+            "class_type": "SaveImage",
+            "inputs": graph_inputs,
+        }
+    }
     draft = PlannedVariant(
         variant_id="baseline",
         source_workflow_id="workflow-1",
         source_hash="a" * 64,
-        materialized_graph={
-            "9": {
-                "class_type": "SaveImage",
-                "inputs": graph_inputs,
-            }
-        },
+        materialized_graph=graph,
         exact_run_hash="0" * 64,
-        capability_hash="b" * 64,
+        capability_hash=graph_capability_hash(graph),
         expected_output_count=expected_output_count,
         output_node_ids=output_node_ids,
         expected_media_types=expected_media_types,
@@ -169,7 +171,7 @@ def _persist_wave_plan(
     store.create(experiment_id)
     planned: list[PlannedVariant] = []
     candidates: list[dict[str, object]] = []
-    for index, (variant_id, capability_hash, confidence, engagement, provenance) in enumerate(
+    for index, (variant_id, capability_group, confidence, engagement, provenance) in enumerate(
         variants,
         start=1,
     ):
@@ -180,25 +182,30 @@ def _persist_wave_plan(
         }
         if corrections is not None and variant_id in corrections:
             execution_parameters["correction"] = corrections[variant_id]
+        graph = {
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {
+                    "ckpt_name": (
+                        f"group-{capability_group[0]}.safetensors"
+                    )
+                },
+            },
+            "9": {
+                "class_type": "SaveImage",
+                "inputs": {"filename_prefix": variant_id},
+            },
+        }
         draft = PlannedVariant(
             variant_id=variant_id,
             source_workflow_id="workflow-1",
             source_hash="a" * 64,
-            materialized_graph={
-                "1": {
-                    "class_type": "CheckpointLoaderSimple",
-                    "inputs": {"ckpt_name": f"model-{index}.safetensors"},
-                },
-                "9": {
-                    "class_type": "SaveImage",
-                    "inputs": {"filename_prefix": variant_id},
-                },
-            },
+            materialized_graph=graph,
             hypothesis=hypothesis,
             evidence_ids=(f"workflow-{index}",),
             confidence=confidence,
             exact_run_hash="0" * 64,
-            capability_hash=capability_hash,
+            capability_hash=graph_capability_hash(graph),
             expected_output_count=1,
             output_node_ids=("9",),
             expected_media_types=("image/png",),
@@ -2853,6 +2860,37 @@ def _persist_active_wave_run(
     return record
 
 
+def _persist_incomplete_wave_run(
+    config: LabConfig,
+    plan: ExperimentPlan,
+    *,
+    error: dict[str, object],
+    actual_output_count: int = 0,
+    expected_output_count: int = 1,
+) -> RunRecord:
+    variant = plan.variants[0]
+    record = RunRecord(
+        run_id="run-wave-incomplete",
+        experiment_id="wave-approved",
+        variant_id=variant.variant_id,
+        state=RunState.INCOMPLETE,
+        plan_hash=plan.plan_hash,
+        exact_run_hash=variant.exact_run_hash,
+        provider_task_id="provider-wave-incomplete",
+        expected_output_count=expected_output_count,
+        expected_output_node_ids=variant.output_node_ids,
+        expected_media_types=variant.expected_media_types,
+        actual_output_count=actual_output_count,
+        error=error,
+    )
+    ExperimentStore(config.experiments_root).write_json_new(
+        "wave-approved",
+        f"runs/{record.run_id}.json",
+        record.model_dump(mode="json"),
+    )
+    return record
+
+
 def test_wave_artifact_write_never_clobbers_conflicting_ordinal(
     tmp_path: Path,
 ) -> None:
@@ -3281,6 +3319,130 @@ def test_wave_poll_retry_exhaustion_keeps_paid_task_pending(
     assert executor.submissions == []
 
 
+def test_inconclusive_incomplete_run_repeatedly_resumes_without_saturation(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("active", "d" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    existing = _persist_incomplete_wave_run(
+        config,
+        plan,
+        error={"kind": "poll_error", "diagnostic": "status unavailable"},
+    )
+    executor = FakeExecutor(
+        method_exceptions={
+            "poll": [TimeoutError("poll timed out") for _ in range(8)]
+        }
+    )
+    engine = _wave_engine(config, executor)
+
+    first = engine.resume("wave-approved", existing.run_id)
+    second = engine.resume("wave-approved", existing.run_id)
+    pending = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert first.state is RunState.INCOMPLETE
+    assert second.state is RunState.INCOMPLETE
+    assert first.provider_task_id == existing.provider_task_id
+    assert second.provider_task_id == existing.provider_task_id
+    assert first.recovery_disposition == "resume_provider_task"
+    assert second.recovery_disposition == "resume_provider_task"
+    assert pending.selected_variant_ids == ()
+    assert pending.pending_variant_ids == ("active",)
+    assert pending.pending_run_ids == (existing.run_id,)
+    assert pending.saturation_reason is None
+    assert executor.calls == ["poll"] * 9
+    assert executor.submissions == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"kind": "collection_error", "diagnostic": "outputs unavailable"},
+        {"kind": "retry_exhausted", "operation": "collect_outputs"},
+    ],
+    ids=("collection-error", "collection-retries-exhausted"),
+)
+def test_collection_uncertainty_incomplete_run_remains_pending(
+    tmp_path: Path,
+    error: dict[str, object],
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("active", "d" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    existing = _persist_incomplete_wave_run(config, plan, error=error)
+    executor = FakeExecutor(
+        poll_sequences={
+            existing.provider_task_id: (ProviderTaskState.RUNNING,)
+        }
+    )
+    engine = _wave_engine(config, executor)
+
+    pending = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert pending.pending_variant_ids == ("active",)
+    assert pending.pending_run_ids == (existing.run_id,)
+    assert pending.saturation_reason is None
+    assert executor.calls == ["poll"]
+    assert executor.submissions == []
+
+
+def test_conclusive_partial_incomplete_run_remains_terminal(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("partial", "d" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    existing = _persist_incomplete_wave_run(
+        config,
+        plan,
+        error={
+            "kind": "partial_outputs",
+            "expected_output_count": 2,
+            "actual_output_count": 1,
+        },
+        actual_output_count=1,
+        expected_output_count=2,
+    )
+    constructions: list[str] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: constructions.append("executor"),
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    resumed = engine.resume("wave-approved", existing.run_id)
+    saturated = engine.run_wave(
+        "wave-approved",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert resumed.state is RunState.INCOMPLETE
+    assert resumed.recovery_disposition == "terminal"
+    assert saturated.pending_variant_ids == ()
+    assert saturated.saturation_reason == (
+        "no_approved_non_dominated_novel_capability_signature_remains"
+    )
+    assert constructions == []
+
+
 def test_wave_recovers_crash_after_submission_without_double_charge(
     tmp_path: Path,
 ) -> None:
@@ -3353,6 +3515,84 @@ def test_wave_approval_failure_constructs_no_executor(tmp_path: Path) -> None:
 
     assert plan.plan_hash != "f" * 64
     assert constructions == []
+
+
+def test_wave_approval_rejects_tampered_capability_hash_preimage(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("tampered", "d" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    original = plan.variants[0]
+    fabricated_hash = (
+        "f" * 64 if original.capability_hash != "f" * 64 else "e" * 64
+    )
+    tampered_variant = PlannedVariant.model_validate(
+        {
+            **original.model_dump(mode="python"),
+            "capability_hash": fabricated_hash,
+        }
+    )
+    approval_payload = thaw_json(plan.approval_payload)
+    approval_payload["variants"] = [
+        tampered_variant.model_dump(mode="json")
+    ]
+    tampered_plan = ExperimentPlan(
+        plan_hash=_canonical_hash(approval_payload),
+        source_hashes=plan.source_hashes,
+        variants=(tampered_variant,),
+        capability_coverage=plan.capability_coverage,
+        warnings=plan.warnings,
+        approval_payload=approval_payload,
+    )
+    store = ExperimentStore(config.experiments_root)
+    store.write_json_new(
+        "wave-approved",
+        f"plans/{tampered_plan.plan_hash}.json",
+        tampered_plan.model_dump(mode="json"),
+    )
+    completed = RunRecord(
+        run_id="run-tampered-complete",
+        experiment_id="wave-approved",
+        variant_id=tampered_variant.variant_id,
+        state=RunState.FAILED,
+        plan_hash=tampered_plan.plan_hash,
+        exact_run_hash=tampered_variant.exact_run_hash,
+        expected_output_count=tampered_variant.expected_output_count,
+        expected_output_node_ids=tampered_variant.output_node_ids,
+        expected_media_types=tampered_variant.expected_media_types,
+        error={"kind": "provider_failed"},
+    )
+    store.write_json_new(
+        "wave-approved",
+        f"runs/{completed.run_id}.json",
+        completed.model_dump(mode="json"),
+    )
+    constructions: list[str] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: constructions.append("executor"),
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(
+        engine_module.ApprovalError,
+        match="capability hash",
+    ):
+        engine.run_wave(
+            "wave-approved",
+            approved_plan_hash=tampered_plan.plan_hash,
+        )
+
+    assert constructions == []
+    assert not (
+        config.experiments_root / "wave-approved" / "plans" / "waves"
+    ).exists()
 
 
 def test_unapproved_hypothesis_dimension_requires_reapproval_before_executor(

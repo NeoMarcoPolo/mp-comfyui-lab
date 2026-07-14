@@ -26,6 +26,7 @@ from mp_comfyui_lab.executors.base import (
     TransientExecutorError,
     TransientOperationError,
 )
+from mp_comfyui_lab.graph.hashing import capability_hash
 from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.security import SafetyError
 from mp_comfyui_lab.security import safe_filename
@@ -37,6 +38,7 @@ from .models import (
     MaterializedVariant,
     OutputRecord,
     PlannedVariant,
+    RecoveryDisposition,
     ResolvedFixture,
     ResolvedFixtures,
     RunRecord,
@@ -418,8 +420,13 @@ class ExperimentEngine:
             RunState.SUCCESS,
             RunState.FAILED,
             RunState.CANCELLED,
-            RunState.INCOMPLETE,
         }:
+            return record
+        if (
+            record.state is RunState.INCOMPLETE
+            and record.recovery_disposition
+            is not RecoveryDisposition.RESUME_PROVIDER_TASK
+        ):
             return record
         if record.state is not RunState.PLANNED and record.provider_task_id is None:
             raise SafetyError("resumable run has no durable provider task ID")
@@ -429,8 +436,13 @@ class ExperimentEngine:
                 RunState.SUCCESS,
                 RunState.FAILED,
                 RunState.CANCELLED,
-                RunState.INCOMPLETE,
             }:
+                return record
+            if (
+                record.state is RunState.INCOMPLETE
+                and record.recovery_disposition
+                is not RecoveryDisposition.RESUME_PROVIDER_TASK
+            ):
                 return record
             if record.state is RunState.PLANNED:
                 ambiguous_at = self._now()
@@ -448,6 +460,21 @@ class ExperimentEngine:
                     updated_at=ambiguous_at,
                 )
                 return self._persist(record)
+            if record.state is RunState.INCOMPLETE:
+                resumed_at = self._now()
+                resumed_state = (
+                    RunState.RUNNING
+                    if record.started_at is not None
+                    else RunState.SUBMITTED
+                )
+                record = record.transition(
+                    resumed_state,
+                    recovery_disposition=None,
+                    error=None,
+                    completed_at=None,
+                    updated_at=resumed_at,
+                )
+                self._persist(record)
             if record.provider_task_id is None:
                 raise SafetyError("resumable run has no durable provider task ID")
             return self._poll_current(
@@ -465,7 +492,14 @@ class ExperimentEngine:
         recovered: list[RunRecord] = []
         for record in self._load_run_records(experiment_id):
             if (
-                record.state in {RunState.SUBMITTED, RunState.RUNNING}
+                (
+                    record.state in {RunState.SUBMITTED, RunState.RUNNING}
+                    or (
+                        record.state is RunState.INCOMPLETE
+                        and record.recovery_disposition
+                        is RecoveryDisposition.RESUME_PROVIDER_TASK
+                    )
+                )
                 and record.provider_task_id is not None
                 and record.exact_run_hash in exact_run_hashes
             ):
@@ -503,6 +537,7 @@ class ExperimentEngine:
             record = record.transition(
                 RunState.SUBMITTED,
                 provider_task_id=task_id,
+                recovery_disposition=None,
                 error=None,
                 submitted_at=reconciled_at,
                 updated_at=reconciled_at,
@@ -567,6 +602,19 @@ class ExperimentEngine:
             raise ApprovalError("approved plan artifact is missing or invalid") from error
         if plan.plan_hash != approved_plan_hash:
             raise ApprovalError("approved plan hash does not match its artifact filename")
+        for variant in plan.variants:
+            try:
+                canonical_capability_hash = capability_hash(
+                    thaw_json(variant.materialized_graph)
+                )
+            except ValueError as error:
+                raise ApprovalError(
+                    "plan variant capability preimage is invalid"
+                ) from error
+            if canonical_capability_hash != variant.capability_hash:
+                raise ApprovalError(
+                    "plan variant capability hash does not match canonical graph"
+                )
         if any(
             variant.hypothesis is not None
             and variant.hypothesis not in plan.capability_coverage
@@ -644,7 +692,14 @@ class ExperimentEngine:
         for record in self._load_run_records(experiment_id):
             variant = variants.get((record.variant_id, record.exact_run_hash))
             if (
-                record.state in {RunState.SUBMITTED, RunState.RUNNING}
+                (
+                    record.state in {RunState.SUBMITTED, RunState.RUNNING}
+                    or (
+                        record.state is RunState.INCOMPLETE
+                        and record.recovery_disposition
+                        is RecoveryDisposition.RESUME_PROVIDER_TASK
+                    )
+                )
                 and record.provider_task_id is not None
             ):
                 if record.exact_run_hash is not None:

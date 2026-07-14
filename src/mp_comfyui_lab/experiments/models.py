@@ -64,6 +64,12 @@ class RunState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class RecoveryDisposition(StrEnum):
+    RESUME_PROVIDER_TASK = "resume_provider_task"
+    RECONCILE_SUBMISSION = "reconcile_submission"
+    TERMINAL = "terminal"
+
+
 _NORMAL_RUN_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
     RunState.PLANNED: frozenset(
         {RunState.SUBMITTED, RunState.FAILED, RunState.INCOMPLETE}
@@ -117,6 +123,32 @@ def _is_ambiguous_submission(error: Any) -> bool:
         isinstance(error, Mapping)
         and error.get("kind") == "ambiguous_submission"
     )
+
+
+def _incomplete_recovery_disposition(
+    error: Any,
+    *,
+    has_provider_task_id: bool,
+) -> RecoveryDisposition:
+    if _is_ambiguous_submission(error) and not has_provider_task_id:
+        return RecoveryDisposition.RECONCILE_SUBMISSION
+    if not has_provider_task_id or not isinstance(error, Mapping):
+        return RecoveryDisposition.TERMINAL
+    kind = error.get("kind")
+    if kind in {
+        "collection_error",
+        "poll_error",
+        "provider_task_id_mismatch",
+        "unknown_provider_state",
+    }:
+        return RecoveryDisposition.RESUME_PROVIDER_TASK
+    if kind == "retry_exhausted" and error.get("operation") in {
+        "collect_outputs",
+        "download_output",
+        "poll",
+    }:
+        return RecoveryDisposition.RESUME_PROVIDER_TASK
+    return RecoveryDisposition.TERMINAL
 
 
 def _sanitize_diagnostic_json(value: Any) -> Any:
@@ -239,6 +271,7 @@ class RunRecord(_FrozenModel):
     experiment_id: NonBlankStr
     variant_id: NonBlankStr
     state: RunState
+    recovery_disposition: RecoveryDisposition | None = None
     plan_hash: Sha256 | None = None
     exact_run_hash: Sha256 | None = None
     provider_task_id: NonBlankStr | None = None
@@ -283,6 +316,18 @@ class RunRecord(_FrozenModel):
 
     @model_validator(mode="after")
     def validate_provider_task_id(self) -> RunRecord:
+        if (
+            self.state is RunState.INCOMPLETE
+            and self.recovery_disposition is None
+        ):
+            object.__setattr__(
+                self,
+                "recovery_disposition",
+                _incomplete_recovery_disposition(
+                    self.error,
+                    has_provider_task_id=self.provider_task_id is not None,
+                ),
+            )
         _validate_output_expectations(
             self.expected_output_count,
             self.expected_output_node_ids,
@@ -299,6 +344,33 @@ class RunRecord(_FrozenModel):
             raise ValueError("provider_task_id is not allowed for PLANNED")
         if self.state in task_id_required_states and self.provider_task_id is None:
             raise ValueError(f"provider_task_id is required for {self.state.value}")
+        if self.state is not RunState.INCOMPLETE:
+            if self.recovery_disposition is not None:
+                raise ValueError(
+                    "recovery_disposition is only allowed for INCOMPLETE"
+                )
+        elif self.recovery_disposition is None:
+            raise ValueError("INCOMPLETE requires a recovery_disposition")
+        elif (
+            self.recovery_disposition
+            is RecoveryDisposition.RESUME_PROVIDER_TASK
+            and self.provider_task_id is None
+        ):
+            raise ValueError(
+                "resumable INCOMPLETE requires a provider_task_id"
+            )
+        elif (
+            self.recovery_disposition
+            is RecoveryDisposition.RECONCILE_SUBMISSION
+            and (
+                self.provider_task_id is not None
+                or not _is_ambiguous_submission(self.error)
+            )
+        ):
+            raise ValueError(
+                "reconcile disposition requires ambiguous submission "
+                "without a provider_task_id"
+            )
         if (
             self.state is RunState.SUCCESS
             and self.actual_output_count != self.expected_output_count
@@ -367,7 +439,19 @@ class RunRecord(_FrozenModel):
             raise ValueError("transition cannot replace provider_task_id")
 
         if self.state is RunState.INCOMPLETE:
-            self._validate_ambiguous_reconciliation(new_state, updates)
+            updates.setdefault("recovery_disposition", None)
+            if (
+                self.recovery_disposition
+                is RecoveryDisposition.RECONCILE_SUBMISSION
+            ):
+                self._validate_ambiguous_reconciliation(new_state, updates)
+            elif (
+                self.recovery_disposition
+                is RecoveryDisposition.RESUME_PROVIDER_TASK
+            ):
+                self._validate_provider_resume(new_state, updates)
+            else:
+                self._validate_ambiguous_reconciliation(new_state, updates)
         else:
             allowed_states = _NORMAL_RUN_TRANSITIONS.get(self.state, frozenset())
             if new_state not in allowed_states:
@@ -432,6 +516,22 @@ class RunRecord(_FrozenModel):
                 "a nonblank provider_task_id must be attached during "
                 "ambiguous reconciliation"
             )
+        if updates.get("recovery_disposition", self.recovery_disposition) is not None:
+            raise ValueError("reconciliation must clear recovery_disposition")
+
+    def _validate_provider_resume(
+        self,
+        new_state: RunState,
+        updates: dict[str, Any],
+    ) -> None:
+        if new_state not in {RunState.SUBMITTED, RunState.RUNNING}:
+            raise ValueError(
+                "resumable INCOMPLETE can only return to an active state"
+            )
+        if self.provider_task_id is None:
+            raise ValueError("resumable INCOMPLETE requires a provider_task_id")
+        if updates.get("recovery_disposition", self.recovery_disposition) is not None:
+            raise ValueError("provider resume must clear recovery_disposition")
 
 
 # Planning DTOs deliberately use tuples rather than mutable containers.  Plans are

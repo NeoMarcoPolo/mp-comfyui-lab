@@ -16,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from mp_comfyui_lab.graph.hashing import capability_hash
 from mp_comfyui_lab.json_types import SanitizedJsonObject, thaw_json
 
 from .models import (
@@ -618,19 +619,33 @@ def _correction_addresses_failure(
         return False
     if variant.hypothesis not in correction.changed_dimensions:
         return False
-    if (
-        variant.exact_run_hash == correction.failed_exact_run_hash
-        or variant.capability_hash == correction.failed_capability_hash
-    ):
+    if variant.exact_run_hash == correction.failed_exact_run_hash:
         return False
     failed_key = (
         correction.failed_variant_id,
         correction.failed_exact_run_hash,
         correction.failed_capability_hash,
     )
-    if failed_key not in history.failed_variants.get(
+    failed_variant = history.failed_variants.get(
         correction.failure_signature,
         {},
+    ).get(failed_key)
+    if failed_variant is None:
+        return False
+    try:
+        failed_capability_hash = capability_hash(
+            thaw_json(failed_variant.materialized_graph)
+        )
+        candidate_capability_hash = capability_hash(
+            thaw_json(variant.materialized_graph)
+        )
+    except ValueError:
+        return False
+    if (
+        failed_variant.capability_hash != failed_capability_hash
+        or correction.failed_capability_hash != failed_capability_hash
+        or variant.capability_hash != candidate_capability_hash
+        or candidate_capability_hash == failed_capability_hash
     ):
         return False
     if correction.failure_signature.startswith("missing-node:"):
