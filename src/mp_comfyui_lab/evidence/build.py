@@ -28,8 +28,11 @@ from mp_comfyui_lab.evidence.models import (
     EvidenceWarning,
     LoraStrengthRange,
     MutationClaim,
+    PRIOR_FINALISTS_SCHEMA_VERSION,
+    PRIOR_HANDOFF_SCHEMA_VERSION,
     PriorFinalistsArtifact,
     PriorHandoffArtifact,
+    PriorObservationRecord,
     VisibleOutputEvidence,
 )
 from mp_comfyui_lab.graph.models import (
@@ -349,36 +352,27 @@ def _extract_observation(source: CurrentEvidenceInput) -> EvidenceObservation:
 class _EvidenceRecord:
     source: EvidenceSource
     observation: EvidenceObservation
-    identity: tuple[str, str]
     payload_fingerprint: str
 
 
-def _identity_for_source(source: EvidenceSource) -> tuple[str, str]:
+def _identities_for_source(source: EvidenceSource) -> tuple[tuple[str, str], ...]:
+    identities = [("source_id", source.source_id)]
     if source.source_hash is not None:
-        return ("source_hash", source.source_hash)
+        identities.append(("source_hash", source.source_hash))
     if source.capability_hash is not None:
-        return ("capability_hash", source.capability_hash)
-    return ("source_id", source.source_id)
+        identities.append(("capability_hash", source.capability_hash))
+    return tuple(identities)
 
 
 def _record_payload_fingerprint(
     source: EvidenceSource,
     observation: EvidenceObservation,
 ) -> str:
-    source_payload = source.model_dump(mode="json")
-    source_payload.pop("source_id", None)
-    source_payload.pop("canonical_url", None)
-    source_payload.pop("artifact_path", None)
-    source_payload.pop("content_sha256", None)
+    del source
     observation_payload = observation.model_dump(mode="json")
     observation_payload.pop("source_id", None)
     return hashlib.sha256(
-        _canonical_json(
-            {
-                "source": source_payload,
-                "observation": observation_payload,
-            }
-        ).encode("utf-8")
+        _canonical_json(observation_payload).encode("utf-8")
     ).hexdigest()
 
 
@@ -394,7 +388,6 @@ def _current_record(source: CurrentEvidenceInput) -> _EvidenceRecord:
     return _EvidenceRecord(
         source=provenance,
         observation=observation,
-        identity=_identity_for_source(provenance),
         payload_fingerprint=_record_payload_fingerprint(provenance, observation),
     )
 
@@ -575,6 +568,102 @@ def _validate_json_bounds(value: Any) -> None:
         raise ValueError("unsupported JSON value")
 
 
+def _artifact_open_flags() -> int:
+    flags = os.O_RDONLY
+    for name in ("O_BINARY", "O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= getattr(os, name, 0)
+    return flags
+
+
+def _descriptor_matches_path(descriptor_info: os.stat_result, path: Path) -> bool:
+    try:
+        path_info = path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(descriptor_info, "st_file_attributes", 0) & reparse_flag:
+        return False
+    if getattr(path_info, "st_file_attributes", 0) & reparse_flag:
+        return False
+    descriptor_identity = (descriptor_info.st_dev, descriptor_info.st_ino)
+    path_identity = (path_info.st_dev, path_info.st_ino)
+    if all(descriptor_identity) and all(path_identity):
+        return descriptor_identity == path_identity
+    return True
+
+
+def _read_regular_artifact(
+    path: Path,
+    root: Path,
+    relative: str,
+    warnings: list[EvidenceWarning],
+) -> bytes | None:
+    try:
+        descriptor = os.open(path, _artifact_open_flags())
+    except OSError:
+        warnings.append(
+            _warning(
+                "unsafe_path",
+                "artifact is not a safe regular file",
+                relative,
+            )
+        )
+        return None
+
+    try:
+        descriptor_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(descriptor_info.st_mode)
+            or not _descriptor_matches_path(descriptor_info, path)
+            or not _safe_under_root(path, root)
+        ):
+            warnings.append(
+                _warning(
+                    "unsafe_path",
+                    "artifact is not a safe regular file",
+                    relative,
+                )
+            )
+            return None
+        if descriptor_info.st_size > MAX_PRIOR_FILE_BYTES:
+            warnings.append(
+                _warning(
+                    "oversized_artifact",
+                    f"artifact exceeds {MAX_PRIOR_FILE_BYTES} byte limit",
+                    relative,
+                )
+            )
+            return None
+
+        chunks: list[bytes] = []
+        remaining = MAX_PRIOR_FILE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError:
+        warnings.append(
+            _warning("malformed_artifact", "artifact could not be read", relative)
+        )
+        return None
+    finally:
+        os.close(descriptor)
+
+    if len(raw) > MAX_PRIOR_FILE_BYTES:
+        warnings.append(
+            _warning(
+                "oversized_artifact",
+                f"artifact exceeds {MAX_PRIOR_FILE_BYTES} byte limit",
+                relative,
+            )
+        )
+        return None
+    return raw
+
+
 def _prior_records_from_graph(
     graph: EvidenceGraph,
     *,
@@ -599,7 +688,6 @@ def _prior_records_from_graph(
             _EvidenceRecord(
                 source=source,
                 observation=observation,
-                identity=_identity_for_source(source),
                 payload_fingerprint=_record_payload_fingerprint(source, observation),
             )
         )
@@ -607,25 +695,29 @@ def _prior_records_from_graph(
 
 
 def _prior_records_from_observations(
-    observations: Sequence[EvidenceObservation],
+    records_with_provenance: Sequence[PriorObservationRecord],
     *,
     kind: EvidenceSourceKind,
     artifact_path: str,
     content_sha256: str,
 ) -> tuple[_EvidenceRecord, ...]:
     records = []
-    for observation in observations:
+    for record in records_with_provenance:
+        observation = record.observation
+        provenance = record.source
         source = EvidenceSource(
             source_id=observation.source_id,
             kind=kind,
+            canonical_url=provenance.canonical_url,
             artifact_path=artifact_path,
+            source_hash=provenance.source_hash,
+            capability_hash=provenance.capability_hash,
             content_sha256=content_sha256,
         )
         records.append(
             _EvidenceRecord(
                 source=source,
                 observation=observation,
-                identity=_identity_for_source(source),
                 payload_fingerprint=_record_payload_fingerprint(source, observation),
             )
         )
@@ -644,38 +736,8 @@ def _read_prior_artifact(
             _warning("unsafe_path", "reparse point or path escape rejected", relative)
         )
         return ()
-    try:
-        size = path.stat().st_size
-    except OSError:
-        warnings.append(
-            _warning("unsafe_path", "could not inspect allowed artifact", relative)
-        )
-        return ()
-    if size > MAX_PRIOR_FILE_BYTES:
-        warnings.append(
-            _warning(
-                "oversized_artifact",
-                f"artifact exceeds {MAX_PRIOR_FILE_BYTES} byte limit",
-                relative,
-            )
-        )
-        return ()
-    try:
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_PRIOR_FILE_BYTES + 1)
-    except OSError:
-        warnings.append(
-            _warning("malformed_artifact", "artifact could not be read", relative)
-        )
-        return ()
-    if len(raw) > MAX_PRIOR_FILE_BYTES:
-        warnings.append(
-            _warning(
-                "oversized_artifact",
-                f"artifact exceeds {MAX_PRIOR_FILE_BYTES} byte limit",
-                relative,
-            )
-        )
+    raw = _read_regular_artifact(path, root, relative, warnings)
+    if raw is None:
         return ()
 
     try:
@@ -716,11 +778,16 @@ def _read_prior_artifact(
             _warning("malformed_artifact", "artifact root must be an object", relative)
         )
         return ()
-    if payload.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+    expected_schema_version = {
+        EvidenceSourceKind.PRIOR_EVIDENCE_GRAPH: EVIDENCE_SCHEMA_VERSION,
+        EvidenceSourceKind.PRIOR_FINALISTS: PRIOR_FINALISTS_SCHEMA_VERSION,
+        EvidenceSourceKind.PRIOR_HANDOFF: PRIOR_HANDOFF_SCHEMA_VERSION,
+    }[kind]
+    if payload.get("schema_version") != expected_schema_version:
         warnings.append(
             _warning(
                 "unknown_schema",
-                f"artifact schema_version must equal {EVIDENCE_SCHEMA_VERSION}",
+                f"artifact schema_version must equal {expected_schema_version}",
                 relative,
             )
         )
@@ -805,43 +872,103 @@ def _deduplicate_records(
     records: Iterable[_EvidenceRecord],
     warnings: Iterable[EvidenceWarning],
 ) -> EvidenceGraph:
-    grouped: dict[tuple[str, str], list[_EvidenceRecord]] = defaultdict(list)
-    for record in records:
-        grouped[record.identity].append(record)
-
-    selected: list[_EvidenceRecord] = []
-    all_warnings = list(warnings)
-    for identity in sorted(grouped):
-        candidates = sorted(
-            grouped[identity],
+    ordered_records = tuple(
+        sorted(
+            records,
             key=lambda item: (
                 item.source.source_id,
                 item.payload_fingerprint,
                 item.source.kind.value,
                 item.source.artifact_path or "",
+                item.source.canonical_url or "",
+                item.source.source_hash or "",
+                item.source.capability_hash or "",
             ),
         )
+    )
+    parents = list(range(len(ordered_records)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        lower, higher = sorted((left_root, right_root))
+        parents[higher] = lower
+
+    identity_owner: dict[tuple[str, str], int] = {}
+    for index, record in enumerate(ordered_records):
+        for identity in _identities_for_source(record.source):
+            owner = identity_owner.setdefault(identity, index)
+            union(index, owner)
+
+    grouped: dict[int, list[_EvidenceRecord]] = defaultdict(list)
+    for index, record in enumerate(ordered_records):
+        grouped[find(index)].append(record)
+
+    selected: list[_EvidenceRecord] = []
+    all_warnings = list(warnings)
+    for component_index in sorted(grouped):
+        candidates = grouped[component_index]
         winner = candidates[0]
         fingerprints = {candidate.payload_fingerprint for candidate in candidates}
+        source_hashes = sorted(
+            {
+                candidate.source.source_hash
+                for candidate in candidates
+                if candidate.source.source_hash is not None
+            }
+        )
+        capability_hashes = sorted(
+            {
+                candidate.source.capability_hash
+                for candidate in candidates
+                if candidate.source.capability_hash is not None
+            }
+        )
+        conflict_fields = []
         if len(fingerprints) > 1:
+            conflict_fields.append("observation payload")
+        if len(source_hashes) > 1:
+            conflict_fields.append("source_hash")
+        if len(capability_hashes) > 1:
+            conflict_fields.append("capability_hash")
+        if conflict_fields:
             all_warnings.append(
                 _warning(
                     "conflicting_duplicate",
-                    "duplicate source identity has conflicting payloads; "
-                    "canonical source_id and payload fingerprint order selected deterministically",
+                    "duplicate identity component has conflicting payloads "
+                    f"({', '.join(conflict_fields)}); canonical source_id and "
+                    "payload fingerprint order selected deterministically",
                     winner.source.artifact_path,
                 )
             )
         canonical_id = min(candidate.source.source_id for candidate in candidates)
-        if winner.source.source_id != canonical_id:
-            winner = _EvidenceRecord(
-                source=winner.source.model_copy(update={"source_id": canonical_id}),
-                observation=winner.observation.model_copy(
-                    update={"source_id": canonical_id}
+        source_payload = winner.source.model_dump()
+        source_payload.update(
+            {
+                "source_id": canonical_id,
+                "source_hash": source_hashes[0] if source_hashes else None,
+                "capability_hash": (
+                    capability_hashes[0] if capability_hashes else None
                 ),
-                identity=winner.identity,
-                payload_fingerprint=winner.payload_fingerprint,
-            )
+            }
+        )
+        reconciled_source = EvidenceSource(**source_payload)
+        reconciled_observation = winner.observation.model_copy(
+            update={"source_id": canonical_id}
+        )
+        winner = _EvidenceRecord(
+            source=reconciled_source,
+            observation=reconciled_observation,
+            payload_fingerprint=winner.payload_fingerprint,
+        )
         selected.append(winner)
 
     return EvidenceGraph(
@@ -968,13 +1095,19 @@ def _assess_observation(
     topology_matches = not any(
         dimension in topology_dimensions for dimension in differing
     )
+    substantive_matching_topology = bool(
+        claim.loader_topology
+        and observation.loader_topology
+        and claim.encoder_topology
+        and observation.encoder_topology
+        and claim.loras
+        and observation.loras
+        and topology_matches
+    )
     declared = set(claim.changed_dimensions)
     if (
         exact_family
-        and claim.loras is not None
-        and claim.loader_topology is not None
-        and claim.encoder_topology is not None
-        and topology_matches
+        and substantive_matching_topology
         and len(differing) == 1
         and set(differing) == declared
     ):
@@ -987,14 +1120,7 @@ def _assess_observation(
             "declared changed dimension",
         )
 
-    meaningful_overlap = bool(matched) or (
-        claim.loras is not None
-        and bool(
-            {_canonical_identity(value) for value in claim.loras}
-            & {_canonical_identity(value) for value in observation.loras}
-        )
-    )
-    if exact_family or (partial_family and meaningful_overlap):
+    if exact_family or partial_family:
         reason = (
             "exact combination lacks visible output evidence"
             if exact_relevant and not observation.visible_output.has_visible_output

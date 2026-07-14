@@ -29,6 +29,8 @@ from mp_comfyui_lab.security import sanitize_for_persistence, sanitize_untrusted
 
 
 EVIDENCE_SCHEMA_VERSION = "1"
+PRIOR_FINALISTS_SCHEMA_VERSION = "evidence-finalists/1"
+PRIOR_HANDOFF_SCHEMA_VERSION = "evidence-handoff/1"
 MAX_EVIDENCE_TEXT_LENGTH = 512
 MAX_EVIDENCE_ITEMS = 1_024
 MAX_EVIDENCE_EXPLANATION_LENGTH = MAX_EVIDENCE_TEXT_LENGTH * MAX_EVIDENCE_ITEMS
@@ -516,14 +518,29 @@ class CurrentEvidenceInput(_FrozenModel):
         return self
 
 
+class PriorObservationRecord(_FrozenModel):
+    source: EvidenceSource
+    observation: EvidenceObservation
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> PriorObservationRecord:
+        if self.source.source_id != self.observation.source_id:
+            raise ValueError("prior source_id must match observation source_id")
+        if self.source.canonical_url is None:
+            raise ValueError("prior observation provenance requires canonical_url")
+        return self
+
+
 class PriorFinalistsArtifact(_FrozenModel):
-    schema_version: Literal["1"] = EVIDENCE_SCHEMA_VERSION
-    finalists: tuple[EvidenceObservation, ...] = Field(
+    schema_version: Literal["evidence-finalists/1"] = (
+        PRIOR_FINALISTS_SCHEMA_VERSION
+    )
+    finalists: tuple[PriorObservationRecord, ...] = Field(
         default=(),
         max_length=MAX_EVIDENCE_ITEMS,
     )
 
 
 class PriorHandoffArtifact(_FrozenModel):
-    schema_version: Literal["1"] = EVIDENCE_SCHEMA_VERSION
-    selected: EvidenceObservation
+    schema_version: Literal["evidence-handoff/1"] = PRIOR_HANDOFF_SCHEMA_VERSION
+    selected: PriorObservationRecord

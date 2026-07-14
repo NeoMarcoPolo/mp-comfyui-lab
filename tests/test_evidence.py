@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
+import socket
 from time import perf_counter
 
 from pydantic import ValidationError
@@ -29,8 +31,11 @@ from mp_comfyui_lab.evidence.models import (
     EvidenceSourceKind,
     EvidenceWarning,
     MutationClaim,
+    PRIOR_FINALISTS_SCHEMA_VERSION,
+    PRIOR_HANDOFF_SCHEMA_VERSION,
     PriorFinalistsArtifact,
     PriorHandoffArtifact,
+    PriorObservationRecord,
 )
 from mp_comfyui_lab.executors.base import CapabilityReport
 from mp_comfyui_lab.graph.models import strength_bucket
@@ -227,6 +232,14 @@ def _prior_graph(source_id: str) -> EvidenceGraph:
     )
 
 
+def _prior_record(source_id: str) -> PriorObservationRecord:
+    graph = _prior_graph(source_id)
+    return PriorObservationRecord(
+        source=graph.sources[0],
+        observation=graph.observations[0],
+    )
+
+
 def test_exact_qwen_multi_angle_consistency_with_visible_output_is_observed() -> None:
     graph = build_evidence_graph((_current_source(),), prior_experiment_roots=())
     observation = graph.observations[0]
@@ -263,6 +276,20 @@ def test_same_family_matching_topology_one_declared_change_is_strongly_inferred(
     assert assessment.differing_dimensions == (EvidenceDimension.CHECKPOINT,)
     assert assessment.supporting_source_ids == ("workflow-1",)
     assert "checkpoint" in assessment.explanation
+
+
+def test_partial_model_family_alone_is_weakly_inferred() -> None:
+    graph = build_evidence_graph((_current_source(),), prior_experiment_roots=())
+    claim = MutationClaim(
+        checkpoint="qwen_image_edit_2509_fp8.safetensors",
+        model_family="qwen_image_edit_2509",
+    )
+
+    assessment = assess_claim(claim, graph)
+
+    assert assessment.label is ConfidenceLabel.WEAKLY_INFERRED
+    assert assessment.supporting_source_ids == ("workflow-1",)
+    assert assessment.matched_dimensions == ()
 
 
 def test_lora_order_and_loader_topology_mismatch_is_weakly_inferred() -> None:
@@ -550,6 +577,31 @@ def test_strong_inference_requires_claimed_loader_encoder_and_lora_topology() ->
     assert "topology" in assessment.explanation.casefold()
 
 
+@pytest.mark.parametrize("empty_dimension", ["loader_topology", "encoder_topology", "loras"])
+def test_strong_inference_rejects_matching_empty_topology(
+    empty_dimension: str,
+) -> None:
+    base = build_evidence_graph((_current_source(),), prior_experiment_roots=())
+    observation = base.observations[0]
+    updates: dict[str, object] = {empty_dimension: ()}
+    if empty_dimension == "loras":
+        updates["lora_strengths"] = ()
+    sparse = EvidenceObservation(**{
+        **observation.model_dump(),
+        **updates,
+    })
+    graph = EvidenceGraph(sources=base.sources, observations=(sparse,))
+    claim = _claim(
+        sparse,
+        checkpoint="qwen_image_edit_2511_fp8.safetensors",
+        changed_dimensions=(EvidenceDimension.CHECKPOINT,),
+    )
+
+    assessment = assess_claim(claim, graph)
+
+    assert assessment.label is ConfidenceLabel.WEAKLY_INFERRED
+
+
 def test_nsfw_and_unknown_support_remains_visible() -> None:
     sources = (
         _current_source("nsfw-source", classification=ContentClassification.NSFW),
@@ -695,6 +747,94 @@ def test_duplicate_source_identity_prefers_hash_then_capability_then_source_id()
     ]
 
 
+def test_duplicate_identity_coalescing_is_transitive_across_hash_kinds() -> None:
+    source_hash = "a" * 64
+    capability_hash = "b" * 64
+    sources = (
+        _current_source(
+            "source-c",
+            source_hash=None,
+            capability_hash=capability_hash,
+        ),
+        _current_source(
+            "source-b",
+            source_hash=source_hash,
+            capability_hash=capability_hash,
+        ),
+        _current_source(
+            "source-a",
+            source_hash=source_hash,
+            capability_hash=None,
+        ),
+    )
+
+    forward = build_evidence_graph(sources, prior_experiment_roots=())
+    reverse = build_evidence_graph(tuple(reversed(sources)), prior_experiment_roots=())
+
+    assert forward.canonical_json() == reverse.canonical_json()
+    assert [source.source_id for source in forward.sources] == ["source-a"]
+    assert [item.source_id for item in forward.observations] == ["source-a"]
+    assert forward.sources[0].source_hash == source_hash
+    assert forward.sources[0].capability_hash == capability_hash
+
+
+def test_duplicate_identity_coalescing_bridges_missing_and_mixed_identifiers() -> None:
+    source_hash = "c" * 64
+    sources = (
+        _current_source(
+            "shared-id",
+            source_hash=None,
+            capability_hash=None,
+        ),
+        _current_source(
+            "shared-id",
+            source_hash=source_hash,
+            capability_hash=None,
+        ),
+        _current_source(
+            "other-id",
+            source_hash=source_hash,
+            capability_hash=None,
+        ),
+    )
+
+    graph = build_evidence_graph(sources, prior_experiment_roots=())
+
+    assert len(graph.sources) == 1
+    assert graph.sources[0].source_id == "other-id"
+    assert graph.sources[0].source_hash == source_hash
+    assert graph.observations[0].source_id == "other-id"
+
+
+def test_transitive_conflicts_warn_deterministically_without_duplicate_source_ids() -> None:
+    first_hash = "d" * 64
+    second_hash = "e" * 64
+    sources = (
+        _current_source(
+            "shared-id",
+            graph=_workflow_graph(sampler="euler"),
+            source_hash=first_hash,
+        ),
+        _current_source(
+            "shared-id",
+            graph=_workflow_graph(sampler="heun"),
+            source_hash=second_hash,
+        ),
+        _current_source(
+            "linked-id",
+            graph=_workflow_graph(sampler="heun"),
+            source_hash=second_hash,
+        ),
+    )
+
+    forward = build_evidence_graph(sources, prior_experiment_roots=())
+    reverse = build_evidence_graph(tuple(reversed(sources)), prior_experiment_roots=())
+
+    assert forward.canonical_json() == reverse.canonical_json()
+    assert len(forward.sources) == len({item.source_id for item in forward.sources}) == 1
+    assert any(item.code == "conflicting_duplicate" for item in forward.warnings)
+
+
 def test_conflicting_duplicate_payload_warns_deterministically_never_last_wins() -> None:
     shared_hash = "c" * 64
     first = _current_source(
@@ -758,8 +898,8 @@ def test_prior_finalists_and_handoff_support_allowed_root_shapes(
 ) -> None:
     experiments = tmp_path / "experiments"
     experiment = experiments / "prior-exp"
-    finalist = _prior_graph("prior-finalist").observations[0]
-    handoff = _prior_graph("prior-handoff").observations[0]
+    finalist = _prior_record("prior-finalist")
+    handoff = _prior_record("prior-handoff")
     _write_json(
         experiment / "finalists.json",
         PriorFinalistsArtifact(finalists=(finalist,)),
@@ -804,13 +944,13 @@ def test_prior_scan_reads_only_known_schema_locations_and_creates_no_catalog(
         path.write_text('{"schema_version":"1","secret":"do-not-read"}', encoding="utf-8")
 
     opened: list[Path] = []
-    original_open = Path.open
+    original_open = evidence_build.os.open
 
-    def open_spy(path: Path, *args, **kwargs):
-        opened.append(path)
-        return original_open(path, *args, **kwargs)
+    def open_spy(path, flags, *args, **kwargs):
+        opened.append(Path(path))
+        return original_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", open_spy)
+    monkeypatch.setattr(evidence_build.os, "open", open_spy)
 
     graph = build_evidence_graph((), prior_experiment_roots=(tmp_path,))
 
@@ -866,7 +1006,11 @@ def test_prior_json_with_duplicate_object_keys_is_rejected(tmp_path: Path) -> No
     artifact = tmp_path / "experiments" / "prior-exp" / "finalists.json"
     artifact.parent.mkdir(parents=True)
     artifact.write_text(
-        '{"schema_version":"1","schema_version":"1","finalists":[]}',
+        (
+            '{"schema_version":"'
+            f'{PRIOR_FINALISTS_SCHEMA_VERSION}","schema_version":"'
+            f'{PRIOR_FINALISTS_SCHEMA_VERSION}","finalists":[]}}'
+        ),
         encoding="utf-8",
     )
 
@@ -878,6 +1022,86 @@ def test_prior_json_with_duplicate_object_keys_is_rejected(tmp_path: Path) -> No
     assert "duplicate" in graph.warnings[0].reason.casefold()
 
 
+def test_prior_artifact_open_uses_nofollow_nonblocking_flags_where_supported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "experiments" / "prior-exp" / "finalists.json"
+    _write_json(
+        artifact,
+        PriorFinalistsArtifact(finalists=(_prior_record("prior"),)),
+    )
+    opened_flags: list[int] = []
+    original_open = evidence_build.os.open
+
+    def open_spy(path, flags, *args, **kwargs):
+        opened_flags.append(flags)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(evidence_build.os, "open", open_spy)
+
+    graph = build_evidence_graph((), prior_experiment_roots=(tmp_path,))
+
+    assert {item.source_id for item in graph.observations} == {"prior"}
+    assert len(opened_flags) == 1
+    if hasattr(os, "O_NOFOLLOW"):
+        assert opened_flags[0] & os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        assert opened_flags[0] & os.O_NONBLOCK
+
+
+def test_known_directory_artifact_is_rejected_as_non_regular_without_blocking(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "experiments" / "prior-exp" / "finalists.json"
+    artifact.mkdir(parents=True)
+
+    started = perf_counter()
+    graph = build_evidence_graph((), prior_experiment_roots=(tmp_path,))
+
+    assert perf_counter() - started < 1.0
+    assert graph.observations == ()
+    assert len(graph.warnings) == 1
+    assert graph.warnings[0].code == "unsafe_path"
+    assert "regular file" in graph.warnings[0].reason
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO unavailable")
+def test_known_fifo_artifact_is_rejected_without_hanging(tmp_path: Path) -> None:
+    artifact = tmp_path / "experiments" / "prior-exp" / "finalists.json"
+    artifact.parent.mkdir(parents=True)
+    os.mkfifo(artifact)
+
+    started = perf_counter()
+    graph = build_evidence_graph((), prior_experiment_roots=(tmp_path,))
+
+    assert perf_counter() - started < 1.0
+    assert graph.observations == ()
+    assert graph.warnings[0].code == "unsafe_path"
+    assert "regular file" in graph.warnings[0].reason
+
+
+@pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX") or os.name == "nt",
+    reason="Unix sockets unavailable",
+)
+def test_known_socket_artifact_is_rejected_without_hanging(tmp_path: Path) -> None:
+    artifact = tmp_path / "experiments" / "prior-exp" / "finalists.json"
+    artifact.parent.mkdir(parents=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(artifact))
+        started = perf_counter()
+        graph = build_evidence_graph((), prior_experiment_roots=(tmp_path,))
+    finally:
+        server.close()
+
+    assert perf_counter() - started < 1.0
+    assert graph.observations == ()
+    assert graph.warnings[0].code == "unsafe_path"
+    assert "regular file" in graph.warnings[0].reason
+
+
 def test_symlinked_artifact_and_export_directory_are_rejected_without_escape(
     tmp_path: Path,
 ) -> None:
@@ -886,7 +1110,7 @@ def test_symlinked_artifact_and_export_directory_are_rejected_without_escape(
     external = outside / "handoff.json"
     _write_json(
         external,
-        PriorHandoffArtifact(selected=_prior_graph("escaped").observations[0]),
+        PriorHandoffArtifact(selected=_prior_record("escaped")),
     )
     experiment = tmp_path / "experiments" / "prior-exp"
     direct_link = experiment / "evidence" / "graph.json"
@@ -920,7 +1144,7 @@ def test_root_and_file_count_limits_fail_closed(tmp_path: Path, monkeypatch) -> 
         _write_json(
             experiment / "export" / str(index) / "handoff.json",
             PriorHandoffArtifact(
-                selected=_prior_graph(f"prior-{index}").observations[0]
+                selected=_prior_record(f"prior-{index}")
             ),
         )
     monkeypatch.setattr(evidence_build, "MAX_PRIOR_ROOTS", 10)
@@ -941,7 +1165,7 @@ def test_prior_scan_is_deterministic_and_linear_across_many_roots(tmp_path: Path
         _write_json(
             root / "finalists.json",
             PriorFinalistsArtifact(
-                finalists=(_prior_graph(f"prior-{index:03d}").observations[0],)
+                finalists=(_prior_record(f"prior-{index:03d}"),)
             ),
         )
 
@@ -957,14 +1181,74 @@ def test_prior_scan_is_deterministic_and_linear_across_many_roots(tmp_path: Path
 
 
 def test_prior_artifact_models_reject_unknown_fields_and_wrong_schema() -> None:
-    observation = _prior_graph("prior").observations[0]
+    record = _prior_record("prior")
     with pytest.raises(ValidationError):
         PriorFinalistsArtifact(
             schema_version="999",
-            finalists=(observation,),
+            finalists=(record,),
         )
     with pytest.raises(ValidationError):
-        PriorHandoffArtifact(selected=observation, hidden_catalog="forbidden")
+        PriorHandoffArtifact(selected=record, hidden_catalog="forbidden")
+
+
+def test_prior_finalist_and_handoff_records_require_and_preserve_sanitized_provenance(
+    tmp_path: Path,
+) -> None:
+    graph = _prior_graph("prior-provenance")
+    record = PriorObservationRecord(
+        source=EvidenceSource(
+            **{
+                **graph.sources[0].model_dump(),
+                "canonical_url": (
+                    "https://www.runninghub.ai/post/prior-provenance?token=secret"
+                ),
+            }
+        ),
+        observation=graph.observations[0],
+    )
+    experiment = tmp_path / "experiments" / "prior-exp"
+    _write_json(
+        experiment / "finalists.json",
+        PriorFinalistsArtifact(finalists=(record,)),
+    )
+    _write_json(
+        experiment / "export" / "selected" / "handoff.json",
+        PriorHandoffArtifact(selected=record),
+    )
+
+    evidence = build_evidence_graph((), prior_experiment_roots=(tmp_path,))
+
+    assert len(evidence.sources) == 1
+    assert evidence.sources[0].canonical_url == (
+        "https://www.runninghub.ai/post/prior-provenance"
+    )
+    assert "secret" not in evidence.canonical_json()
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "payload"),
+    [
+        ("finalists.json", {"finalists": []}),
+        (
+            "export/selected/handoff.json",
+            {"schema_version": "1", "selected": {}},
+        ),
+    ],
+)
+def test_unversioned_or_unknown_prior_shapes_warn_deterministically(
+    tmp_path: Path,
+    relative_path: str,
+    payload: dict[str, object],
+) -> None:
+    experiment = tmp_path / "experiments" / "prior-exp"
+    _write_json(experiment / relative_path, payload)
+
+    graph = build_evidence_graph((), prior_experiment_roots=(tmp_path,))
+
+    assert graph.observations == ()
+    assert len(graph.warnings) == 1
+    assert graph.warnings[0].code == "unknown_schema"
+    assert graph.warnings[0].path == f"experiments/prior-exp/{relative_path}"
 
 
 def test_graph_model_rejects_conflicting_duplicate_records() -> None:
