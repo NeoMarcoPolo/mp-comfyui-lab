@@ -257,6 +257,34 @@ def test_source_and_mapping_order_produce_byte_identical_canonical_plan_json(tmp
     assert first.plan_hash == second.plan_hash
 
 
+def test_source_and_candidate_order_produce_identical_plan_bytes(tmp_path: Path) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    first_source = _source(workflow_id="123")
+    second_source = _source(workflow_id="124")
+    evidence = EvidenceGraph(
+        sources=tuple(
+            EvidenceSource(
+                source_id=item.workflow_id,
+                kind=EvidenceSourceKind.CURRENT_NORMALIZED_GRAPH,
+                canonical_url=item.canonical_url,
+                source_hash=item.source_hash,
+                capability_hash=item.capability_hash,
+            )
+            for item in (first_source, second_source)
+        ),
+        observations=tuple(EvidenceObservation(source_id=item.workflow_id) for item in (first_source, second_source)),
+    )
+    patch = SemanticPatch(mutations=(SetRoleInput(role=SemanticRole.CHECKPOINT, binding_index=0, field_name="ckpt_name", value="next.safetensors"),))
+    candidates = (
+        Candidate(candidate_id="one", hypothesis="checkpoint", capability_signature="checkpoint:one", confidence="observed", evidence_ids=("123",), semantic_patch=patch),
+        Candidate(candidate_id="two", hypothesis="checkpoint", capability_signature="checkpoint:two", confidence="observed", evidence_ids=("124",), semantic_patch=patch),
+    )
+    first = build_plan(_brief(), SourceBundle(sources=(first_source, second_source), candidates=candidates, evidence_graph=evidence), config=_config(tmp_path))
+    second = build_plan(_brief(), SourceBundle(sources=(second_source, first_source), candidates=tuple(reversed(candidates)), evidence_graph=evidence), config=_config(tmp_path))
+    assert first.canonical_json() == second.canonical_json()
+    assert first.plan_hash == second.plan_hash
+
+
 def test_fixture_resolution_rejects_symlink_special_and_changed_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "target.png"
     target.write_bytes(b"fixture")
@@ -268,6 +296,21 @@ def test_fixture_resolution_rejects_symlink_special_and_changed_file(tmp_path: P
     brief = _brief(fixtures={"reference_images": [{"uri": "link.png", "binding_index": 0}], "prompt_lines": ["x"]})
     with pytest.raises(Exception):
         build_plan(brief, _bundle(), config=_config(tmp_path))
+
+
+@pytest.mark.skipif(os.name == "nt" or not hasattr(os, "mkfifo"), reason="POSIX special-file coverage")
+def test_fixture_descriptor_walk_rejects_fifo_and_intermediate_symlink(tmp_path: Path) -> None:
+    os.mkfifo(tmp_path / "fixture.pipe")
+    fifo_brief = _brief(fixtures={"reference_images": [{"uri": "fixture.pipe", "binding_index": 0}], "prompt_lines": ["x"]})
+    with pytest.raises(Exception, match="regular file"):
+        build_plan(fifo_brief, _bundle(), config=_config(tmp_path))
+    target = tmp_path / "real"
+    target.mkdir()
+    (target / "portrait.png").write_bytes(b"fixture")
+    (tmp_path / "swapped").symlink_to(target, target_is_directory=True)
+    race_brief = _brief(fixtures={"reference_images": [{"uri": "swapped/portrait.png", "binding_index": 0}], "prompt_lines": ["x"]})
+    with pytest.raises(Exception):
+        build_plan(race_brief, _bundle(), config=_config(tmp_path))
 
 
 def test_fixture_fingerprint_detects_a_change_during_descriptor_read(

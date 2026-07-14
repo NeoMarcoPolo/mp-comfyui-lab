@@ -577,3 +577,26 @@ def test_default_read_only_planning_loader_uses_only_public_discovery_methods():
     call_names = [call[0] for call in executor.calls]
     assert set(call_names) == {"search", "fetch_workflow", "inspect_capabilities"}
     assert call_names[-2:] == ["fetch_workflow", "inspect_capabilities"]
+
+
+def test_plan_main_constructs_only_read_only_default_executor(tmp_path, capsys, monkeypatch):
+    graph = json.loads((Path(__file__).parent / "fixtures" / "runninghub" / "qwen_graph.json").read_text(encoding="utf-8"))
+    executor = ReadOnlyExecutor(graph)
+    monkeypatch.setattr(app, "RunningHubExecutor", lambda: executor)
+    manifest = tmp_path / "plan.yaml"
+    manifest.write_text("""goal: x
+sources:
+  queries: [next scene]
+  urls: []
+fixtures:
+  reference_images: []
+  prompt_lines: [one]
+expectations:
+  output_count: 1
+  media_types: [image/png]
+dimensions:
+  checkpoint: approved
+""", encoding="utf-8")
+    assert main(["plan", str(manifest)], cwd=tmp_path) == ExitCode.OK
+    _single_json_document(capsys.readouterr())
+    assert set(call[0] for call in executor.calls) == {"search", "fetch_workflow", "inspect_capabilities"}

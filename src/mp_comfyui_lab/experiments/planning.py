@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from math import isfinite
+import ntpath
 import os
 from pathlib import Path
 import stat
@@ -237,9 +238,9 @@ def _windows_open_fixture(root: Path, parts: tuple[str, ...]) -> int:
         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
     )
     create_file.restype = wintypes.HANDLE
-    get_attributes = kernel32.GetFileAttributesW
-    get_attributes.argtypes = (wintypes.LPCWSTR,)
-    get_attributes.restype = wintypes.DWORD
+    get_information = kernel32.GetFileInformationByHandleEx
+    get_information.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD)
+    get_information.restype = wintypes.BOOL
     get_final = kernel32.GetFinalPathNameByHandleW
     get_final.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
     get_final.restype = wintypes.DWORD
@@ -255,15 +256,22 @@ def _windows_open_fixture(root: Path, parts: tuple[str, ...]) -> int:
     share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
     open_existing = 3
     file_attribute_reparse_point = 0x00000400
-    invalid_attributes = 0xFFFFFFFF
+    file_attribute_tag_info = 9
     file_flag_open_reparse_point = 0x00200000
     file_flag_backup_semantics = 0x02000000
     file_type_disk = 0x0001
 
+    class AttributeTagInfo(ctypes.Structure):
+        _fields_ = (("attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD))
+
+    def validate_handle(handle: int) -> None:
+        info = AttributeTagInfo()
+        if not get_information(handle, file_attribute_tag_info, ctypes.byref(info), ctypes.sizeof(info)):
+            raise SafetyError("cannot inspect opened fixture handle")
+        if info.attributes & file_attribute_reparse_point or info.reparse_tag:
+            raise SafetyError("fixture path contains a reparse point")
+
     def open_handle(path: Path, *, directory: bool) -> int:
-        attributes = get_attributes(str(path))
-        if attributes == invalid_attributes or attributes & file_attribute_reparse_point:
-            raise SafetyError("fixture path contains a reparse point or unavailable component")
         flags = file_flag_open_reparse_point
         if directory:
             flags |= file_flag_backup_semantics
@@ -272,16 +280,33 @@ def _windows_open_fixture(root: Path, parts: tuple[str, ...]) -> int:
         )
         if handle == invalid:
             raise SafetyError("cannot open fixture safely with Windows handle APIs")
+        try:
+            validate_handle(handle)
+        except Exception:
+            close_handle(handle)
+            raise
         return handle
 
-    def final_path(handle: int) -> Path:
+    def final_path(handle: int) -> str:
         size = get_final(handle, None, 0, 0)
         if not size:
             raise SafetyError("cannot verify final fixture handle path")
         buffer = ctypes.create_unicode_buffer(size + 1)
         if not get_final(handle, buffer, len(buffer), 0):
             raise SafetyError("cannot verify final fixture handle path")
-        return Path(buffer.value.removeprefix("\\\\?\\")).resolve()
+        value = buffer.value
+        if value.casefold().startswith("\\\\?\\unc\\"):
+            value = "\\\\" + value[8:]
+        elif value.casefold().startswith("\\\\?\\"):
+            value = value[4:]
+        return ntpath.normcase(ntpath.normpath(value))
+
+    def require_contained(root_value: str, value: str) -> None:
+        try:
+            if ntpath.commonpath((root_value, value)) != root_value:
+                raise SafetyError("fixture handle escapes configured containment")
+        except ValueError as error:
+            raise SafetyError("fixture handle escapes configured containment") from error
 
     root_handle = open_handle(root, directory=True)
     try:
@@ -293,7 +318,7 @@ def _windows_open_fixture(root: Path, parts: tuple[str, ...]) -> int:
         current /= part
         handle = open_handle(current, directory=True)
         try:
-            final_path(handle)
+            require_contained(root_final, final_path(handle))
         finally:
             close_handle(handle)
     candidate = current / parts[-1]
@@ -301,11 +326,7 @@ def _windows_open_fixture(root: Path, parts: tuple[str, ...]) -> int:
     try:
         if get_type(handle) != file_type_disk:
             raise SafetyError("fixture must be a regular disk file")
-        actual = final_path(handle)
-        try:
-            actual.relative_to(root_final)
-        except ValueError as error:
-            raise SafetyError("fixture handle escapes configured containment") from error
+        require_contained(root_final, final_path(handle))
         descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         handle = None
         return descriptor
