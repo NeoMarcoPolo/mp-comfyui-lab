@@ -720,6 +720,16 @@ class ExperimentPlan(_FrozenModel):
     def validate_plan_hash(self) -> Self:
         if self.plan_hash != self.recompute_plan_hash():
             raise ValueError("plan_hash does not match durable approval_payload")
+        payload = thaw_json(self.approval_payload)
+        durable = {
+            "source_hashes": list(self.source_hashes),
+            "variants": [item.model_dump(mode="json") for item in self.variants],
+            "capability_coverage": [item.value for item in self.capability_coverage],
+            "warnings": list(self.warnings),
+        }
+        for field_name, value in durable.items():
+            if payload.get(field_name) != value:
+                raise ValueError(f"{field_name} does not match durable approval_payload")
         return self
 
     def recompute_plan_hash(self) -> str:

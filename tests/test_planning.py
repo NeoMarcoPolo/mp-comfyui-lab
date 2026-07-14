@@ -30,8 +30,10 @@ from mp_comfyui_lab.experiments.models import (
     ExperimentBrief,
     PlanningSource,
     SourceBundle,
+    ExperimentPlan,
 )
-from mp_comfyui_lab.mutations import SemanticPatch, SetRoleInput
+from mp_comfyui_lab.mutations import LoraSpec, ReplaceLoraStack, SemanticPatch, SetRoleInput
+from mp_comfyui_lab.mutations.planner import validate_candidate_patch
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
@@ -529,3 +531,34 @@ def test_exact_hash_binds_media_and_every_output_field(tmp_path: Path) -> None:
             _bundle(),
             config=_config(tmp_path),
         )
+
+
+def test_plan_rejects_tampered_duplicate_durable_fields(tmp_path: Path) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    plan = build_plan(_brief(), _bundle(), config=_config(tmp_path))
+    payload = plan.model_dump()
+    payload["warnings"] = ("tampered",)
+    with pytest.raises(ValidationError, match="warnings does not match"):
+        ExperimentPlan.model_validate(payload)
+    payload = plan.model_dump()
+    payload["variants"][0]["exact_run_hash"] = "0" * 64
+    with pytest.raises(ValidationError, match="variants does not match"):
+        ExperimentPlan.model_validate(payload)
+
+
+def test_lora_delta_requires_strength_approval_for_non_neutral_additions() -> None:
+    graph = _graph()
+    graph["20"] = {"class_type": "LoraLoader", "inputs": {"lora_name": "base.safetensors", "strength_model": 1.0, "strength_clip": 1.0, "model": ["4", 0]}}
+    graph["6"]["inputs"]["model"] = ["20", 0]
+    source = _source(graph)
+    stack_only = _brief(dimensions={"checkpoint": "approved", "prompt_grammar": "approved", "sampler": "approved", "lora_stack": "approved"})
+    mutation = ReplaceLoraStack(loras=(LoraSpec(name="base.safetensors", strength_model=1.0, strength_clip=1.0), LoraSpec(name="new.safetensors", strength_model=19.0, strength_clip=19.0)), evidence_ids=("123",))
+    candidate = Candidate(candidate_id="lora-19", hypothesis="lora_stack", capability_signature="lora-19", confidence="observed", evidence_ids=("123",), semantic_patch=SemanticPatch(mutations=(mutation,)))
+    assert "other than its hypothesis" in validate_candidate_patch(candidate, candidate.semantic_patch, source, stack_only)
+    neutral = ReplaceLoraStack(loras=(LoraSpec(name="base.safetensors", strength_model=1.0, strength_clip=1.0), LoraSpec(name="new.safetensors", strength_model=1.0, strength_clip=1.0)), evidence_ids=("123",))
+    neutral_candidate = candidate.model_copy(update={"semantic_patch": SemanticPatch(mutations=(neutral,))})
+    assert validate_candidate_patch(neutral_candidate, neutral_candidate.semantic_patch, source, stack_only) is None
+    strength = ReplaceLoraStack(loras=(LoraSpec(name="base.safetensors", strength_model=2.0, strength_clip=1.0),), evidence_ids=("123",))
+    strength_candidate = Candidate(candidate_id="lora-strength", hypothesis="lora_strength", capability_signature="lora-strength", confidence="observed", evidence_ids=("123",), semantic_patch=SemanticPatch(mutations=(strength,)))
+    strength_brief = _brief(dimensions={"checkpoint": "approved", "prompt_grammar": "approved", "sampler": "approved", "lora_strength": "approved"})
+    assert validate_candidate_patch(strength_candidate, strength_candidate.semantic_patch, source, strength_brief) is None
