@@ -8,6 +8,7 @@ import json
 from typing import TYPE_CHECKING
 
 from mp_comfyui_lab.graph.models import SemanticRole
+from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.mutations.models import (
     ReplaceLoraStack,
     ReplaceSubgraph,
@@ -163,10 +164,10 @@ def validate_candidate_patch(
     """Classify every candidate mutation from graph bindings; never guess."""
     dimensions: set[str] = set()
     for mutation in patch.mutations:
-        dimension = _mutation_dimension(mutation, source)
-        if dimension is None:
+        affected = _mutation_dimensions(mutation, source)
+        if affected is None:
             return "affected dimension cannot be proven"
-        dimensions.add(dimension)
+        dimensions.update(affected)
     if "seed_variance" in dimensions and brief.policy_for(
         type(candidate.hypothesis).SEED_VARIANCE
     ).value != "approved":
@@ -178,9 +179,10 @@ def validate_candidate_patch(
     return None
 
 
-def _mutation_dimension(mutation, source: PlanningSource) -> str | None:
+def _mutation_dimensions(mutation, source: PlanningSource) -> set[str] | None:
     if isinstance(mutation, SetRoleInput):
-        return _ROLE_DIMENSIONS.get(mutation.role)
+        dimension = _ROLE_DIMENSIONS.get(mutation.role)
+        return None if dimension is None else {dimension}
     if isinstance(mutation, SetNodeInput):
         matches = {
             _ROLE_DIMENSIONS[role]
@@ -190,16 +192,51 @@ def _mutation_dimension(mutation, source: PlanningSource) -> str | None:
             and binding.field_name == mutation.field_name
             and role in _ROLE_DIMENSIONS
         }
-        return next(iter(matches)) if len(matches) == 1 else None
+        return matches if len(matches) == 1 else None
     if isinstance(mutation, ReplaceLoraStack):
-        existing = tuple(
-            str(binding.value.get("name", binding.value))
-            if isinstance(binding.value, Mapping)
-            else str(binding.value)
-            for binding in source.normalized_graph.bindings(SemanticRole.LORA)
-        )
-        requested = tuple(item.name for item in mutation.loras)
-        return "lora_strength" if requested == existing else "lora_stack"
+        existing = _lora_effective_values(source)
+        requested = tuple((item.name, item.strength_model, item.strength_clip) for item in mutation.loras)
+        if len(existing) != len(requested):
+            return {"lora_stack"}
+        identity_changed = tuple(item[0] for item in existing) != tuple(item[0] for item in requested)
+        strength_changed = any(left[1:] != right[1:] for left, right in zip(existing, requested, strict=True))
+        dimensions: set[str] = set()
+        if identity_changed:
+            dimensions.add("lora_stack")
+        if strength_changed:
+            dimensions.add("lora_strength")
+        return dimensions or set()
     if isinstance(mutation, ReplaceSubgraph):
-        return None
+        target_dimensions = {
+            _ROLE_DIMENSIONS[role]
+            for role in SemanticRole
+            for binding in source.normalized_graph.bindings(role)
+            if binding.node_id in mutation.target_node_ids and role in _ROLE_DIMENSIONS
+        }
+        if len(target_dimensions) != 1:
+            return None
+        dimension = next(iter(target_dimensions))
+        donor_classes = tuple(node.class_type.casefold() for node in mutation.donor_nodes)
+        required = {
+            "encoder": "encode",
+            "prompt_grammar": "prompt",
+            "reference_strategy": "image",
+            "checkpoint": "load",
+        }.get(dimension)
+        if required is None or not any(required in class_type for class_type in donor_classes):
+            return None
+        return {dimension}
     return None
+
+
+def _lora_effective_values(source: PlanningSource) -> tuple[tuple[str, float | None, float | None], ...]:
+    nodes = {node.node_id: node for node in source.normalized_graph.nodes}
+    values = []
+    for binding in source.normalized_graph.bindings(SemanticRole.LORA):
+        raw = thaw_json(binding.value)
+        name = str(raw.get("name", raw)) if isinstance(raw, Mapping) else str(raw)
+        node = nodes[binding.node_id]
+        model = node.inputs.get("strength_model")
+        clip = node.inputs.get("strength_clip")
+        values.append((name, float(model) if isinstance(model, (int, float)) and not isinstance(model, bool) else None, float(clip) if isinstance(clip, (int, float)) and not isinstance(clip, bool) else None))
+    return tuple(values)

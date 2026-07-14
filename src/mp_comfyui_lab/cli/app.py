@@ -26,7 +26,7 @@ from mp_comfyui_lab.evidence.models import CurrentEvidenceInput
 from mp_comfyui_lab.executors.base import Executor, ExecutorError, SearchRequest, WorkflowRef
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
 from mp_comfyui_lab.experiments.store import ExperimentStore
-from mp_comfyui_lab.experiments.models import ExperimentBrief, PlanningSource, SourceBundle
+from mp_comfyui_lab.experiments.models import Candidate, DimensionName, ExperimentBrief, PlanningSource, SourceBundle
 from mp_comfyui_lab.experiments.planning import (
     PlanningValidationError,
     build_plan,
@@ -35,6 +35,9 @@ from mp_comfyui_lab.experiments.planning import (
 )
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
+from mp_comfyui_lab.graph.models import SemanticRole
+from mp_comfyui_lab.json_types import thaw_json
+from mp_comfyui_lab.mutations import SemanticPatch, SetRoleInput
 from mp_comfyui_lab.security import (
     SafetyError,
     sanitize_for_persistence,
@@ -137,14 +140,68 @@ class ReadOnlyPlanningBundleLoader:
         sources = tuple(record[0] for record in records)
         if not sources:
             raise PlanningValidationError("public discovery returned no workflows")
+        baseline = next((item for item in sources if item.workflow_id == first_url_id), None)
+        if baseline is None:
+            baseline = min(sources, key=lambda item: (-item.engagement, item.source_hash, item.workflow_id))
+        candidates = self._compile_candidates(brief, baseline, sources)
         return SourceBundle(
             sources=sources,
             baseline_workflow_id=first_url_id,
+            candidates=candidates,
             evidence_graph=build_evidence_graph(
                 tuple(record[1] for record in records),
                 prior_experiment_roots=(),
             ),
         )
+
+    @staticmethod
+    def _compile_candidates(
+        brief: ExperimentBrief,
+        baseline: PlanningSource,
+        sources: tuple[PlanningSource, ...],
+    ) -> tuple[Candidate, ...]:
+        roles = {
+            DimensionName.CHECKPOINT: SemanticRole.CHECKPOINT,
+            DimensionName.SAMPLER: SemanticRole.SAMPLER,
+            DimensionName.SCHEDULER: SemanticRole.SCHEDULER,
+            DimensionName.ENCODER: SemanticRole.ENCODER,
+            DimensionName.PROMPT_GRAMMAR: SemanticRole.PROMPT_SOURCE,
+        }
+        candidates: list[Candidate] = []
+        for donor in sources:
+            if donor.workflow_id == baseline.workflow_id:
+                continue
+            for dimension, role in roles.items():
+                if brief.policy_for(dimension).value != "approved":
+                    continue
+                source_bindings = baseline.normalized_graph.bindings(role)
+                donor_bindings = donor.normalized_graph.bindings(role)
+                if len(source_bindings) != 1 or len(donor_bindings) != 1:
+                    continue
+                source_binding, donor_binding = source_bindings[0], donor_bindings[0]
+                if source_binding.field_name != donor_binding.field_name or source_binding.field_name == "$class_type":
+                    continue
+                value = thaw_json(donor_binding.value)
+                if value == thaw_json(source_binding.value):
+                    continue
+                candidate_id = f"{dimension.value}-{donor.workflow_id}"[:96]
+                candidates.append(Candidate(
+                    candidate_id=candidate_id,
+                    hypothesis=dimension,
+                    capability_signature=f"{dimension.value}:{_canonical_candidate_value(value)}",
+                    confidence="observed",
+                    evidence_ids=(donor.workflow_id,),
+                    semantic_patch=SemanticPatch(mutations=(SetRoleInput(role=role, binding_index=0, field_name=source_binding.field_name, value=value),)),
+                    engagement=donor.engagement,
+                    provenance_rank=1,
+                ))
+        return tuple(candidates)
+
+
+def _canonical_candidate_value(value) -> str:
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()[:16]
 
 
 class StructuredArgumentParser(argparse.ArgumentParser):

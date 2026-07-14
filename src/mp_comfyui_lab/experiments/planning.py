@@ -31,6 +31,7 @@ from mp_comfyui_lab.mutations.planner import (
     validate_candidate_patch,
 )
 from mp_comfyui_lab.security import SafetyError
+from mp_comfyui_lab.security import sanitize_for_persistence
 
 from .models import (
     MAX_MANIFEST_BYTES,
@@ -556,17 +557,19 @@ def _variant(
         materialized = materialize_variant(thaw_json(source.raw_graph), patch)
     except (PatchValidationError, PatchTopologyError, ValidationError, ValueError) as error:
         raise PlanningValidationError(f"structural materialization failed: {error}") from error
-    graph = thaw_json(materialized.graph)
+    graph = sanitize_for_persistence(thaw_json(materialized.graph))
+    patch_payload = sanitize_for_persistence(patch.model_dump(mode="json"))
+    diff_payload = sanitize_for_persistence(materialized.diff.model_dump(mode="json"))
     expected_output_count, output_node_ids, expected_media_types = _output_details(
         brief=brief,
         graph=graph,
         prompt_fanout_node_id=prompt_fanout_node_id,
     )
-    execution_parameters = {
+    execution_parameters = sanitize_for_persistence({
         "prompt_lines": list(prompt_lines),
         "expected_output_count": expected_output_count,
         "output_node_ids": list(output_node_ids),
-    }
+    })
     exact_run_hash = _hash(
         {
             "graph": graph,
@@ -579,15 +582,15 @@ def _variant(
             "expected_media_types": list(expected_media_types),
         }
     )
-    warnings = list(item.message for item in materialized.validation.warnings)
+    warnings = [sanitize_for_persistence(item.message) for item in materialized.validation.warnings]
     if candidate is not None and candidate.confidence.value == "unexplored":
         warnings.append("candidate has unexplored compatibility")
     return PlannedVariant(
         variant_id=variant_id,
         source_workflow_id=source.workflow_id,
         source_hash=source.source_hash,
-        semantic_patch=patch.model_dump(mode="json"),
-        diff=materialized.diff.model_dump(mode="json"),
+        semantic_patch=patch_payload,
+        diff=diff_payload,
         materialized_graph=graph,
         hypothesis=hypothesis,
         evidence_ids=() if candidate is None else candidate.evidence_ids,
@@ -674,7 +677,7 @@ def build_plan(
         )
         coverage.add(candidate.hypothesis)
     variants_tuple = tuple(variants)
-    plan_payload = {
+    plan_payload = sanitize_for_persistence({
         "source_hashes": sorted(item.source_hash for item in source_bundle.sources),
         "brief": brief.model_dump(mode="json"),
         "candidates": sorted(
@@ -686,8 +689,8 @@ def build_plan(
         ),
         "variants": [item.model_dump(mode="json") for item in variants_tuple],
         "capability_coverage": sorted(item.value for item in coverage),
-        "warnings": sorted(set(warnings)),
-    }
+        "warnings": sorted(set(sanitize_for_persistence(item) for item in warnings)),
+    })
     return ExperimentPlan(
         plan_hash=_hash(plan_payload),
         source_hashes=tuple(sorted(item.source_hash for item in source_bundle.sources)),
