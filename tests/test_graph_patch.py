@@ -891,3 +891,144 @@ def test_mutation_identifiers_and_nested_json_text_are_bounded() -> None:
         SetNodeInput(node_id="node", field_name="value", value={"nested": too_long})
     with pytest.raises(ValidationError, match="key"):
         SetNodeInput(node_id="node", field_name="value", value={too_long: "value"})
+
+
+def test_subgraph_rejects_boundary_mapping_on_literal_collection_field() -> None:
+    graph = {
+        "source": _node("Source"),
+        "old": _node("Old"),
+        "consumer": _node("Consumer", value=["old", 0]),
+    }
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceSubgraph(
+                target_node_ids=["old"],
+                donor_nodes=[
+                    DonorNode(
+                        node_id="donor",
+                        class_type="Donor",
+                        inputs={"values": None},
+                    )
+                ],
+                boundary_inputs=[
+                    BoundaryInputMapping(
+                        donor_node_id="donor",
+                        donor_field_name="values",
+                        source_node_id="source",
+                        source_output_index=0,
+                    )
+                ],
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="donor",
+                        donor_output_index=0,
+                        consumer_node_id="consumer",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="donor",
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="materialize"):
+        apply_patch(graph, patch)
+
+
+def test_subgraph_literal_collection_does_not_create_donor_reachability_edge() -> None:
+    graph = {"old": _node("Old"), "consumer": _node("Consumer", value=["old", 0])}
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceSubgraph(
+                target_node_ids=["old"],
+                donor_nodes=[
+                    DonorNode(node_id="used", class_type="Used", inputs={}),
+                    DonorNode(
+                        node_id="literal-parent",
+                        class_type="Literal",
+                        inputs={"values": ["used", 0]},
+                    ),
+                ],
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="literal-parent",
+                        donor_output_index=0,
+                        consumer_node_id="consumer",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="donor",
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="path"):
+        apply_patch(graph, patch)
+
+
+def test_independent_subgraph_replacements_reserve_cumulative_ids_deterministically() -> None:
+    graph = {
+        "1": _node("Old"),
+        "2": _node("Old"),
+        "left-consumer": _node("Consumer", value=["1", 0]),
+        "right-consumer": _node("Consumer", value=["2", 0]),
+    }
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceSubgraph(
+                target_node_ids=["1"],
+                donor_nodes=[DonorNode(node_id="left", class_type="New", inputs={})],
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="left",
+                        donor_output_index=0,
+                        consumer_node_id="left-consumer",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="left",
+                evidence_ids=["left-evidence"],
+            ),
+            ReplaceSubgraph(
+                target_node_ids=["2"],
+                donor_nodes=[DonorNode(node_id="right", class_type="New", inputs={})],
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="right",
+                        donor_output_index=0,
+                        consumer_node_id="right-consumer",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="right",
+                evidence_ids=["right-evidence"],
+            ),
+        ]
+    )
+
+    result = materialize_variant(graph, patch)
+
+    assert result.graph["left-consumer"]["inputs"]["value"] == ("3", 0)
+    assert result.graph["right-consumer"]["inputs"]["value"] == ("4", 0)
+    assert tuple(item.added_node_ids for item in result.diff.mutations) == (("3",), ("4",))
+
+
+def test_subgraph_target_identifiers_are_bounded() -> None:
+    too_long = "x" * 2_049
+    with pytest.raises(ValidationError, match="at most"):
+        ReplaceSubgraph(
+            target_node_ids=[too_long],
+            donor_nodes=[DonorNode(node_id="donor", class_type="Donor", inputs={})],
+            boundary_outputs=[
+                BoundaryOutputMapping(
+                    donor_node_id="donor",
+                    donor_output_index=0,
+                    consumer_node_id="consumer",
+                    consumer_field_name="value",
+                )
+            ],
+            donor_workflow_id="donor",
+            evidence_ids=["evidence"],
+        )

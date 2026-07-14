@@ -210,7 +210,7 @@ class ReplaceLoraStack(_FrozenModel):
 
 class ReplaceSubgraph(_FrozenModel):
     op: Literal["replace_subgraph"] = "replace_subgraph"
-    target_node_ids: tuple[ExactNodeId, ...] = Field(min_length=1, max_length=512)
+    target_node_ids: tuple[BoundedNodeId, ...] = Field(min_length=1, max_length=512)
     donor_nodes: tuple[DonorNode, ...] = Field(
         min_length=1,
         max_length=MAX_DONOR_NODES,

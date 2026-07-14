@@ -14,6 +14,7 @@ from mp_comfyui_lab.graph.normalize import (
     GraphValidationError,
     _canonical_field_name,
     _compact_class,
+    _input_link,
     _lora_chains,
     _model_links,
     _node_sort_key,
@@ -96,30 +97,39 @@ def _normalize(graph: Mapping[str, Any]):
         raise PatchValidationError(str(error)) from error
 
 
-def _link(value: Any) -> tuple[str, int] | None:
-    if (
-        isinstance(value, list)
-        and len(value) == 2
-        and isinstance(value[0], str)
-        and isinstance(value[1], int)
-        and not isinstance(value[1], bool)
-        and value[1] >= 0
-    ):
-        return (value[0], value[1])
-    return None
-
-
 def _next_numeric_ids(graph: Mapping[str, Any], count: int) -> list[str]:
-    maximum = max((int(node_id) for node_id in graph if node_id.isdecimal()), default=0)
+    return _next_numeric_ids_for_node_ids(graph, count)
+
+
+def _next_numeric_ids_for_node_ids(
+    node_ids: Mapping[str, Any] | set[str] | frozenset[str],
+    count: int,
+) -> list[str]:
+    maximum = max((int(node_id) for node_id in node_ids if node_id.isdecimal()), default=0)
     return [str(maximum + offset) for offset in range(1, count + 1)]
 
 
-def _ordered_donors(mutation: ReplaceSubgraph) -> tuple[Any, ...]:
+def _semantic_link(
+    node_id: str,
+    field_name: str,
+    value: Any,
+    node_ids: frozenset[str],
+) -> tuple[str, int] | None:
+    try:
+        return _input_link(node_id, field_name, value, node_ids)
+    except GraphValidationError as error:
+        raise PatchValidationError(str(error)) from error
+
+
+def _ordered_donors(
+    mutation: ReplaceSubgraph,
+    node_ids: frozenset[str],
+) -> tuple[Any, ...]:
     donors = {donor.node_id: donor for donor in mutation.donor_nodes}
     parents: dict[str, set[str]] = {node_id: set() for node_id in donors}
     for donor in donors.values():
-        for value in thaw_json(donor.inputs).values():
-            link = _link(value)
+        for field_name, value in thaw_json(donor.inputs).items():
+            link = _semantic_link(donor.node_id, field_name, value, node_ids)
             if link is not None and link[0] in donors:
                 parents[donor.node_id].add(link[0])
     ordered: list[Any] = []
@@ -395,6 +405,7 @@ def _replace_subgraph(graph: dict[str, Any], mutation: ReplaceSubgraph) -> None:
         raise PatchValidationError(f"replacement target nodes do not exist: {missing}")
     donors = {node.node_id: node for node in mutation.donor_nodes}
     donor_ids = set(donors)
+    link_universe = frozenset((set(graph) - {"_meta"}) | donor_ids)
     input_maps = {
         (item.donor_node_id, item.donor_field_name): item
         for item in mutation.boundary_inputs
@@ -409,7 +420,12 @@ def _replace_subgraph(graph: dict[str, Any], mutation: ReplaceSubgraph) -> None:
         if consumer_id in targets or not isinstance(consumer, dict):
             continue
         for field_name, value in consumer["inputs"].items():
-            link = _link(value)
+            link = _semantic_link(
+                consumer_id,
+                field_name,
+                value,
+                frozenset(set(graph) - {"_meta"}),
+            )
             if link is not None and link[0] in targets:
                 external_links.add((consumer_id, field_name))
     if external_links != set(output_maps):
@@ -436,18 +452,36 @@ def _replace_subgraph(graph: dict[str, Any], mutation: ReplaceSubgraph) -> None:
         if mapping.source_node_id not in graph or mapping.source_node_id in targets:
             raise PatchValidationError("boundary input source must be an existing external node")
         original = thaw_json(donor.inputs)[field_name]
-        original_link = _link(original)
+        original_link = _semantic_link(
+            donor_id,
+            field_name,
+            original,
+            link_universe,
+        )
         if original is not None and original_link != (
             mapping.source_node_id,
             mapping.source_output_index,
         ):
             raise PatchValidationError("boundary input mapping is unused by its donor field")
+        materialized_link = _semantic_link(
+            donor_id,
+            field_name,
+            [mapping.source_node_id, mapping.source_output_index],
+            link_universe,
+        )
+        if materialized_link != (
+            mapping.source_node_id,
+            mapping.source_output_index,
+        ):
+            raise PatchValidationError(
+                "boundary input mapping does not materialize as a graph link"
+            )
 
     for donor in mutation.donor_nodes:
         inputs = thaw_json(donor.inputs)
         for field_name, value in inputs.items():
             mapping = input_maps.get((donor.node_id, field_name))
-            link = _link(value)
+            link = _semantic_link(donor.node_id, field_name, value, link_universe)
             if mapping is not None:
                 consumed_inputs.add((donor.node_id, field_name))
                 continue
@@ -471,7 +505,7 @@ def _replace_subgraph(graph: dict[str, Any], mutation: ReplaceSubgraph) -> None:
     if reached != donor_ids:
         raise PatchValidationError("every donor node must lie on a path to a boundary output")
 
-    ordered_donors = _ordered_donors(mutation)
+    ordered_donors = _ordered_donors(mutation, link_universe)
     allocated = dict(zip(
         (node.node_id for node in ordered_donors),
         _next_numeric_ids(graph, len(ordered_donors)),
@@ -486,7 +520,7 @@ def _replace_subgraph(graph: dict[str, Any], mutation: ReplaceSubgraph) -> None:
             if mapping is not None:
                 inputs[field_name] = [mapping.source_node_id, mapping.source_output_index]
             else:
-                link = _link(value)
+                link = _semantic_link(donor.node_id, field_name, value, link_universe)
                 if link is not None and link[0] in allocated:
                     inputs[field_name] = [allocated[link[0]], link[1]]
         node: dict[str, Any] = {"class_type": donor.class_type, "inputs": inputs}
@@ -499,7 +533,11 @@ def _replace_subgraph(graph: dict[str, Any], mutation: ReplaceSubgraph) -> None:
         ]
 
 
-def _operation_scope(graph: Mapping[str, Any], mutation: Any) -> _OperationScope:
+def _operation_scope(
+    graph: Mapping[str, Any],
+    mutation: Any,
+    reserved_node_ids: frozenset[str] = frozenset(),
+) -> _OperationScope:
     if isinstance(mutation, SetRoleInput):
         binding = _role_binding_target(graph, mutation)
         return _OperationScope(writes=frozenset({(binding.node_id, binding.field_name)}))
@@ -524,7 +562,12 @@ def _operation_scope(graph: Mapping[str, Any], mutation: Any) -> _OperationScope
         return _OperationScope(
             writes=frozenset(writes),
             controlled_nodes=frozenset(plan.node_ids),
-            added_nodes=frozenset(_next_numeric_ids(graph, added)),
+            added_nodes=frozenset(
+                _next_numeric_ids_for_node_ids(
+                    (set(graph) - {"_meta"}) | set(reserved_node_ids),
+                    added,
+                )
+            ),
             deleted_nodes=frozenset(plan.node_ids),
         )
     if isinstance(mutation, ReplaceSubgraph):
@@ -535,14 +578,25 @@ def _operation_scope(graph: Mapping[str, Any], mutation: Any) -> _OperationScope
                 for item in mutation.boundary_outputs
             ),
             controlled_nodes=targets,
-            added_nodes=frozenset(_next_numeric_ids(graph, len(mutation.donor_nodes))),
+            added_nodes=frozenset(
+                _next_numeric_ids_for_node_ids(
+                    (set(graph) - {"_meta"}) | set(reserved_node_ids),
+                    len(mutation.donor_nodes),
+                )
+            ),
             deleted_nodes=targets,
         )
     raise TypeError(f"unsupported mutation type {type(mutation).__name__}")
 
 
 def _preflight_patch(graph: Mapping[str, Any], patch: SemanticPatch) -> tuple[_OperationScope, ...]:
-    scopes = tuple(_operation_scope(graph, mutation) for mutation in patch.mutations)
+    reserved_node_ids: set[str] = set()
+    scopes: list[_OperationScope] = []
+    for mutation in patch.mutations:
+        scope = _operation_scope(graph, mutation, frozenset(reserved_node_ids))
+        scopes.append(scope)
+        reserved_node_ids.update(scope.added_nodes)
+    scopes = tuple(scopes)
     for index, left in enumerate(scopes):
         left_nodes = left.controlled_nodes | left.deleted_nodes
         for right in scopes[index + 1 :]:
