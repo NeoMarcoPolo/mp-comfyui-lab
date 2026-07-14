@@ -18,6 +18,7 @@ import requests
 
 from mp_comfyui_lab.comparison.finalists import (
     ReviewArtifactPaths,
+    load_canonical_review,
     regenerate_review_artifacts,
 )
 from mp_comfyui_lab.config import LabConfig
@@ -426,11 +427,18 @@ class ExperimentEngine:
         return record
 
     def review_artifact_paths(self, experiment_id: str) -> ReviewArtifactPaths:
-        root = self._store.root(experiment_id)
+        review = load_canonical_review(self._store, experiment_id)
+        generation = review.manifest_path.parent
         return ReviewArtifactPaths(
-            comparison_path=(root / "comparisons" / "facts.json").resolve(),
-            finalists_path=(root / "finalists.json").resolve(),
+            comparison_path=(generation / "comparisons" / "facts.json").resolve(),
+            finalists_path=(generation / "finalists.json").resolve(),
         )
+
+    def run_artifact_path(self, experiment_id: str, run_id: str) -> Path:
+        safe_filename(run_id)
+        return (
+            self._store.root(experiment_id) / "runs" / f"{run_id}.json"
+        ).resolve()
 
     def _regenerate_review_for_completed_record(
         self,
@@ -467,7 +475,8 @@ class ExperimentEngine:
         runs = tuple(
             record
             for record in self._load_run_records(experiment_id)
-            if (record.variant_id, record.exact_run_hash) in current_variants
+            if record.plan_hash == plan.plan_hash
+            and (record.variant_id, record.exact_run_hash) in current_variants
         )
         regenerate_review_artifacts(
             self._store,

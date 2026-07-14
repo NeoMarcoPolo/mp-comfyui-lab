@@ -176,11 +176,22 @@ def _publish_artifact_set(
             )
             return
         if judgment_document is not None:
-            _append_judgments(
-                root,
-                judgment_document,
-                fault_injector=fault_injector,
-            )
+            try:
+                _append_judgments(
+                    root,
+                    judgment_document,
+                    fault_injector=fault_injector,
+                )
+            except ComparisonArtifactConflict:
+                if not replace_existing:
+                    raise
+                _replace_artifact_set(
+                    root,
+                    destination,
+                    objective_artifacts,
+                    judgment_document=judgment_document,
+                    fault_injector=fault_injector,
+                )
         return
 
     stage = Path(

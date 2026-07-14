@@ -371,6 +371,69 @@ def test_manifest_is_strict_and_forbids_budget_task_and_unknown_fields() -> None
         _brief(dimensions={"checkpoint": "anything"})
 
 
+def test_partial_behavior_opt_in_is_strict_and_defaults_false() -> None:
+    assert _brief().partial_behavior_is_tested_capability is False
+    assert _brief(
+        partial_behavior_is_tested_capability=True
+    ).partial_behavior_is_tested_capability is True
+    with pytest.raises(ValidationError):
+        _brief(partial_behavior_is_tested_capability="true")
+
+
+def test_plan_binds_parsed_partial_opt_in_and_source_provenance(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    source = _source()
+    plan = build_plan(
+        _brief(partial_behavior_is_tested_capability=True),
+        _bundle(),
+        config=_config(tmp_path),
+    )
+
+    assert plan.partial_behavior_is_tested_capability is True
+    assert plan.approval_payload["brief"][
+        "partial_behavior_is_tested_capability"
+    ] is True
+    assert len(plan.source_provenance) == 1
+    provenance = plan.source_provenance[0]
+    assert provenance.workflow_id == source.workflow_id
+    assert provenance.canonical_url == source.canonical_url
+    assert provenance.source_hash == source.source_hash
+    assert provenance.capability_hash == source.capability_hash
+    assert plan.model_dump(mode="json")["approval_payload"][
+        "source_provenance"
+    ] == [
+        provenance.model_dump(mode="json")
+    ]
+
+
+def test_fabricated_approval_payload_cannot_enable_partial_behavior(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    plan = build_plan(_brief(), _bundle(), config=_config(tmp_path))
+    document = plan.model_dump(mode="json")
+    document["approval_payload"]["brief"][
+        "partial_behavior_is_tested_capability"
+    ] = True
+    document["plan_hash"] = hashlib.sha256(
+        json.dumps(
+            document["approval_payload"],
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    with pytest.raises(
+        ValidationError,
+        match="partial_behavior_is_tested_capability",
+    ):
+        ExperimentPlan.model_validate_json(json.dumps(document), strict=True)
+
+
 def test_load_manifest_rejects_duplicate_nonfinite_oversize_and_deep_yaml(tmp_path: Path) -> None:
     manifest = tmp_path / "brief.yaml"
     manifest.write_text("goal: one\ngoal: two\n", encoding="utf-8")

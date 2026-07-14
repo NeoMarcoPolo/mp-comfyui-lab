@@ -9,11 +9,14 @@ from PIL import Image
 import pytest
 
 from mp_comfyui_lab.comparison.finalists import (
+    ArtifactIntegrityError,
+    StaleSelectionError,
     regenerate_review_artifacts,
     select_finalist,
 )
 from mp_comfyui_lab.cli.app import ExitCode, main
 from mp_comfyui_lab.experiments.models import (
+    ApprovedSourceProvenance,
     DimensionName,
     ExperimentPlan,
     FixtureFingerprint,
@@ -138,6 +141,19 @@ def _persist_selected_experiment(tmp_path: Path) -> tuple[ExperimentStore, Path]
     )
     approval_payload = {
         "source_hashes": [variant.source_hash],
+        "source_provenance": [
+            {
+                "workflow_id": variant.source_workflow_id,
+                "canonical_url": (
+                    "https://www.runninghub.ai/post/"
+                    f"{variant.source_workflow_id}"
+                ),
+                "source_hash": variant.source_hash,
+                "capability_hash": capability_hash(source_graph),
+                "evidence_ids": [variant.source_workflow_id],
+                "engagement": 0,
+            }
+        ],
         "variants": [variant.model_dump(mode="json")],
         "capability_coverage": [DimensionName.CHECKPOINT.value],
         "warnings": [],
@@ -149,6 +165,11 @@ def _persist_selected_experiment(tmp_path: Path) -> tuple[ExperimentStore, Path]
     plan = ExperimentPlan(
         plan_hash=_canonical_hash(approval_payload),
         source_hashes=(variant.source_hash,),
+        source_provenance=(
+            ApprovedSourceProvenance.model_validate(
+                approval_payload["source_provenance"][0]
+            ),
+        ),
         variants=(variant,),
         capability_coverage=(DimensionName.CHECKPOINT,),
         warnings=(),
@@ -247,6 +268,29 @@ def test_suggested_name_uses_base_type_and_ascii_short_description() -> None:
     ) == "qwen_image_edit_2511_i2i_multi_angle_consistency"
 
 
+def test_suggested_name_preserves_type_and_description_suffix_at_max_length() -> None:
+    value = suggested_workflow_name(
+        base_model="model-" + "x" * 300,
+        workflow_type="i2i",
+        description="multiangle-" + "y" * 300,
+    )
+
+    assert len(value) <= 160
+    assert "_i2i_" in value
+    assert value.rsplit("_i2i_", 1)[1]
+    assert value == suggested_workflow_name(
+        base_model="model-" + "x" * 300,
+        workflow_type="i2i",
+        description="multiangle-" + "y" * 300,
+    )
+    different = suggested_workflow_name(
+        base_model="model-" + "x" * 300,
+        workflow_type="i2i",
+        description="multiangle-" + "y" * 299 + "z",
+    )
+    assert different != value
+
+
 def test_export_requires_current_explicit_human_selection(tmp_path: Path) -> None:
     store, root = _persist_selected_experiment(tmp_path)
     (root / "selection.json").unlink()
@@ -287,6 +331,8 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
         "execution.json",
         "outputs",
         "comparison.json",
+        "finalists.json",
+        "review-manifest.json",
         "selection.json",
         "handoff.json",
     }
@@ -309,6 +355,24 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
         "Invoke port-comfy-workflow with that URL through strip, audit, register, smoke, and promote.",
     ]
     assert all("command" not in key for key in handoff)
+    selection = json.loads((bundle / "selection.json").read_text(encoding="utf-8"))
+    assert selection["finalists_artifact_sha256"] == hashlib.sha256(
+        (bundle / "finalists.json").read_bytes()
+    ).hexdigest()
+    review_manifest = json.loads(
+        (bundle / "review-manifest.json").read_text(encoding="utf-8")
+    )
+    assert review_manifest["finalists_sha256"] == selection[
+        "finalists_artifact_sha256"
+    ]
+    comparison = json.loads(
+        (bundle / "comparison.json").read_text(encoding="utf-8")
+    )
+    assert comparison["facts"]["experiment_id"] == EXPERIMENT_ID
+    assert comparison["facts_sha256"] == review_manifest[
+        "comparison_facts_sha256"
+    ]
+    assert "judgments" in comparison
     assert {root: _snapshot_tree(root) for root in production_roots} == before
 
 
@@ -317,7 +381,7 @@ def test_export_rejects_tampered_recorded_output(tmp_path: Path) -> None:
     output = next((root / "outputs" / VARIANT_ID).rglob("*.png"))
     output.write_bytes(b"tampered")
 
-    with pytest.raises(BundleIntegrityError, match="output"):
+    with pytest.raises(ArtifactIntegrityError, match="output evidence"):
         BundleExporter(store).export(EXPERIMENT_ID)
 
 
@@ -355,8 +419,55 @@ def test_changed_finalists_make_selection_stale_for_export(tmp_path: Path) -> No
     finalists["excluded"]["new"] = "run_status_failed"
     store.write_json(EXPERIMENT_ID, "finalists.json", finalists)
 
-    with pytest.raises(SelectionRequiredError, match="SHA-256 changed"):
+    with pytest.raises(StaleSelectionError, match="SHA-256 changed"):
         BundleExporter(store).export(EXPERIMENT_ID)
+
+
+def test_missing_current_finalists_after_selection_is_typed_stale(
+    tmp_path: Path,
+) -> None:
+    store, root = _persist_selected_experiment(tmp_path)
+    (root / "finalists.json").unlink()
+
+    with pytest.raises(StaleSelectionError):
+        BundleExporter(store).export(EXPERIMENT_ID)
+
+
+def test_export_rejects_coordinated_output_and_run_record_mutation(
+    tmp_path: Path,
+) -> None:
+    store, root = _persist_selected_experiment(tmp_path)
+    run_path = root / "runs" / "run-selected.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    output_path = root / run["outputs"][0]["local_relative_path"]
+    changed = b"coordinated changed output bytes"
+    output_path.write_bytes(changed)
+    run["outputs"][0]["content_sha256"] = hashlib.sha256(changed).hexdigest()
+    run["outputs"][0]["size"] = len(changed)
+    store.write_json(EXPERIMENT_ID, "runs/run-selected.json", run)
+
+    with pytest.raises(ArtifactIntegrityError, match="evidence"):
+        BundleExporter(store).export(EXPERIMENT_ID)
+
+
+def test_export_uses_immutable_approved_source_url(
+    tmp_path: Path,
+) -> None:
+    store, root = _persist_selected_experiment(tmp_path)
+    source_bundle = store.read_json(EXPERIMENT_ID, "sources/source-bundle.json")
+    source_bundle["sources"][0]["canonical_url"] = (
+        "https://www.runninghub.ai/post/9999999999999999999"
+    )
+    store.write_json(EXPERIMENT_ID, "sources/source-bundle.json", source_bundle)
+
+    bundle = BundleExporter(store).export(EXPERIMENT_ID)
+
+    model_stack = json.loads(
+        (bundle / "model-stack.json").read_text(encoding="utf-8")
+    )
+    assert model_stack["source_url"] == (
+        "https://www.runninghub.ai/post/1980860923768426497"
+    )
 
 
 def test_export_rejects_selection_changed_after_validation(

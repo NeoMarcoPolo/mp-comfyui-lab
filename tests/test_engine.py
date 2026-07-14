@@ -3425,8 +3425,10 @@ def test_completed_wave_regenerates_review_artifacts_without_selection(
 
     root = config.experiments_root / "wave-approved"
     paths = engine.review_artifact_paths("wave-approved")
-    assert paths.comparison_path == (root / "comparisons/facts.json").resolve()
-    assert paths.finalists_path == (root / "finalists.json").resolve()
+    assert paths.comparison_path.parent.name == "comparisons"
+    assert paths.comparison_path.parent.parent == paths.finalists_path.parent
+    assert paths.finalists_path.name == "finalists.json"
+    assert paths.finalists_path.parent.parent == (root / "reviews").resolve()
     assert paths.comparison_path.exists()
     finalists = json.loads(paths.finalists_path.read_text(encoding="utf-8"))
     assert [item["variant_id"] for item in finalists["finalists"]] == [
@@ -3434,6 +3436,7 @@ def test_completed_wave_regenerates_review_artifacts_without_selection(
         "strong",
     ]
     assert finalists["requires_human_selection"] is True
+    assert (root / "finalists.json").read_bytes() == paths.finalists_path.read_bytes()
     assert not (root / "selection.json").exists()
 
 
@@ -3463,6 +3466,27 @@ def test_completed_failed_wave_still_writes_empty_finalists(
     assert not (
         config.experiments_root / "wave-approved" / "selection.json"
     ).exists()
+
+
+def test_run_artifact_path_uses_actual_store_not_caller_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, _ = _persist_wave_plan(tmp_path)
+    engine = _wave_engine(config, FakeExecutor.success(outputs=()))
+    unrelated = tmp_path / "unrelated-caller"
+    unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+
+    path = engine.run_artifact_path("wave-approved", "run-example")
+
+    assert path == (
+        config.experiments_root
+        / "wave-approved"
+        / "runs"
+        / "run-example.json"
+    ).resolve()
+    assert path.is_absolute()
 
 
 def test_completed_saturation_wave_resumes_without_regenerating_runs(

@@ -125,11 +125,13 @@ class FakeExperimentEngine:
         *,
         comparison_path: Path | None = None,
         finalists_path: Path | None = None,
+        run_artifact_path: Path | None = None,
     ) -> None:
         self.record = record
         self.calls: list[tuple] = []
         self.comparison_path = comparison_path
         self.finalists_path = finalists_path
+        self.run_path = run_artifact_path
 
     def run(self, experiment_id, variant_id, *, approved_plan_hash):
         self.calls.append(
@@ -178,6 +180,11 @@ class FakeExperimentEngine:
                 "finalists_path": self.finalists_path,
             },
         )()
+
+    def run_artifact_path(self, experiment_id, run_id):
+        if self.run_path is not None:
+            return self.run_path
+        return (Path.cwd() / "runs" / f"{run_id}.json").resolve()
 
 
 def test_run_cli_requires_and_passes_exact_plan_approval(capsys):
@@ -323,6 +330,9 @@ def test_run_cli_returns_absolute_comparison_and_finalist_paths(
 ) -> None:
     comparison_path = (tmp_path / "facts.json").resolve()
     finalists_path = (tmp_path / "finalists.json").resolve()
+    run_artifact_path = (
+        tmp_path / "actual-store" / "plan-approved" / "runs" / "run-review-paths.json"
+    ).resolve()
     record = RunRecord(
         run_id="run-review-paths",
         experiment_id="plan-approved",
@@ -336,6 +346,7 @@ def test_run_cli_returns_absolute_comparison_and_finalist_paths(
         record,
         comparison_path=comparison_path,
         finalists_path=finalists_path,
+        run_artifact_path=run_artifact_path,
     )
 
     code = main(
@@ -357,6 +368,10 @@ def test_run_cli_returns_absolute_comparison_and_finalist_paths(
         {"kind": "comparison_facts", "path": str(comparison_path)},
         {"kind": "finalists", "path": str(finalists_path)},
     ]
+    assert payload["artifacts"][0] == {
+        "kind": "run",
+        "path": str(run_artifact_path),
+    }
 
 
 def test_reconcile_cli_wires_operator_task_id(capsys):

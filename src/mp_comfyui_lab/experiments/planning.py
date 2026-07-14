@@ -706,6 +706,17 @@ def build_plan(
     variants_tuple = tuple(variants)
     plan_payload = sanitize_for_persistence({
         "source_hashes": sorted(item.source_hash for item in source_bundle.sources),
+        "source_provenance": [
+            {
+                "workflow_id": item.workflow_id,
+                "canonical_url": item.canonical_url,
+                "source_hash": item.source_hash,
+                "capability_hash": item.capability_hash,
+                "evidence_ids": list(item.evidence_ids),
+                "engagement": item.engagement,
+            }
+            for item in source_bundle.sources
+        ],
         "brief": brief.model_dump(mode="json"),
         "candidates": sorted(
             (item.model_dump(mode="json") for item in source_bundle.candidates),
@@ -721,6 +732,20 @@ def build_plan(
     return ExperimentPlan(
         plan_hash=_hash(plan_payload),
         source_hashes=tuple(sorted(item.source_hash for item in source_bundle.sources)),
+        source_provenance=tuple(
+            {
+                "workflow_id": item.workflow_id,
+                "canonical_url": item.canonical_url,
+                "source_hash": item.source_hash,
+                "capability_hash": item.capability_hash,
+                "evidence_ids": item.evidence_ids,
+                "engagement": item.engagement,
+            }
+            for item in source_bundle.sources
+        ),
+        partial_behavior_is_tested_capability=(
+            brief.partial_behavior_is_tested_capability
+        ),
         variants=variants_tuple,
         capability_coverage=tuple(sorted(coverage, key=lambda item: item.value)),
         warnings=tuple(sorted(set(warnings))),

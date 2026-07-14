@@ -1773,39 +1773,39 @@ def test_compare_cli_is_store_only_and_returns_judgment_input(
 
     assert code == ExitCode.OK
     assert payload["command"] == "compare"
+    generation_root = Path(payload["data"]["finalists_path"]).parent
+    comparison_root = generation_root / "comparisons"
     assert payload["data"] == {
         "experiment_id": "experiment-compare",
         "experiment_root": str(experiment_root.resolve()),
         "variant_ids": ["mixed"],
         "output_ids": ["mixed/0"],
-        "facts": str((experiment_root / "comparisons/facts.json").resolve()),
+        "facts": str((comparison_root / "facts.json").resolve()),
         "duplicate_groups": str(
-            (experiment_root / "comparisons/duplicate-groups.json").resolve()
+            (comparison_root / "duplicate-groups.json").resolve()
         ),
         "contact_sheet": str(
-            (experiment_root / "comparisons/contact-sheet.jpg").resolve()
+            (comparison_root / "contact-sheet.jpg").resolve()
         ),
         "contact_sheets": [
-            str((experiment_root / "comparisons/contact-sheet.jpg").resolve())
+            str((comparison_root / "contact-sheet.jpg").resolve())
         ],
-        "gallery": str((experiment_root / "comparisons/index.html").resolve()),
+        "gallery": str((comparison_root / "index.html").resolve()),
         "judgment_input": str(
-            (experiment_root / "comparisons/judgment-input.json").resolve()
+            (comparison_root / "judgment-input.json").resolve()
         ),
         "judgments": None,
-        "finalists_path": str(
-            (experiment_root / "finalists.json").resolve()
-        ),
+        "finalists_path": str((generation_root / "finalists.json").resolve()),
         "finalist_variant_ids": ["mixed"],
         "requires_human_selection": True,
     }
     assert [item["path"] for item in payload["artifacts"]] == [
-        str((experiment_root / "comparisons/facts.json").resolve()),
-        str((experiment_root / "comparisons/duplicate-groups.json").resolve()),
-        str((experiment_root / "comparisons/contact-sheet.jpg").resolve()),
-        str((experiment_root / "comparisons/index.html").resolve()),
-        str((experiment_root / "comparisons/judgment-input.json").resolve()),
-        str((experiment_root / "finalists.json").resolve()),
+        str((comparison_root / "facts.json").resolve()),
+        str((comparison_root / "duplicate-groups.json").resolve()),
+        str((comparison_root / "contact-sheet.jpg").resolve()),
+        str((comparison_root / "index.html").resolve()),
+        str((comparison_root / "judgment-input.json").resolve()),
+        str((generation_root / "finalists.json").resolve()),
     ]
     assert (experiment_root / "comparisons/facts.json").exists()
 
@@ -1828,18 +1828,20 @@ def test_compare_cli_returns_rendered_absolute_paths_from_custom_store(
 
     assert main(["compare", "experiment-compare"], cwd=caller_root) == ExitCode.OK
     initial = _cli_payload(capsys)
+    generation_root = Path(initial["data"]["finalists_path"]).parent
+    comparison_root = generation_root / "comparisons"
     expected = {
         "experiment_root": experiment_root.resolve(),
-        "facts": (experiment_root / "comparisons/facts.json").resolve(),
+        "facts": (comparison_root / "facts.json").resolve(),
         "duplicate_groups": (
-            experiment_root / "comparisons/duplicate-groups.json"
+            comparison_root / "duplicate-groups.json"
         ).resolve(),
         "contact_sheet": (
-            experiment_root / "comparisons/contact-sheet.jpg"
+            comparison_root / "contact-sheet.jpg"
         ).resolve(),
-        "gallery": (experiment_root / "comparisons/index.html").resolve(),
+        "gallery": (comparison_root / "index.html").resolve(),
         "judgment_input": (
-            experiment_root / "comparisons/judgment-input.json"
+            comparison_root / "judgment-input.json"
         ).resolve(),
     }
     for key, path in expected.items():
@@ -1855,7 +1857,7 @@ def test_compare_cli_returns_rendered_absolute_paths_from_custom_store(
         expected["contact_sheet"],
         expected["gallery"],
         expected["judgment_input"],
-        (experiment_root / "finalists.json").resolve(),
+        (generation_root / "finalists.json").resolve(),
     ]
 
     submission = _valid_judgments(experiment_root)
@@ -1866,7 +1868,8 @@ def test_compare_cli_returns_rendered_absolute_paths_from_custom_store(
         cwd=caller_root,
     ) == ExitCode.OK
     judged = _cli_payload(capsys)
-    judgments = (experiment_root / "comparisons/judgments.json").resolve()
+    judged_generation = Path(judged["data"]["finalists_path"]).parent
+    judgments = (judged_generation / "comparisons/judgments.json").resolve()
 
     assert Path(judged["data"]["judgments"]) == judgments
     assert Path(judged["artifacts"][-1]["path"]) == judgments
@@ -1896,7 +1899,8 @@ def test_compare_cli_validates_and_saves_subjective_judgments_separately(
     payload = _cli_payload(capsys)
 
     assert code == ExitCode.OK
-    judgments_path = (experiment_root / "comparisons/judgments.json").resolve()
+    generation_root = Path(payload["data"]["finalists_path"]).parent
+    judgments_path = (generation_root / "comparisons/judgments.json").resolve()
     assert payload["data"]["judgments"] == str(judgments_path)
     assert payload["artifacts"][-1] == {
         "kind": "judgments",
@@ -1910,6 +1914,47 @@ def test_compare_cli_validates_and_saves_subjective_judgments_separately(
     assert saved == submission
     assert (experiment_root / "comparisons/facts.json").read_bytes() == facts_before
     assert "identity_fidelity" not in json.loads(facts_before)
+
+
+def test_compare_publishes_changed_valid_judgments_as_new_generation(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    experiment_root = _persist_cli_comparison(tmp_path)
+    assert main(["compare", "experiment-compare"], cwd=tmp_path) == ExitCode.OK
+    capsys.readouterr()
+    first_submission = _valid_judgments(experiment_root)
+    first_path = tmp_path / "judgments-first.json"
+    first_path.write_text(json.dumps(first_submission), encoding="utf-8")
+    assert main(
+        ["compare", "experiment-compare", "--judgments", str(first_path)],
+        cwd=tmp_path,
+    ) == ExitCode.OK
+    first = _cli_payload(capsys)
+
+    second_submission = json.loads(json.dumps(first_submission))
+    second_submission["judgments"][0]["visual_quality"] = 5
+    second_submission["judgments"][0]["reasons"] = [
+        "Revised validated quality judgment"
+    ]
+    second_path = tmp_path / "judgments-second.json"
+    second_path.write_text(json.dumps(second_submission), encoding="utf-8")
+    code = main(
+        ["compare", "experiment-compare", "--judgments", str(second_path)],
+        cwd=tmp_path,
+    )
+    second = _cli_payload(capsys)
+
+    assert code == ExitCode.OK
+    first_generation = Path(first["data"]["finalists_path"]).parent
+    second_generation = Path(second["data"]["finalists_path"]).parent
+    assert second_generation != first_generation
+    assert first_generation.is_dir()
+    assert json.loads(
+        (second_generation / "comparisons/judgments.json").read_text(
+            encoding="utf-8"
+        )
+    ) == second_submission
 
 
 def test_fresh_compare_with_invalid_judgments_leaves_no_comparisons_directory(
@@ -1943,14 +1988,20 @@ def test_fresh_compare_stages_valid_judgments_with_objective_set(
     submission = _fresh_valid_judgments(experiment_root)
     submission_path = tmp_path / "valid-fresh-judgments.json"
     submission_path.write_text(json.dumps(submission), encoding="utf-8")
-    original_render = app.render_comparison
-    observed: dict[str, bytes | None] = {}
+    original_regenerate = app.regenerate_review_artifacts
+    observed: dict[str, object | None] = {}
 
-    def recording_render(report, root, **kwargs):
-        observed["judgment_document"] = kwargs.get("judgment_document")
-        return original_render(report, root, **kwargs)
+    def recording_regenerate(store, experiment_id, plan, runs, **kwargs):
+        observed["judgments"] = kwargs.get("judgments")
+        return original_regenerate(
+            store,
+            experiment_id,
+            plan,
+            runs,
+            **kwargs,
+        )
 
-    monkeypatch.setattr(app, "render_comparison", recording_render)
+    monkeypatch.setattr(app, "regenerate_review_artifacts", recording_regenerate)
     code = main(
         ["compare", "experiment-compare", "--judgments", str(submission_path)],
         cwd=tmp_path,
@@ -1958,7 +2009,7 @@ def test_fresh_compare_stages_valid_judgments_with_objective_set(
     _cli_payload(capsys)
 
     assert code == ExitCode.OK
-    assert observed["judgment_document"] is not None
+    assert observed["judgments"] is not None
     assert (experiment_root / "comparisons/judgments.json").exists()
 
 

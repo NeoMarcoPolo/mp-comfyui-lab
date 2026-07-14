@@ -17,14 +17,14 @@ import requests
 from mp_comfyui_lab import __version__
 from mp_comfyui_lab.cli.output import emit_error, emit_success
 from mp_comfyui_lab.comparison.finalists import (
+    ArtifactIntegrityError,
     FinalistSelectionError,
-    propose_finalists,
+    StaleSelectionError,
+    regenerate_review_artifacts,
     select_finalist,
-    write_finalists,
 )
 from mp_comfyui_lab.comparison.judgments import (
     JudgmentValidationError,
-    judgment_document_bytes,
     load_and_validate_judgments,
 )
 from mp_comfyui_lab.comparison.metrics import compare_outputs
@@ -32,7 +32,6 @@ from mp_comfyui_lab.comparison.paths import path_component_is_link_or_junction
 from mp_comfyui_lab.comparison.render import (
     ComparisonArtifacts,
     comparison_facts_sha256,
-    render_comparison,
 )
 from mp_comfyui_lab.config import LabConfig, LabConfigError
 from mp_comfyui_lab.discovery.query import QueryExpansionConfigError, expand_query
@@ -63,7 +62,6 @@ from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.export.bundle import (
     BundleConflictError,
     BundleExporter,
-    BundleIntegrityError,
     SelectionRequiredError,
 )
 from mp_comfyui_lab.experiments.engine import (
@@ -835,7 +833,8 @@ def _compare_command(
     runs = tuple(
         record
         for record in all_runs
-        if (record.variant_id, record.exact_run_hash) in current_variants
+        if record.plan_hash == plan.plan_hash
+        and (record.variant_id, record.exact_run_hash) in current_variants
     )
     report = compare_outputs(
         runs,
@@ -843,7 +842,6 @@ def _compare_command(
         experiment_id=parsed.experiment_id,
     )
     submission = None
-    judgment_bytes: bytes | None = None
     if parsed.judgments is not None:
         source = Path(parsed.judgments)
         if not source.is_absolute():
@@ -853,7 +851,6 @@ def _compare_command(
             report,
             expected_facts_sha256=comparison_facts_sha256(report),
         )
-        judgment_bytes = judgment_document_bytes(submission)
     else:
         stored_judgments = experiment_root / "comparisons" / "judgments.json"
         if stored_judgments.exists() or stored_judgments.is_symlink():
@@ -866,14 +863,35 @@ def _compare_command(
             except JudgmentValidationError as error:
                 if "facts_sha256 does not match" not in str(error):
                     raise
-    rendered = render_comparison(
-        report,
-        experiment_root,
-        judgment_document=judgment_bytes,
-        replace_existing=True,
+    review = regenerate_review_artifacts(
+        store,
+        parsed.experiment_id,
+        plan,
+        runs,
+        judgments=submission,
     )
-    finalists = propose_finalists(report, plan, judgments=submission)
-    finalists_path = write_finalists(store, finalists)
+    comparison_root = review.comparison_path.parent
+    contact_sheets = tuple(
+        sorted(
+            comparison_root.glob("contact-sheet*.jpg"),
+            key=lambda path: path.name,
+        )
+    )
+    rendered = ComparisonArtifacts(
+        experiment_root=experiment_root,
+        facts=review.comparison_path,
+        duplicate_groups=comparison_root / "duplicate-groups.json",
+        contact_sheet=contact_sheets[0],
+        contact_sheets=contact_sheets,
+        gallery=comparison_root / "index.html",
+        judgment_input=comparison_root / "judgment-input.json",
+        judgments=(
+            comparison_root / "judgments.json"
+            if review.finalists.judgments_path is not None
+            else None
+        ),
+    )
+    finalists_path = review.finalists_path
     artifacts = _comparison_artifacts_payload(rendered)
     finalist_artifact = {"kind": "finalists", "path": str(finalists_path)}
     if artifacts and artifacts[-1]["kind"] == "judgments":
@@ -898,7 +916,7 @@ def _compare_command(
                 else str(rendered.judgments)
             ),
             "finalists_path": str(finalists_path),
-            "finalist_variant_ids": list(finalists.variant_ids),
+            "finalist_variant_ids": list(review.finalists.variant_ids),
             "requires_human_selection": True,
         },
         artifacts,
@@ -1217,6 +1235,13 @@ def main(
                 [{"kind": "selection", "path": str(selection_path)}],
             )
             return ExitCode.OK
+        except ArtifactIntegrityError as error:
+            emit_error(
+                "select",
+                "integrity",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.SAFETY
         except FinalistSelectionError as error:
             emit_error(
                 "select",
@@ -1255,16 +1280,21 @@ def main(
                 [{"kind": "handoff_bundle", "path": str(bundle)}],
             )
             return ExitCode.OK
-        except SelectionRequiredError as error:
-            message = sanitize_untrusted_diagnostic(str(error))
-            kind = (
-                "stale_selection"
-                if "changed" in str(error) or "not a current finalist" in str(error)
-                else "selection_required"
+        except StaleSelectionError as error:
+            emit_error(
+                "export",
+                "stale_selection",
+                sanitize_untrusted_diagnostic(str(error)),
             )
-            emit_error("export", kind, message)
             return ExitCode.SELECTION
-        except BundleIntegrityError as error:
+        except SelectionRequiredError as error:
+            emit_error(
+                "export",
+                "selection_required",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.SELECTION
+        except ArtifactIntegrityError as error:
             emit_error(
                 "export",
                 "integrity",
@@ -1327,7 +1357,12 @@ def main(
             artifacts = [
                 {
                     "kind": "run",
-                    "path": f"runs/{record.run_id}.json",
+                    "path": str(
+                        engine.run_artifact_path(
+                            parsed.experiment_id,
+                            record.run_id,
+                        )
+                    ),
                 }
             ]
             data = _run_payload(record)

@@ -756,6 +756,7 @@ class DimensionApproval(_FrozenModel):
 
 class ExperimentBrief(_FrozenModel):
     goal: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=MAX_MANIFEST_SCALAR_LENGTH)]
+    partial_behavior_is_tested_capability: bool = False
     sources: SourceSpec
     fixtures: FixtureSpec
     expectations: ExpectationSpec
@@ -903,6 +904,48 @@ class PlanningSource(_FrozenModel):
         return self
 
 
+class ApprovedSourceProvenance(_FrozenModel):
+    workflow_id: Annotated[
+        str,
+        StringConstraints(strict=True, min_length=1, max_length=256),
+    ]
+    canonical_url: Annotated[
+        str,
+        StringConstraints(strict=True, min_length=1, max_length=2_048),
+    ]
+    source_hash: Sha256
+    capability_hash: Sha256
+    evidence_ids: tuple[
+        Annotated[
+            str,
+            StringConstraints(strict=True, min_length=1, max_length=512),
+        ],
+        ...,
+    ] = Field(min_length=1, max_length=128)
+    engagement: int = Field(default=0, ge=0)
+
+    @field_validator("evidence_ids", mode="before")
+    @classmethod
+    def source_evidence_array(cls, value: Any) -> Any:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("source evidence_ids must be an array")
+        return tuple(value)
+
+    @field_validator("canonical_url")
+    @classmethod
+    def canonical_source_url(cls, value: str) -> str:
+        try:
+            return parse_runninghub_url(value).canonical_url
+        except UnsupportedSourceError as error:
+            raise ValueError(str(error)) from error
+
+    @model_validator(mode="after")
+    def source_id_matches_url(self) -> Self:
+        if parse_runninghub_url(self.canonical_url).workflow_id != self.workflow_id:
+            raise ValueError("workflow_id does not match canonical_url")
+        return self
+
+
 class SourceBundle(_FrozenModel):
     sources: tuple[PlanningSource, ...] = Field(min_length=1, max_length=MAX_MANIFEST_SOURCES)
     candidates: tuple[Candidate, ...] = Field(default=(), max_length=MAX_PLAN_VARIANTS)
@@ -1035,12 +1078,24 @@ class PlannedVariant(_FrozenModel):
 class ExperimentPlan(_FrozenModel):
     plan_hash: Sha256
     source_hashes: tuple[Sha256, ...] = Field(min_length=1, max_length=MAX_MANIFEST_SOURCES)
+    source_provenance: tuple[ApprovedSourceProvenance, ...] = Field(
+        default=(),
+        max_length=MAX_MANIFEST_SOURCES,
+    )
+    partial_behavior_is_tested_capability: bool = False
     variants: tuple[PlannedVariant, ...] = Field(min_length=1, max_length=MAX_PLAN_VARIANTS)
     capability_coverage: tuple[DimensionName, ...] = Field(default=(), max_length=len(DimensionName))
     warnings: tuple[str, ...] = Field(default=(), max_length=512)
     approval_payload: SanitizedJsonObject
 
-    @field_validator("source_hashes", "variants", "capability_coverage", "warnings", mode="before")
+    @field_validator(
+        "source_hashes",
+        "source_provenance",
+        "variants",
+        "capability_coverage",
+        "warnings",
+        mode="before",
+    )
     @classmethod
     def json_arrays(cls, value: Any) -> Any:
         return tuple(value) if isinstance(value, list) else value
@@ -1073,6 +1128,34 @@ class ExperimentPlan(_FrozenModel):
                 ]
             if approval_value != value:
                 raise ValueError(f"{field_name} does not match durable approval_payload")
+        approved_brief = payload.get("brief")
+        approved_partial = (
+            approved_brief.get(
+                "partial_behavior_is_tested_capability",
+                False,
+            )
+            if isinstance(approved_brief, Mapping)
+            else False
+        )
+        if type(approved_partial) is not bool or approved_partial is not (
+            self.partial_behavior_is_tested_capability
+        ):
+            raise ValueError(
+                "partial_behavior_is_tested_capability does not match "
+                "durable approval_payload"
+            )
+        approved_sources = payload.get("source_provenance", [])
+        expected_sources = [
+            item.model_dump(mode="json") for item in self.source_provenance
+        ]
+        if approved_sources != expected_sources:
+            raise ValueError(
+                "source_provenance does not match durable approval_payload"
+            )
+        if self.source_provenance and tuple(
+            sorted(item.source_hash for item in self.source_provenance)
+        ) != tuple(sorted(self.source_hashes)):
+            raise ValueError("source_provenance does not match source_hashes")
         return self
 
     def recompute_plan_hash(self) -> str:

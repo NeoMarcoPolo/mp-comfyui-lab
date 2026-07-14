@@ -16,18 +16,19 @@ from pydantic import ValidationError
 import yaml
 
 from mp_comfyui_lab.comparison.finalists import (
-    FinalistSelectionError,
-    FinalistsArtifact,
+    ArtifactIntegrityError,
+    CanonicalReview,
     HumanSelection,
+    SelectionRequiredError,
+    StaleSelectionError,
+    load_canonical_review,
     require_valid_selection,
 )
-from mp_comfyui_lab.comparison.metrics import ComparisonReport
 from mp_comfyui_lab.comparison.paths import (
     hash_stored_artifact,
     path_component_is_link_or_junction,
     resolve_stored_artifact,
 )
-from mp_comfyui_lab.comparison.render import comparison_facts_sha256
 from mp_comfyui_lab.comparison.render import _rename_directory_new
 from mp_comfyui_lab.experiments.models import (
     ExperimentPlan,
@@ -54,11 +55,7 @@ class BundleExportError(ValueError):
     """Base class for deterministic handoff export failures."""
 
 
-class SelectionRequiredError(BundleExportError):
-    """Raised when export is not bound to a current explicit selection."""
-
-
-class BundleIntegrityError(BundleExportError):
+class BundleIntegrityError(ArtifactIntegrityError):
     """Raised when a durable source artifact is missing, unsafe, or changed."""
 
 
@@ -72,7 +69,7 @@ def suggested_workflow_name(
     workflow_type: str,
     description: str,
 ) -> str:
-    components = tuple(
+    base_component, full_type, full_description = tuple(
         _ascii_component(value, fallback=fallback)
         for value, fallback in (
             (_without_model_extension(base_model), "model"),
@@ -80,7 +77,31 @@ def suggested_workflow_name(
             (description, "handoff"),
         )
     )
-    return "_".join(components)[:160].rstrip("_")
+    type_component = full_type[:24].strip("_") or "workflow"
+    description_component = (
+        full_description[:72].strip("_") or "handoff"
+    )
+    suffix = f"_{type_component}_{description_component}"
+    full_name = f"{base_component}{suffix}"
+    needs_hash = (
+        len(full_name) > 160
+        or type_component != full_type
+        or description_component != full_description
+    )
+    if not needs_hash:
+        return full_name
+    hash_preimage = f"{base_component}\0{full_type}\0{full_description}"
+    short_hash = hashlib.sha256(hash_preimage.encode("ascii")).hexdigest()[:10]
+    description_budget = max(1, 72 - len(short_hash) - 1)
+    description_component = (
+        description_component[:description_budget].rstrip("_")
+        or "handoff"
+    )
+    description_component = f"{description_component}_{short_hash}"
+    suffix = f"_{type_component}_{description_component}"
+    base_budget = max(1, 160 - len(suffix))
+    base_component = base_component[:base_budget].rstrip("_") or "model"
+    return f"{base_component}{suffix}"
 
 
 class BundleExporter:
@@ -92,22 +113,44 @@ class BundleExporter:
             return self._export_locked(experiment_id)
 
     def _export_locked(self, experiment_id: str) -> Path:
-        try:
-            selection = require_valid_selection(self._store, experiment_id)
-        except FinalistSelectionError as error:
-            raise SelectionRequiredError(str(error)) from error
-
-        root = self._store.root(experiment_id)
-        finalists = self._load_finalists(root, experiment_id)
-        plan = self._load_plan(root, selection)
+        selection = require_valid_selection(self._store, experiment_id)
+        review = load_canonical_review(self._store, experiment_id)
+        root = review.root
+        if (
+            selection.plan_hash != review.plan.plan_hash
+            or selection.finalists_artifact_sha256
+            != hashlib.sha256(review.finalists_bytes).hexdigest()
+        ):
+            raise StaleSelectionError(
+                "selection no longer matches the canonical review generation"
+            )
+        plan = review.plan
         variant = self._load_variant(root, selection, plan)
-        source = self._load_source(root, variant)
-        comparison, comparison_bytes = self._load_comparison(
-            root,
-            finalists,
-            selection,
+        source = self._load_source(root, variant, plan)
+        proposal = next(
+            (
+                item
+                for item in review.finalists.finalists
+                if item.variant_id == selection.selected_variant_id
+            ),
+            None,
         )
-        run = self._load_selected_run(root, comparison, selection, variant)
+        if proposal is None:
+            raise StaleSelectionError(
+                "selected variant is not a current canonical finalist"
+            )
+        run = next(
+            (
+                item
+                for item in review.runs
+                if item.run_id == proposal.run_evidence.run_id
+            ),
+            None,
+        )
+        if run is None:
+            raise ArtifactIntegrityError(
+                "selected finalist run evidence is missing"
+            )
         selection_bytes = self._read_stored_bytes(root, "selection.json")
         try:
             persisted_selection = HumanSelection.model_validate_json(
@@ -142,7 +185,7 @@ class BundleExporter:
                 source=source,
                 run=run,
                 root=root,
-                comparison_bytes=comparison_bytes,
+                review=review,
                 selection_bytes=selection_bytes,
             )
             self._publish(stage, destination)
@@ -161,7 +204,7 @@ class BundleExporter:
         source: dict[str, Any],
         run: RunRecord,
         root: Path,
-        comparison_bytes: bytes,
+        review: CanonicalReview,
         selection_bytes: bytes,
     ) -> None:
         (stage / "fixtures" / "files").mkdir(parents=True)
@@ -216,7 +259,26 @@ class BundleExporter:
                 "exported_outputs": exported_outputs,
             },
         )
-        self._write_bytes(stage / "comparison.json", comparison_bytes)
+        self._write_json(
+            stage / "comparison.json",
+            {
+                "schema_version": "1",
+                "generation_id": review.manifest.generation_id,
+                "facts_sha256": review.manifest.comparison_facts_sha256,
+                "facts": review.comparison.model_dump(mode="json"),
+                "judgments_sha256": review.manifest.judgments_sha256,
+                "judgments": (
+                    None
+                    if review.judgments is None
+                    else review.judgments.model_dump(mode="json")
+                ),
+            },
+        )
+        self._write_bytes(stage / "finalists.json", review.finalists_bytes)
+        self._write_bytes(
+            stage / "review-manifest.json",
+            review.manifest_bytes,
+        )
         self._write_bytes(stage / "selection.json", selection_bytes)
 
         description = self._brief_goal(root, plan)
@@ -255,41 +317,6 @@ class BundleExporter:
             },
         )
         self._fsync_tree(stage)
-
-    def _load_finalists(
-        self,
-        root: Path,
-        experiment_id: str,
-    ) -> FinalistsArtifact:
-        try:
-            finalists = FinalistsArtifact.model_validate_json(
-                self._read_stored_bytes(root, "finalists.json"),
-                strict=True,
-            )
-        except (ValidationError, ValueError) as error:
-            raise BundleIntegrityError("finalists artifact is invalid") from error
-        if finalists.experiment_id != experiment_id:
-            raise BundleIntegrityError("finalists experiment identity changed")
-        return finalists
-
-    def _load_plan(
-        self,
-        root: Path,
-        selection: HumanSelection,
-    ) -> ExperimentPlan:
-        try:
-            plan = ExperimentPlan.model_validate_json(
-                self._read_stored_bytes(
-                    root,
-                    f"plans/{selection.plan_hash}.json",
-                ),
-                strict=True,
-            )
-        except (ValidationError, ValueError) as error:
-            raise BundleIntegrityError("approved plan artifact is invalid") from error
-        if plan.plan_hash != selection.plan_hash:
-            raise BundleIntegrityError("approved plan hash changed")
-        return plan
 
     def _load_variant(
         self,
@@ -333,6 +360,7 @@ class BundleExporter:
         self,
         root: Path,
         variant: PlannedVariant,
+        plan: ExperimentPlan,
     ) -> dict[str, Any]:
         document = self._read_json(root, "sources/source-bundle.json")
         if not isinstance(document, Mapping) or not isinstance(
@@ -360,64 +388,24 @@ class BundleExporter:
             raise BundleIntegrityError("source workflow API graph is invalid") from error
         if actual_hash != variant.source_hash:
             raise BundleIntegrityError("source workflow hash changed")
-        return source
-
-    def _load_comparison(
-        self,
-        root: Path,
-        finalists: FinalistsArtifact,
-        selection: HumanSelection,
-    ) -> tuple[ComparisonReport, bytes]:
-        comparison_bytes = self._read_stored_bytes(root, "comparisons/facts.json")
-        if hashlib.sha256(comparison_bytes).hexdigest() != (
-            finalists.comparison_facts_sha256
-        ):
-            raise BundleIntegrityError("comparison artifact hash changed")
-        try:
-            comparison = ComparisonReport.model_validate_json(
-                comparison_bytes,
-                strict=True,
-            )
-        except ValidationError as error:
-            raise BundleIntegrityError("comparison artifact is invalid") from error
-        if comparison_facts_sha256(comparison) != finalists.comparison_facts_sha256:
-            raise BundleIntegrityError("comparison artifact is not canonical")
-        if selection.selected_variant_id not in comparison.variants:
-            raise BundleIntegrityError(
-                "selected variant is missing from comparison facts"
-            )
-        return comparison, comparison_bytes
-
-    def _load_selected_run(
-        self,
-        root: Path,
-        comparison: ComparisonReport,
-        selection: HumanSelection,
-        variant: PlannedVariant,
-    ) -> RunRecord:
-        run_id = comparison.variants[selection.selected_variant_id].run_id
-        try:
-            safe_filename(run_id)
-            run = RunRecord.model_validate_json(
-                self._read_stored_bytes(root, f"runs/{run_id}.json"),
-                strict=True,
-            )
-        except (SafetyError, ValidationError, ValueError) as error:
-            raise BundleIntegrityError("selected run artifact is invalid") from error
-        if (
-            run.run_id != run_id
-            or run.experiment_id != selection.experiment_id
-            or run.variant_id != variant.variant_id
-            or run.plan_hash != selection.plan_hash
-            or run.exact_run_hash != variant.exact_run_hash
-        ):
-            raise BundleIntegrityError("selected run provenance changed")
-        snapshot = (
-            None if run.variant_snapshot is None else thaw_json(run.variant_snapshot)
+        identities = tuple(
+            item
+            for item in plan.source_provenance
+            if item.workflow_id == variant.source_workflow_id
+            and item.source_hash == variant.source_hash
         )
-        if snapshot != variant.model_dump(mode="json"):
-            raise BundleIntegrityError("selected run variant snapshot changed")
-        return run
+        if len(identities) != 1:
+            raise BundleIntegrityError(
+                "selected source lacks immutable approved provenance"
+            )
+        identity = identities[0]
+        if identity.capability_hash != capability_hash(graph):
+            raise BundleIntegrityError("source capability evidence changed")
+        return {
+            **source,
+            **identity.model_dump(mode="json"),
+            "raw_graph": graph,
+        }
 
     def _copy_fixtures(
         self,

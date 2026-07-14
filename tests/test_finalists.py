@@ -9,8 +9,10 @@ from PIL import Image
 import pytest
 
 from mp_comfyui_lab.comparison.finalists import (
+    ArtifactIntegrityError,
     FinalistSelectionError,
     SelectionState,
+    ReviewGenerationConflict,
     propose_finalists,
     regenerate_review_artifacts,
     select_finalist,
@@ -120,6 +122,9 @@ def _plan(
     return ExperimentPlan(
         plan_hash=_canonical_hash(approval_payload),
         source_hashes=("a" * 64,),
+        partial_behavior_is_tested_capability=(
+            partial_behavior_is_tested_capability
+        ),
         variants=tuple(variants),
         capability_coverage=(DimensionName.CHECKPOINT,),
         warnings=(),
@@ -196,18 +201,19 @@ def test_finalists_exclude_failed_cancelled_and_partial_batches_by_default(
     experiment_root = tmp_path / EXPERIMENT_ID
     plan = _plan(("complete", "partial", "failed", "cancelled"))
     variants = {item.variant_id: item for item in plan.variants}
-    report = compare_outputs(
-        (
+    runs = (
             _run(experiment_root, variants["complete"], state=RunState.SUCCESS),
             _run(experiment_root, variants["partial"], state=RunState.INCOMPLETE),
             _run(experiment_root, variants["failed"], state=RunState.FAILED),
             _run(experiment_root, variants["cancelled"], state=RunState.CANCELLED),
-        ),
+        )
+    report = compare_outputs(
+        runs,
         experiment_root,
         experiment_id=EXPERIMENT_ID,
     )
 
-    finalists = propose_finalists(report, plan)
+    finalists = propose_finalists(report, plan, runs=runs)
 
     assert finalists.variant_ids == ("complete",)
     assert finalists.requires_human_selection is True
@@ -220,6 +226,30 @@ def test_finalists_exclude_failed_cancelled_and_partial_batches_by_default(
     assert proposal.supporting_facts.perceptually_unique_output_count >= 0
     assert proposal.supporting_facts.capability_covered is True
     assert proposal.supporting_facts.evidence_confidence == "observed"
+    assert proposal.run_evidence.run_id == "run-complete"
+    expected_run_bytes = (
+        json.dumps(
+            runs[0].model_dump(mode="json"),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    assert proposal.run_evidence.run_record_sha256 == hashlib.sha256(
+        expected_run_bytes
+    ).hexdigest()
+    assert proposal.run_evidence.state == RunState.SUCCESS.value
+    assert proposal.run_evidence.provider_task_id == "task-complete"
+    output_evidence = proposal.run_evidence.outputs[0]
+    assert output_evidence.output_id == "complete/0"
+    assert output_evidence.sha256 == runs[0].outputs[0].content_sha256
+    assert output_evidence.bytes == runs[0].outputs[0].size
+    assert output_evidence.media_type == "image/png"
+    assert output_evidence.artifact_relative_path == (
+        runs[0].outputs[0].local_relative_path
+    )
+    assert proposal.comparison_report_sha256 == comparison_facts_sha256(report)
 
 
 def test_partial_finalist_requires_immutable_approved_capability_and_is_visible(
@@ -231,16 +261,17 @@ def test_partial_finalist_requires_immutable_approved_capability_and_is_visible(
         partial_behavior_is_tested_capability=True,
     )
     variants = {item.variant_id: item for item in plan.variants}
-    report = compare_outputs(
-        (
+    runs = (
             _run(experiment_root, variants["partial"], state=RunState.INCOMPLETE),
             _run(experiment_root, variants["failed"], state=RunState.FAILED),
-        ),
+        )
+    report = compare_outputs(
+        runs,
         experiment_root,
         experiment_id=EXPERIMENT_ID,
     )
 
-    finalists = propose_finalists(report, plan)
+    finalists = propose_finalists(report, plan, runs=runs)
 
     assert finalists.variant_ids == ("partial",)
     proposal = finalists.finalists[0]
@@ -282,7 +313,7 @@ def test_approved_partial_capability_does_not_admit_unrelated_incomplete_run(
         experiment_id=EXPERIMENT_ID,
     )
 
-    finalists = propose_finalists(report, plan)
+    finalists = propose_finalists(report, plan, runs=(run,))
 
     assert finalists.variant_ids == ()
     assert finalists.excluded == {"partial": "run_status_incomplete"}
@@ -294,8 +325,7 @@ def test_finalists_persist_all_scoring_facts_and_validated_judgment_reasons(
     experiment_root = tmp_path / EXPERIMENT_ID
     plan = _plan(("baseline", "candidate"))
     variants = {item.variant_id: item for item in plan.variants}
-    report = compare_outputs(
-        (
+    runs = (
             _run(
                 experiment_root,
                 variants["baseline"],
@@ -308,7 +338,9 @@ def test_finalists_persist_all_scoring_facts_and_validated_judgment_reasons(
                 state=RunState.SUCCESS,
                 color=(220, 30, 90),
             ),
-        ),
+        )
+    report = compare_outputs(
+        runs,
         experiment_root,
         experiment_id=EXPERIMENT_ID,
     )
@@ -340,7 +372,12 @@ def test_finalists_persist_all_scoring_facts_and_validated_judgment_reasons(
         }
     )
 
-    finalists = propose_finalists(report, plan, judgments=judgments)
+    finalists = propose_finalists(
+        report,
+        plan,
+        runs=runs,
+        judgments=judgments,
+    )
 
     assert finalists.variant_ids[0] == "candidate"
     proposal = finalists.finalists[0]
@@ -393,6 +430,155 @@ def test_regeneration_writes_empty_finalists_and_never_selection(
     assert not (experiment_root / "selection.json").exists()
 
 
+def test_review_generation_is_immutable_bound_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create(EXPERIMENT_ID)
+    plan = _plan(("complete",))
+    variant = plan.variants[0]
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    run = _run(root, variant, state=RunState.SUCCESS).model_copy(
+        update={"plan_hash": plan.plan_hash}
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        run.model_dump(mode="json"),
+    )
+
+    first = regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
+    select_finalist(store, EXPERIMENT_ID, "complete")
+    second = regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
+
+    assert first.comparison_path == second.comparison_path
+    assert first.finalists_path == second.finalists_path
+    assert first.generation_manifest_path == second.generation_manifest_path
+    assert first.finalists_path.parent == first.comparison_path.parent.parent
+    assert first.generation_manifest_path.parent == first.finalists_path.parent
+    assert (root / "finalists.json").read_bytes() == first.finalists_path.read_bytes()
+    current = json.loads((root / "finalists.json").read_text(encoding="utf-8"))
+    assert current["review_generation_id"] == first.finalists.review_generation_id
+    assert current["comparison_facts_path"] == (
+        first.comparison_path.relative_to(root).as_posix()
+    )
+    manifest = json.loads(
+        first.generation_manifest_path.read_text(encoding="utf-8")
+    )
+    assert manifest["generation_id"] == first.finalists.review_generation_id
+    assert manifest["comparison_facts_sha256"] == (
+        first.finalists.comparison_facts_sha256
+    )
+    assert manifest["finalists_sha256"] == hashlib.sha256(
+        first.finalists_path.read_bytes()
+    ).hexdigest()
+    assert selection_status(store, EXPERIMENT_ID).state is SelectionState.VALID
+
+    changed_output = _image_output(
+        root,
+        variant,
+        run_id=run.run_id,
+        color=(240, 180, 20),
+    )
+    changed_run = RunRecord.model_validate(
+        {
+            **run.model_dump(mode="python"),
+            "outputs": (changed_output,),
+        }
+    )
+    store.write_json(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        changed_run.model_dump(mode="json"),
+    )
+    changed = regenerate_review_artifacts(
+        store,
+        EXPERIMENT_ID,
+        plan,
+        (changed_run,),
+    )
+    assert changed.finalists_path != first.finalists_path
+    assert selection_status(store, EXPERIMENT_ID).state is SelectionState.STALE
+
+
+def test_review_generation_conflict_does_not_clobber_immutable_content(
+    tmp_path: Path,
+) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create(EXPERIMENT_ID)
+    plan = _plan(("complete",))
+    run = _run(root, plan.variants[0], state=RunState.SUCCESS).model_copy(
+        update={"plan_hash": plan.plan_hash}
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        run.model_dump(mode="json"),
+    )
+    review = regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
+    review.finalists_path.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ReviewGenerationConflict, match="different content"):
+        regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
+
+    assert review.finalists_path.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_review_publication_fault_keeps_authoritative_generation(
+    tmp_path: Path,
+) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create(EXPERIMENT_ID)
+    plan = _plan(("complete",))
+    run = _run(root, plan.variants[0], state=RunState.SUCCESS).model_copy(
+        update={"plan_hash": plan.plan_hash}
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        run.model_dump(mode="json"),
+    )
+    first = regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
+    current_before = (root / "finalists.json").read_bytes()
+    output = root / run.outputs[0].local_relative_path
+    output.write_bytes(b"changed review evidence")
+
+    def fail_before_current(point: str) -> None:
+        if point == "current:before_publish":
+            raise RuntimeError("injected finalist publication failure")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        regenerate_review_artifacts(
+            store,
+            EXPERIMENT_ID,
+            plan,
+            (run,),
+            fault_injector=fail_before_current,
+        )
+
+    assert (root / "finalists.json").read_bytes() == current_before
+    current = json.loads(current_before)
+    bound_facts = root / current["comparison_facts_path"]
+    assert bound_facts == first.comparison_path
+    assert hashlib.sha256(bound_facts.read_bytes()).hexdigest() == current[
+        "comparison_facts_sha256"
+    ]
+
+
 def test_select_is_explicit_and_changed_finalists_make_selection_stale(
     tmp_path: Path,
 ) -> None:
@@ -407,6 +593,11 @@ def test_select_is_explicit_and_changed_finalists_make_selection_stale(
     )
     run = _run(experiment_root, variant, state=RunState.SUCCESS)
     run = run.model_copy(update={"plan_hash": plan.plan_hash})
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        run.model_dump(mode="json"),
+    )
     review = regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
     selected_at = datetime(2026, 7, 14, 15, 30, tzinfo=UTC)
 
@@ -433,15 +624,84 @@ def test_select_is_explicit_and_changed_finalists_make_selection_stale(
     assert "selected_at" not in persisted_selection
     assert selection_status(store, EXPERIMENT_ID).state is SelectionState.VALID
 
+    write_finalists(store, review.finalists)
+    assert selection_status(store, EXPERIMENT_ID).state is SelectionState.VALID
+
     empty_report = compare_outputs(
         (), experiment_root, experiment_id=EXPERIMENT_ID
     )
-    write_finalists(store, propose_finalists(empty_report, plan))
+    write_finalists(store, propose_finalists(empty_report, plan, runs=()))
     stale = selection_status(store, EXPERIMENT_ID)
     assert stale.state is SelectionState.STALE
     assert "finalists artifact SHA-256 changed" in (stale.reason or "")
-    with pytest.raises(FinalistSelectionError, match="not a current finalist"):
+    with pytest.raises(ArtifactIntegrityError, match="canonical review generation"):
         select_finalist(store, EXPERIMENT_ID, "complete")
+
+
+def test_select_rejects_tampered_finalist_content(tmp_path: Path) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create(EXPERIMENT_ID)
+    plan = _plan(("complete",))
+    variant = plan.variants[0]
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    run = _run(root, variant, state=RunState.SUCCESS).model_copy(
+        update={"plan_hash": plan.plan_hash}
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{run.run_id}.json",
+        run.model_dump(mode="json"),
+    )
+    regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (run,))
+    tampered = store.read_json(EXPERIMENT_ID, "finalists.json")
+    tampered["finalists"][0]["supporting_facts"]["capability"] = "tampered"
+    store.write_json(EXPERIMENT_ID, "finalists.json", tampered)
+
+    with pytest.raises(ArtifactIntegrityError, match="canonical"):
+        select_finalist(store, EXPERIMENT_ID, "complete")
+
+    assert not (root / "selection.json").exists()
+
+
+def test_select_rejects_review_that_omits_new_current_plan_run(
+    tmp_path: Path,
+) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create(EXPERIMENT_ID)
+    plan = _plan(("first", "second"))
+    variants = {item.variant_id: item for item in plan.variants}
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"plans/{plan.plan_hash}.json",
+        plan.model_dump(mode="json"),
+    )
+    first = _run(root, variants["first"], state=RunState.SUCCESS).model_copy(
+        update={"plan_hash": plan.plan_hash}
+    )
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{first.run_id}.json",
+        first.model_dump(mode="json"),
+    )
+    regenerate_review_artifacts(store, EXPERIMENT_ID, plan, (first,))
+    second = _run(
+        root,
+        variants["second"],
+        state=RunState.SUCCESS,
+        color=(220, 30, 90),
+    ).model_copy(update={"plan_hash": plan.plan_hash})
+    store.write_json_new(
+        EXPERIMENT_ID,
+        f"runs/{second.run_id}.json",
+        second.model_dump(mode="json"),
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="current run or output evidence"):
+        select_finalist(store, EXPERIMENT_ID, "first")
 
 
 def _cli_payload(capsys) -> dict[str, object]:
@@ -511,6 +771,11 @@ def test_select_and_export_cli_return_structured_stale_selection_errors(
     store, _ = _persist_cli_review(tmp_path)
     assert main(["finalists", EXPERIMENT_ID], cwd=tmp_path) == ExitCode.OK
     capsys.readouterr()
+
+    code = main(["export", EXPERIMENT_ID], cwd=tmp_path)
+    missing_selection = _cli_payload(capsys)
+    assert code == ExitCode.SELECTION
+    assert missing_selection["error"]["kind"] == "selection_required"
 
     code = main(["select", EXPERIMENT_ID, "missing"], cwd=tmp_path)
     invalid = _cli_payload(capsys)
