@@ -1,0 +1,200 @@
+{
+  "$defs": {
+    "DimensionApproval": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/DimensionName"
+        },
+        "policy": {
+          "$ref": "#/$defs/DimensionPolicy"
+        }
+      },
+      "required": [
+        "name",
+        "policy"
+      ],
+      "title": "DimensionApproval",
+      "type": "object"
+    },
+    "DimensionName": {
+      "enum": [
+        "checkpoint",
+        "lora_stack",
+        "lora_strength",
+        "prompt_grammar",
+        "sampler",
+        "scheduler",
+        "encoder",
+        "reference_strategy",
+        "output_dimensions",
+        "seed_variance"
+      ],
+      "title": "DimensionName",
+      "type": "string"
+    },
+    "DimensionPolicy": {
+      "enum": [
+        "approved",
+        "baseline_only",
+        "disabled"
+      ],
+      "title": "DimensionPolicy",
+      "type": "string"
+    },
+    "ExpectationSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "media_types": {
+          "default": [],
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Media Types",
+          "type": "array"
+        },
+        "output_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "const": "auto",
+              "type": "string"
+            }
+          ],
+          "title": "Output Count"
+        }
+      },
+      "required": [
+        "output_count"
+      ],
+      "title": "ExpectationSpec",
+      "type": "object"
+    },
+    "FixtureSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "prompt_lines": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 512,
+          "minItems": 1,
+          "title": "Prompt Lines",
+          "type": "array"
+        },
+        "reference_images": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ReferenceImageFixture"
+          },
+          "maxItems": 64,
+          "title": "Reference Images",
+          "type": "array"
+        }
+      },
+      "required": [
+        "prompt_lines"
+      ],
+      "title": "FixtureSpec",
+      "type": "object"
+    },
+    "ReferenceImageFixture": {
+      "additionalProperties": false,
+      "properties": {
+        "binding_index": {
+          "maximum": 4095,
+          "minimum": 0,
+          "title": "Binding Index",
+          "type": "integer"
+        },
+        "uri": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "binding_index"
+      ],
+      "title": "ReferenceImageFixture",
+      "type": "object"
+    },
+    "SourceSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "queries": {
+          "default": [],
+          "items": {
+            "maxLength": 8192,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Queries",
+          "type": "array"
+        },
+        "urls": {
+          "default": [],
+          "items": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Urls",
+          "type": "array"
+        }
+      },
+      "title": "SourceSpec",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "dimensions": {
+      "items": {
+        "$ref": "#/$defs/DimensionApproval"
+      },
+      "maxItems": 10,
+      "minItems": 1,
+      "title": "Dimensions",
+      "type": "array"
+    },
+    "expectations": {
+      "$ref": "#/$defs/ExpectationSpec"
+    },
+    "fixtures": {
+      "$ref": "#/$defs/FixtureSpec"
+    },
+    "goal": {
+      "maxLength": 8192,
+      "minLength": 1,
+      "title": "Goal",
+      "type": "string"
+    },
+    "partial_behavior_is_tested_capability": {
+      "default": false,
+      "title": "Partial Behavior Is Tested Capability",
+      "type": "boolean"
+    },
+    "sources": {
+      "$ref": "#/$defs/SourceSpec"
+    }
+  },
+  "required": [
+    "goal",
+    "sources",
+    "fixtures",
+    "expectations",
+    "dimensions"
+  ],
+  "title": "ExperimentBrief",
+  "type": "object"
+}

@@ -1,0 +1,369 @@
+{
+  "$defs": {
+    "ApprovedSourceProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "canonical_url": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Canonical Url",
+          "type": "string"
+        },
+        "capability_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Capability Hash",
+          "type": "string"
+        },
+        "engagement": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Engagement",
+          "type": "integer"
+        },
+        "evidence_ids": {
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Evidence Ids",
+          "type": "array"
+        },
+        "source_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Hash",
+          "type": "string"
+        },
+        "workflow_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Workflow Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_id",
+        "canonical_url",
+        "source_hash",
+        "capability_hash",
+        "evidence_ids"
+      ],
+      "title": "ApprovedSourceProvenance",
+      "type": "object"
+    },
+    "ContentClassification": {
+      "enum": [
+        "SFW",
+        "NSFW",
+        "UNKNOWN"
+      ],
+      "title": "ContentClassification",
+      "type": "string"
+    },
+    "DimensionName": {
+      "enum": [
+        "checkpoint",
+        "lora_stack",
+        "lora_strength",
+        "prompt_grammar",
+        "sampler",
+        "scheduler",
+        "encoder",
+        "reference_strategy",
+        "output_dimensions",
+        "seed_variance"
+      ],
+      "title": "DimensionName",
+      "type": "string"
+    },
+    "FixtureFingerprint": {
+      "additionalProperties": false,
+      "properties": {
+        "binding_index": {
+          "maximum": 4095,
+          "minimum": 0,
+          "title": "Binding Index",
+          "type": "integer"
+        },
+        "media_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Media Type"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 67108864,
+          "minimum": 0,
+          "title": "Size",
+          "type": "integer"
+        },
+        "uri": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "binding_index",
+        "size",
+        "sha256"
+      ],
+      "title": "FixtureFingerprint",
+      "type": "object"
+    },
+    "PlannedVariant": {
+      "additionalProperties": false,
+      "properties": {
+        "capability_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Capability Hash",
+          "type": "string"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanningConfidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "content_classification": {
+          "$ref": "#/$defs/ContentClassification",
+          "default": "UNKNOWN"
+        },
+        "diff": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Diff"
+        },
+        "evidence_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Evidence Ids",
+          "type": "array"
+        },
+        "exact_run_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Exact Run Hash",
+          "type": "string"
+        },
+        "execution_parameters": {
+          "additionalProperties": true,
+          "title": "Execution Parameters",
+          "type": "object"
+        },
+        "expected_media_types": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Expected Media Types",
+          "type": "array"
+        },
+        "expected_output_count": {
+          "exclusiveMinimum": 0,
+          "title": "Expected Output Count",
+          "type": "integer"
+        },
+        "fixture_fingerprints": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FixtureFingerprint"
+          },
+          "maxItems": 64,
+          "title": "Fixture Fingerprints",
+          "type": "array"
+        },
+        "hypothesis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DimensionName"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "materialized_graph": {
+          "additionalProperties": true,
+          "title": "Materialized Graph",
+          "type": "object"
+        },
+        "output_node_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Output Node Ids",
+          "type": "array"
+        },
+        "semantic_patch": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Semantic Patch"
+        },
+        "source_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Hash",
+          "type": "string"
+        },
+        "source_workflow_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Source Workflow Id",
+          "type": "string"
+        },
+        "variant_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Variant Id",
+          "type": "string"
+        },
+        "warnings": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "variant_id",
+        "source_workflow_id",
+        "source_hash",
+        "materialized_graph",
+        "exact_run_hash",
+        "capability_hash",
+        "expected_output_count",
+        "output_node_ids",
+        "execution_parameters"
+      ],
+      "title": "PlannedVariant",
+      "type": "object"
+    },
+    "PlanningConfidence": {
+      "enum": [
+        "observed",
+        "strongly_inferred",
+        "weakly_inferred",
+        "unexplored"
+      ],
+      "title": "PlanningConfidence",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "approval_payload": {
+      "additionalProperties": true,
+      "title": "Approval Payload",
+      "type": "object"
+    },
+    "capability_coverage": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/DimensionName"
+      },
+      "maxItems": 10,
+      "title": "Capability Coverage",
+      "type": "array"
+    },
+    "partial_behavior_is_tested_capability": {
+      "default": false,
+      "title": "Partial Behavior Is Tested Capability",
+      "type": "boolean"
+    },
+    "plan_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Plan Hash",
+      "type": "string"
+    },
+    "source_hashes": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "maxItems": 128,
+      "minItems": 1,
+      "title": "Source Hashes",
+      "type": "array"
+    },
+    "source_provenance": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ApprovedSourceProvenance"
+      },
+      "maxItems": 128,
+      "title": "Source Provenance",
+      "type": "array"
+    },
+    "variants": {
+      "items": {
+        "$ref": "#/$defs/PlannedVariant"
+      },
+      "maxItems": 512,
+      "minItems": 1,
+      "title": "Variants",
+      "type": "array"
+    },
+    "warnings": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 512,
+      "title": "Warnings",
+      "type": "array"
+    }
+  },
+  "required": [
+    "plan_hash",
+    "source_hashes",
+    "variants",
+    "approval_payload"
+  ],
+  "title": "ExperimentPlan",
+  "type": "object"
+}

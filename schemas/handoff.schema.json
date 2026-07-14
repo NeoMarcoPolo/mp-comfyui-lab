@@ -1,0 +1,79 @@
+{
+  "$defs": {
+    "HandoffArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "minimum": 0,
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "title": "HandoffArtifact",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/HandoffArtifact"
+      },
+      "title": "Artifacts",
+      "type": "array"
+    },
+    "experiment_id": {
+      "minLength": 1,
+      "title": "Experiment Id",
+      "type": "string"
+    },
+    "instructions": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Instructions",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "suggested_workflow_name": {
+      "minLength": 1,
+      "title": "Suggested Workflow Name",
+      "type": "string"
+    },
+    "variant_id": {
+      "minLength": 1,
+      "title": "Variant Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "experiment_id",
+    "variant_id",
+    "suggested_workflow_name",
+    "artifacts",
+    "instructions"
+  ],
+  "title": "HandoffManifest",
+  "type": "object"
+}

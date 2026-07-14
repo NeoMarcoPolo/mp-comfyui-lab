@@ -37,3 +37,6 @@ mp_comfyui_lab = ["resources/*.yaml", "resources/*.html"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "runninghub_readonly: opt-in live tests limited to public RunningHub discovery",
+]

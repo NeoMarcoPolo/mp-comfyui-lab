@@ -10,9 +10,15 @@ import shutil
 import stat
 import tempfile
 import unicodedata
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from pydantic import ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+)
 import yaml
 
 from mp_comfyui_lab.comparison.finalists import (
@@ -49,6 +55,31 @@ _MODEL_FIELDS = frozenset(
     {"ckpt_name", "checkpoint", "model_name", "unet_name", "diffusion_model"}
 )
 _LORA_FIELDS = frozenset({"lora_name", "lora_file", "lora"})
+NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class _HandoffModel(BaseModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        allow_inf_nan=False,
+    )
+
+
+class HandoffArtifact(_HandoffModel):
+    path: NonBlankStr
+    sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    bytes: int = Field(ge=0)
+
+
+class HandoffManifest(_HandoffModel):
+    schema_version: Literal["1"] = "1"
+    experiment_id: NonBlankStr
+    variant_id: NonBlankStr
+    suggested_workflow_name: NonBlankStr
+    artifacts: tuple[HandoffArtifact, ...]
+    instructions: tuple[NonBlankStr, ...]
 
 
 class BundleExportError(ValueError):
@@ -314,15 +345,12 @@ class BundleExporter:
             }
             for path, digest, size in self._artifact_hashes(stage)
         )
-        self._write_json(
-            stage / "handoff.json",
-            {
-                "schema_version": "1",
-                "experiment_id": experiment_id,
-                "variant_id": variant.variant_id,
-                "suggested_workflow_name": workflow_name,
-                "artifacts": artifacts,
-                "instructions": [
+        handoff = HandoffManifest(
+            experiment_id=experiment_id,
+            variant_id=variant.variant_id,
+            suggested_workflow_name=workflow_name,
+            artifacts=artifacts,
+            instructions=(
                     (
                         "Upload or import selected-workflow-api.json to "
                         "RunningHub as a saved workflow."
@@ -332,8 +360,11 @@ class BundleExporter:
                         "Invoke port-comfy-workflow with that URL through strip, "
                         "audit, register, smoke, and promote."
                     ),
-                ],
-            },
+            ),
+        )
+        self._write_json(
+            stage / "handoff.json",
+            handoff.model_dump(mode="json"),
         )
         self._fsync_tree(stage)
 

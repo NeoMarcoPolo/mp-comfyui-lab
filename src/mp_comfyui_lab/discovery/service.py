@@ -623,10 +623,19 @@ class DiscoveryService:
                 evidence[workflow_id] = cached.evidence
             else:
                 detail_method = getattr(self.executor, "detail", None)
-                if not callable(detail_method):
-                    raise TypeError("discovery executor must expose public detail()")
                 try:
-                    detail = detail_method(workflow_id)
+                    if callable(detail_method):
+                        detail = detail_method(workflow_id)
+                    else:
+                        detail = self.executor.fetch_workflow(
+                            WorkflowRef(
+                                executor=self.executor.name,
+                                workflow_id=workflow_id,
+                                canonical_url=merged[
+                                    workflow_id
+                                ].canonical_url,
+                            )
+                        ).detail
                 except Exception as error:
                     journal.record(
                         "detail",

@@ -7,7 +7,7 @@ import socket
 import sys
 import time
 from enum import IntEnum
-from typing import Any, NoReturn, Protocol, Sequence
+from typing import Any, Callable, NoReturn, Protocol, Sequence
 from urllib.parse import urljoin, urlsplit
 
 from mp_runninghub_api.errors import RunningHubApiError
@@ -98,6 +98,11 @@ from mp_comfyui_lab.security import (
     sanitize_for_persistence,
     sanitize_untrusted_diagnostic,
 )
+from mp_comfyui_lab.schemas import (
+    SchemaCheckError,
+    check_schemas,
+    export_schemas,
+)
 
 
 class ExitCode(IntEnum):
@@ -110,6 +115,7 @@ class ExitCode(IntEnum):
     INCOMPLETE = 7
     SELECTION = 8
     SAFETY = 9
+    SCHEMA = 10
 
 
 class HelpRequested(Exception):
@@ -368,6 +374,18 @@ def _build_parser() -> StructuredArgumentParser:
         usage="%(prog)s EXPERIMENT_ID",
     )
     export.add_argument("experiment_id", metavar="EXPERIMENT_ID")
+
+    schemas = subparsers.add_parser("schemas")
+    schema_commands = schemas.add_subparsers(
+        dest="schema_command",
+        required=True,
+    )
+    for command in ("export", "check"):
+        schema = schema_commands.add_parser(
+            command,
+            usage=f"%(prog)s --output DIRECTORY",
+        )
+        schema.add_argument("--output", metavar="DIRECTORY", required=True)
     return parser
 
 
@@ -428,6 +446,7 @@ def _make_experiment_engine(
     repository_root: Path,
     *,
     executor: Executor | None = None,
+    output_downloader: Callable[[str, Path], Any] | None = None,
 ) -> ExperimentEngine:
     config = LabConfig.load(repository_root)
     return ExperimentEngine(
@@ -437,7 +456,11 @@ def _make_experiment_engine(
             if executor is not None
             else (lambda: RunningHubExecutor())
         ),
-        downloader=_download_runninghub_output,
+        downloader=(
+            _download_runninghub_output
+            if output_downloader is None
+            else output_downloader
+        ),
         sleep=time.sleep,
     )
 
@@ -1149,6 +1172,7 @@ def main(
     planning_loader: PlanningBundleLoader | None = None,
     executor: Executor | None = None,
     experiment_engine: ExperimentEngine | None = None,
+    output_downloader: Callable[[str, Path], Any] | None = None,
     cwd: str | Path | None = None,
 ) -> ExitCode:
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -1168,6 +1192,46 @@ def main(
     if parsed.command == "version":
         emit_success("version", {"version": __version__})
         return ExitCode.OK
+
+    if parsed.command == "schemas":
+        schema_command = f"schemas {parsed.schema_command}"
+        root = Path.cwd() if cwd is None else Path(cwd)
+        output = Path(parsed.output)
+        if not output.is_absolute():
+            output = root / output
+        try:
+            paths = (
+                export_schemas(output)
+                if parsed.schema_command == "export"
+                else check_schemas(output)
+            )
+            emit_success(
+                schema_command,
+                {
+                    "output": str(output.resolve()),
+                    "status": (
+                        "exported"
+                        if parsed.schema_command == "export"
+                        else "current"
+                    ),
+                    "files": [str(path) for path in paths],
+                },
+                [
+                    {"kind": "schema", "path": str(path)}
+                    for path in paths
+                ],
+            )
+            return ExitCode.OK
+        except SchemaCheckError as error:
+            emit_error(schema_command, "schema", str(error))
+            return ExitCode.SCHEMA
+        except OSError as error:
+            emit_error(
+                schema_command,
+                "execution",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.EXECUTION
 
     if parsed.command in {"compare", "finalists"}:
         try:
@@ -1337,6 +1401,7 @@ def main(
             engine = experiment_engine or _make_experiment_engine(
                 root,
                 executor=executor,
+                output_downloader=output_downloader,
             )
             if parsed.command == "run":
                 if parsed.rerun_variant_id is not None:

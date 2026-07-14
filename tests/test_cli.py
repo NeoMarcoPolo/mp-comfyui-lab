@@ -114,7 +114,7 @@ def test_unknown_command_preserves_argparse_diagnostic(capsys):
     assert document["error"]["message"] == (
         "argument command: invalid choice: 'unknown' "
         "(choose from version, search, inspect, similar, plan, run, resume, "
-        "status, reconcile, compare, finalists, select, export)"
+        "status, reconcile, compare, finalists, select, export, schemas)"
     )
 
 
@@ -554,6 +554,26 @@ def test_default_cli_downloader_translates_runninghub_transport_error(
     assert type(raised.value).__name__ == "TransientOperationError"
     assert "durable-secret" not in str(raised.value)
     assert "signed-secret" not in str(raised.value)
+
+
+def test_experiment_engine_retains_falsey_injected_output_downloader(
+    tmp_path: Path,
+) -> None:
+    class FalseyDownloader:
+        def __bool__(self) -> bool:
+            return False
+
+        def __call__(self, _url: str, target: Path) -> Path:
+            return target
+
+    downloader = FalseyDownloader()
+
+    engine = app._make_experiment_engine(
+        tmp_path,
+        output_downloader=downloader,
+    )
+
+    assert engine._downloader is downloader
 
 
 @pytest.mark.parametrize(
