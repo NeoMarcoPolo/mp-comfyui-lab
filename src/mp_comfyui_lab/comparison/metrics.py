@@ -15,7 +15,7 @@ from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.media import (
-    MAX_IMAGE_PIXELS,
+    COMPARISON_MEDIA_POLICY,
     MediaFamily,
     inspect_media_file,
     media_family,
@@ -331,7 +331,7 @@ def _media_facts(
     inspection = inspect_media_file(
         path,
         record.media_type,
-        max_image_pixels=MAX_IMAGE_PIXELS,
+        policy=COMPARISON_MEDIA_POLICY,
     )
     detected = {
         "detected_mime_type": inspection.detected_mime_type,

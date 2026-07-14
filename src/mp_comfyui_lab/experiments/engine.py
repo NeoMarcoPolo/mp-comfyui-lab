@@ -26,7 +26,11 @@ from mp_comfyui_lab.executors.base import (
 )
 from mp_comfyui_lab.graph.hashing import capability_hash
 from mp_comfyui_lab.json_types import thaw_json
-from mp_comfyui_lab.media import MEDIA_EXTENSIONS, verify_media_file
+from mp_comfyui_lab.media import (
+    ENGINE_MEDIA_POLICY,
+    MEDIA_EXTENSIONS,
+    verify_media_file,
+)
 from mp_comfyui_lab.security import SafetyError
 from mp_comfyui_lab.security import safe_filename
 from mp_comfyui_lab.security import sanitize_for_persistence
@@ -1769,4 +1773,5 @@ class ExperimentEngine:
             path,
             media_type,
             max_bytes=self._max_output_bytes,
+            policy=ENGINE_MEDIA_POLICY,
         )

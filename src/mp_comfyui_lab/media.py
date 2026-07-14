@@ -25,9 +25,6 @@ MediaErrorCode = Literal[
     "invalid_archive",
 ]
 
-# Keep decoded comparison images and engine outputs below Pillow's default
-# bomb threshold while still allowing large production outputs.
-MAX_IMAGE_PIXELS = 40_000_000
 PHASH_ALPHA_MATTE = (255, 255, 255)
 TRANSPARENCY_CHECKER_LIGHT = (242, 244, 246)
 TRANSPARENCY_CHECKER_DARK = (202, 208, 212)
@@ -44,6 +41,21 @@ MEDIA_EXTENSIONS = {
     "audio/ogg": "ogg",
     "application/zip": "zip",
 }
+
+
+@dataclass(frozen=True)
+class MediaVerificationPolicy:
+    max_image_pixels: int
+
+    def __post_init__(self) -> None:
+        if self.max_image_pixels <= 0:
+            raise ValueError("max_image_pixels must be positive")
+
+
+# Pillow 10-12 use 89,478,485 pixels as the default warning threshold. The
+# engine historically accepted images through that boundary.
+ENGINE_MEDIA_POLICY = MediaVerificationPolicy(max_image_pixels=89_478_485)
+COMPARISON_MEDIA_POLICY = MediaVerificationPolicy(max_image_pixels=40_000_000)
 
 
 @dataclass(frozen=True)
@@ -85,8 +97,25 @@ def inspect_media_file(
     path: Path,
     declared_mime_type: str,
     *,
+    policy: MediaVerificationPolicy,
     max_bytes: int | None = None,
-    max_image_pixels: int = MAX_IMAGE_PIXELS,
+) -> MediaInspection:
+    return _inspect_media_file(
+        path,
+        declared_mime_type,
+        policy=policy,
+        max_bytes=max_bytes,
+        retain_image=True,
+    )
+
+
+def _inspect_media_file(
+    path: Path,
+    declared_mime_type: str,
+    *,
+    policy: MediaVerificationPolicy,
+    max_bytes: int | None,
+    retain_image: bool,
 ) -> MediaInspection:
     declared_family = media_family(declared_mime_type)
     try:
@@ -163,11 +192,15 @@ def inspect_media_file(
         )
     if declared_family == "image":
         try:
-            image, source_mode = load_normalized_image(
-                path,
-                alpha_background="white",
-                max_image_pixels=max_image_pixels,
-            )
+            if retain_image:
+                image, source_mode = load_normalized_image(
+                    path,
+                    alpha_background="white",
+                    policy=policy,
+                )
+            else:
+                image = None
+                source_mode = _verify_image_file(path, policy=policy)
         except _ImagePixelLimitError:
             return _inspection_error(
                 declared_mime_type,
@@ -235,13 +268,14 @@ def verify_media_file(
     declared_mime_type: str,
     *,
     max_bytes: int,
-    max_image_pixels: int = MAX_IMAGE_PIXELS,
+    policy: MediaVerificationPolicy,
 ) -> None:
-    inspection = inspect_media_file(
+    inspection = _inspect_media_file(
         path,
         declared_mime_type,
+        policy=policy,
         max_bytes=max_bytes,
-        max_image_pixels=max_image_pixels,
+        retain_image=False,
     )
     if inspection.image is not None:
         inspection.image.close()
@@ -298,14 +332,12 @@ def load_normalized_image(
     path: Path,
     *,
     alpha_background: AlphaBackground,
-    max_image_pixels: int = MAX_IMAGE_PIXELS,
+    policy: MediaVerificationPolicy,
 ) -> tuple[Image.Image, str]:
     with warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
         with Image.open(path) as source:
-            width, height = source.size
-            if width <= 0 or height <= 0 or width * height > max_image_pixels:
-                raise _ImagePixelLimitError
+            _validate_image_size(source.size, policy)
             source.load()
             source_mode = source.mode
             oriented = ImageOps.exif_transpose(source)
@@ -317,6 +349,29 @@ def load_normalized_image(
             else:
                 normalized = oriented.convert("RGB")
     return normalized, source_mode
+
+
+def _verify_image_file(
+    path: Path,
+    *,
+    policy: MediaVerificationPolicy,
+) -> str:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        with Image.open(path) as source:
+            _validate_image_size(source.size, policy)
+            source_mode = source.mode
+            source.verify()
+    return source_mode
+
+
+def _validate_image_size(
+    size: tuple[int, int],
+    policy: MediaVerificationPolicy,
+) -> None:
+    width, height = size
+    if width <= 0 or height <= 0 or width * height > policy.max_image_pixels:
+        raise _ImagePixelLimitError
 
 
 def _alpha_background(

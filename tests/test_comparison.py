@@ -35,6 +35,7 @@ from mp_comfyui_lab.experiments.models import ExperimentPlan, PlannedVariant
 from mp_comfyui_lab.experiments.planning import recompute_exact_run_hash
 from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.graph.hashing import capability_hash
+from mp_comfyui_lab.media import MediaVerificationPolicy
 from mp_comfyui_lab.security import SafetyError
 from tests.helpers import valid_media_bytes
 
@@ -441,8 +442,8 @@ def test_invalid_images_are_objective_nonavailable_facts(
         outputs.append(_output(relative_path, content, ordinal=ordinal))
     monkeypatch.setattr(
         comparison_metrics,
-        "MAX_IMAGE_PIXELS",
-        1,
+        "COMPARISON_MEDIA_POLICY",
+        MediaVerificationPolicy(max_image_pixels=1),
         raising=False,
     )
 
@@ -465,6 +466,27 @@ def test_invalid_images_are_objective_nonavailable_facts(
     assert "Status: SUCCESS / invalid" in html
     assert "Artifact invalid" in html
     assert "<img" not in html
+
+
+def test_comparison_rejects_50mp_image_above_decoding_policy(
+    tmp_path: Path,
+) -> None:
+    experiment_root = tmp_path / "experiment-compare"
+    image_path = experiment_root / "outputs/large/run-large/output.png"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("1", (10_000, 5_000)).save(image_path, format="PNG")
+    content = image_path.read_bytes()
+    relative_path = image_path.relative_to(experiment_root).as_posix()
+
+    report = compare_outputs(
+        (_run("large", (_output(relative_path, content),)),),
+        experiment_root,
+    )
+
+    facts = report.variants["large"].outputs[0]
+    assert facts.availability == "invalid"
+    assert facts.media_error.code == "image_pixel_limit_exceeded"
+    assert facts.artifact_relative_path is None
 
 
 def test_comparison_verifies_declared_and_detected_media_types(

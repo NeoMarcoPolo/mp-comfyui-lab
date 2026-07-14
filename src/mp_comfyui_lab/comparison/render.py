@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict
 
 from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.media import (
-    MAX_IMAGE_PIXELS,
+    COMPARISON_MEDIA_POLICY,
     load_normalized_image,
 )
 from mp_comfyui_lab.security import SafetyError
@@ -770,7 +770,7 @@ def _draw_contact_tile(
             image, _ = load_normalized_image(
                 source_path,
                 alpha_background="checkerboard",
-                max_image_pixels=MAX_IMAGE_PIXELS,
+                policy=COMPARISON_MEDIA_POLICY,
             )
             try:
                 image.thumbnail(_THUMBNAIL_SIZE, Image.Resampling.LANCZOS)

@@ -2476,6 +2476,71 @@ def test_html_declared_as_png_is_incomplete_without_publication(
     )
 
 
+def test_engine_accepts_50mp_image_within_pillow_policy(tmp_path: Path) -> None:
+    config, plan = _persist_plan(tmp_path)
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output.png",
+        media_type="image/png",
+        provider_order=0,
+    )
+    executor = FakeExecutor.success(outputs=(output,))
+
+    def downloader(_url: str, target: Path) -> Path:
+        Image.new("1", (10_000, 5_000)).save(target, format="PNG")
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.SUCCESS
+    assert len(record.outputs) == 1
+
+
+def test_engine_rejects_image_above_pillow_policy(tmp_path: Path) -> None:
+    config, plan = _persist_plan(tmp_path)
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output.png",
+        media_type="image/png",
+        provider_order=0,
+    )
+    executor = FakeExecutor.success(outputs=(output,))
+
+    def downloader(_url: str, target: Path) -> Path:
+        Image.new("1", (10_000, 9_000)).save(target, format="PNG")
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert thaw_json(record.error)["kind"] == "malformed_output"
+    assert record.outputs == ()
+
+
 @pytest.mark.parametrize(
     "media_type",
     [
