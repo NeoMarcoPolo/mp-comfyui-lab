@@ -96,6 +96,7 @@ _UNCLASSIFIED_DIMENSION = "unclassified"
 _LORA_DIMENSIONS = frozenset(
     {DimensionName.LORA_STACK, DimensionName.LORA_STRENGTH}
 )
+_PLANNER_LORA_CLASS = "LoraLoader"
 _LORA_RESIDUAL_CLASS = "MPUnclassifiedLoraResidue"
 _LORA_STRENGTH_FIELDS = frozenset({"strengthclip", "strengthmodel"})
 _TOPOLOGY_ROLES = {
@@ -703,7 +704,7 @@ def classify_graph_dimension_changes(
         or after_residual is None
         or (
             bool(dimensions & _LORA_DIMENSIONS)
-            and _shared_lora_class_type_changed(before, after)
+            and _has_unclassified_lora_class_delta(before, after)
         )
     )
     if not unexplained:
@@ -780,7 +781,7 @@ def _mask_recognized_graph_dimensions(
     return graph
 
 
-def _shared_lora_class_type_changed(
+def _has_unclassified_lora_class_delta(
     before: NormalizedGraph,
     after: NormalizedGraph,
 ) -> bool:
@@ -792,9 +793,18 @@ def _shared_lora_class_type_changed(
     after_lora_ids = {
         binding.node_id for binding in after.bindings(SemanticRole.LORA)
     }
-    return any(
+    if any(
         before_nodes[node_id].class_type != after_nodes[node_id].class_type
         for node_id in before_lora_ids & after_lora_ids
+    ):
+        return True
+    return any(
+        nodes[node_id].class_type != _PLANNER_LORA_CLASS
+        for nodes, node_ids in (
+            (before_nodes, before_lora_ids - after_lora_ids),
+            (after_nodes, after_lora_ids - before_lora_ids),
+        )
+        for node_id in node_ids
     )
 
 

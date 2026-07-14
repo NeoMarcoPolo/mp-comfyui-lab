@@ -4194,7 +4194,12 @@ def test_correction_outside_approved_dimensions_changes_hash_and_requires_reappr
 
 @pytest.mark.parametrize(
     "delta_kind",
-    ["unapproved-sampler", "unclassified-node", "unclassified-lora-input"],
+    [
+        "unapproved-sampler",
+        "unclassified-node",
+        "unclassified-lora-input",
+        "unclassified-added-lora-class",
+    ],
 )
 def test_actual_unapproved_correction_dimension_requires_reapproval(
     tmp_path: Path,
@@ -4202,7 +4207,8 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
 ) -> None:
     approved_dimension = (
         DimensionName.LORA_STACK
-        if delta_kind == "unclassified-lora-input"
+        if delta_kind
+        in {"unclassified-lora-input", "unclassified-added-lora-class"}
         else DimensionName.CHECKPOINT
     )
     config, original_plan = _persist_wave_plan(
@@ -4221,6 +4227,7 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
         checkpoint: str = "base.safetensors",
         custom_node: bool = False,
         lora: str | None = None,
+        lora_class: str = "LoraLoader",
         lora_unapproved_mode: bool = False,
     ) -> dict[str, object]:
         result: dict[str, object] = {
@@ -4232,7 +4239,7 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
         model_node_id = "1"
         if lora is not None:
             result["2"] = {
-                "class_type": "LoraLoader",
+                "class_type": lora_class,
                 "inputs": {
                     "model": ["1", 0],
                     "clip": ["1", 1],
@@ -4311,11 +4318,17 @@ def test_actual_unapproved_correction_dimension_requires_reapproval(
             checkpoint="revised.safetensors",
             custom_node=True,
         )
-    else:
+    elif delta_kind == "unclassified-lora-input":
         candidate_graph = graph(
             "euler",
             lora="new.safetensors",
             lora_unapproved_mode=True,
+        )
+    else:
+        candidate_graph = graph(
+            "euler",
+            lora="new.safetensors",
+            lora_class="LoraLoaderAdvanced",
         )
     candidate_draft = PlannedVariant.model_validate(
         {

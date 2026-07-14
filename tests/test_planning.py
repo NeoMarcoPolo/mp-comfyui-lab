@@ -222,6 +222,40 @@ def test_graph_dimension_changes_preserve_unknown_inputs_on_added_or_removed_lor
     )
 
 
+@pytest.mark.parametrize(
+    ("direction", "class_type", "expected"),
+    [
+        ("added", "LoraLoader", ("lora_stack",)),
+        ("removed", "LoraLoader", ("lora_stack",)),
+        (
+            "added",
+            "LoraLoaderAdvanced",
+            ("lora_stack", "unclassified"),
+        ),
+        (
+            "removed",
+            "LoraLoaderAdvanced",
+            ("lora_stack", "unclassified"),
+        ),
+    ],
+)
+def test_graph_dimension_changes_validate_added_or_removed_lora_class(
+    direction: str,
+    class_type: str,
+    expected: tuple[str, ...],
+) -> None:
+    without_lora = _lora_stack_graph(())
+    with_lora = _lora_stack_graph((("new.safetensors", 1.0, 1.0),))
+    with_lora["20"]["class_type"] = class_type
+    before, after = (
+        (without_lora, with_lora)
+        if direction == "added"
+        else (with_lora, without_lora)
+    )
+
+    assert classify_graph_dimension_changes(before, after) == expected
+
+
 def test_graph_dimension_changes_mark_disconnected_custom_node_unclassified() -> None:
     before = _graph()
     after = json.loads(json.dumps(before))

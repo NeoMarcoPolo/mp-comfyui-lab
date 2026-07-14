@@ -578,9 +578,14 @@ def test_checkpoint_and_lora_correction_uses_actual_changed_dimensions() -> None
     assert decision.variants == (candidate,)
 
 
-def test_lora_correction_with_unknown_same_node_input_is_rejected() -> None:
+@pytest.mark.parametrize("residue_kind", ["unknown-input", "added-class"])
+def test_lora_correction_with_unclassified_residue_is_rejected(
+    residue_kind: str,
+) -> None:
     signature = "provider-failed:unapproved lora mode"
-    failed_graph = _checkpoint_sampler_lora_graph(lora="old.safetensors")
+    failed_graph = _checkpoint_sampler_lora_graph(
+        lora=("old.safetensors" if residue_kind == "unknown-input" else None)
+    )
     failed = _variant(
         "failed",
         capability_hash=graph_capability_hash(failed_graph),
@@ -589,7 +594,10 @@ def test_lora_correction_with_unknown_same_node_input_is_rejected() -> None:
         hypothesis=DimensionName.LORA_STACK,
     )
     candidate_graph = _checkpoint_sampler_lora_graph(lora="new.safetensors")
-    candidate_graph["2"]["inputs"]["unapproved_mode"] = "experimental"
+    if residue_kind == "unknown-input":
+        candidate_graph["2"]["inputs"]["unapproved_mode"] = "experimental"
+    else:
+        candidate_graph["2"]["class_type"] = "LoraLoaderAdvanced"
     candidate = _variant(
         "candidate",
         capability_hash=graph_capability_hash(candidate_graph),
