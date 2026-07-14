@@ -38,7 +38,6 @@ EXPERIMENT_DIRECTORIES = (
     "variants",
     "runs",
     "outputs",
-    "comparisons",
     "export",
 )
 

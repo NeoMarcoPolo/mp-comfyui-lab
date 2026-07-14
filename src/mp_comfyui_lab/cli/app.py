@@ -1,4 +1,5 @@
 import argparse
+import json
 import yaml
 from ipaddress import ip_address
 from pathlib import Path
@@ -23,6 +24,7 @@ from mp_comfyui_lab.comparison.judgments import (
 from mp_comfyui_lab.comparison.metrics import compare_outputs
 from mp_comfyui_lab.comparison.paths import path_component_is_link_or_junction
 from mp_comfyui_lab.comparison.render import (
+    ComparisonArtifacts,
     comparison_facts_sha256,
     render_comparison,
 )
@@ -61,6 +63,8 @@ from mp_comfyui_lab.experiments.models import (
     Candidate,
     DimensionName,
     ExperimentBrief,
+    ExperimentPlan,
+    PlannedVariant,
     PlanningSource,
     RunRecord,
     RunState,
@@ -71,6 +75,7 @@ from mp_comfyui_lab.experiments.planning import (
     build_plan,
     evidence_graph_for_bundle,
     load_experiment_brief,
+    recompute_exact_run_hash,
 )
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
@@ -654,43 +659,125 @@ def _load_comparison_runs(
     if not runs_root.is_dir():
         return ()
     records = []
+    plans: dict[str, ExperimentPlan] = {}
     for path in sorted(runs_root.iterdir(), key=lambda item: item.name):
         if path.suffix.casefold() != ".json":
             continue
         if path.is_symlink() or not path.is_file():
             raise SafetyError("run artifact must be a regular local JSON file")
+        record = RunRecord.model_validate_json(
+            store.read_text(
+                experiment_id,
+                Path("runs", path.name),
+            ),
+            strict=True,
+        )
         records.append(
-            RunRecord.model_validate_json(
-                store.read_text(
-                    experiment_id,
-                    Path("runs", path.name),
-                ),
-                strict=True,
+            _validated_comparison_run_evidence(
+                store,
+                experiment_id,
+                record,
+                plans,
             )
         )
     return tuple(records)
 
 
-def _comparison_artifacts_payload(include_judgments: bool) -> list[dict[str, str]]:
-    artifacts = [
-        {"kind": "comparison_facts", "path": "comparisons/facts.json"},
-        {
-            "kind": "duplicate_groups",
-            "path": "comparisons/duplicate-groups.json",
-        },
-        {
-            "kind": "contact_sheet",
-            "path": "comparisons/contact-sheet.jpg",
-        },
-        {"kind": "comparison_gallery", "path": "comparisons/index.html"},
-        {
-            "kind": "judgment_input",
-            "path": "comparisons/judgment-input.json",
-        },
-    ]
-    if include_judgments:
+def _validated_comparison_run_evidence(
+    store: ExperimentStore,
+    experiment_id: str,
+    record: RunRecord,
+    plans: dict[str, ExperimentPlan],
+) -> RunRecord:
+    if record.plan_hash is None:
+        return record
+    plan = plans.get(record.plan_hash)
+    if plan is None:
+        try:
+            plan = ExperimentPlan.model_validate_json(
+                store.read_text(
+                    experiment_id,
+                    f"plans/{record.plan_hash}.json",
+                ),
+                strict=True,
+            )
+        except (FileNotFoundError, OSError, ValueError, ValidationError) as error:
+            raise SafetyError(
+                "durable run references a missing or invalid approved plan"
+            ) from error
+        if plan.plan_hash != record.plan_hash:
+            raise SafetyError(
+                "durable run plan hash does not match its artifact filename"
+            )
+        for variant in plan.variants:
+            try:
+                if recompute_exact_run_hash(variant) != variant.exact_run_hash:
+                    raise ValueError("exact run hash mismatch")
+                if capability_hash(
+                    thaw_json(variant.materialized_graph)
+                ) != variant.capability_hash:
+                    raise ValueError("capability hash mismatch")
+            except (KeyError, TypeError, ValueError) as error:
+                raise SafetyError(
+                    "approved plan contains an invalid variant fingerprint"
+                ) from error
+        plans[record.plan_hash] = plan
+    matches = tuple(
+        variant
+        for variant in plan.variants
+        if variant.variant_id == record.variant_id
+        and variant.exact_run_hash == record.exact_run_hash
+    )
+    if len(matches) != 1:
+        raise SafetyError(
+            "durable run identity conflicts with its referenced approved plan"
+        )
+    variant = matches[0]
+    if record.variant_snapshot is not None:
+        try:
+            snapshot = PlannedVariant.model_validate_json(
+                json.dumps(
+                    thaw_json(record.variant_snapshot),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                strict=True,
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise SafetyError("durable run variant snapshot is invalid") from error
+        if snapshot != variant:
+            raise SafetyError(
+                "durable run variant snapshot conflicts with its approved plan"
+            )
+        if (
+            record.expected_output_count != variant.expected_output_count
+            or record.expected_output_node_ids != variant.output_node_ids
+            or record.expected_media_types != variant.expected_media_types
+        ):
+            raise SafetyError(
+                "durable run output contract conflicts with its approved variant"
+            )
+    return record.model_copy(
+        update={"variant_snapshot": variant.model_dump(mode="json")}
+    )
+
+
+def _comparison_artifacts_payload(
+    rendered: ComparisonArtifacts,
+) -> list[dict[str, str]]:
+    paths = (
+        ("comparison_facts", rendered.facts),
+        ("duplicate_groups", rendered.duplicate_groups),
+        ("contact_sheet", rendered.contact_sheet),
+        ("comparison_gallery", rendered.gallery),
+        ("judgment_input", rendered.judgment_input),
+    )
+    artifacts = [{"kind": kind, "path": str(path)} for kind, path in paths]
+    if rendered.judgments is not None:
         artifacts.append(
-            {"kind": "judgments", "path": "comparisons/judgments.json"}
+            {"kind": "judgments", "path": str(rendered.judgments)}
         )
     return artifacts
 
@@ -709,7 +796,6 @@ def _compare_command(
         experiment_id=parsed.experiment_id,
     )
     judgment_bytes: bytes | None = None
-    judgment_path = None
     if parsed.judgments is not None:
         source = Path(parsed.judgments)
         if not source.is_absolute():
@@ -720,31 +806,28 @@ def _compare_command(
             expected_facts_sha256=comparison_facts_sha256(report),
         )
         judgment_bytes = judgment_document_bytes(submission)
-        judgment_path = "comparisons/judgments.json"
-        destination = experiment_root / judgment_path
-        if destination.exists() and store.read_bytes(
-            parsed.experiment_id,
-            judgment_path,
-        ) != judgment_bytes:
-            raise SafetyError(
-                "comparison judgments already exist with different content"
-            )
-    render_comparison(report, experiment_root)
-    if judgment_bytes is not None and judgment_path is not None:
-        store.write_bytes_new(
-            parsed.experiment_id,
-            judgment_path,
-            judgment_bytes,
-            reuse_matching=True,
-        )
-    artifacts = _comparison_artifacts_payload(judgment_bytes is not None)
+    rendered = render_comparison(
+        report,
+        experiment_root,
+        judgment_document=judgment_bytes,
+    )
+    artifacts = _comparison_artifacts_payload(rendered)
     return (
         {
             "experiment_id": parsed.experiment_id,
+            "experiment_root": str(rendered.experiment_root),
             "variant_ids": sorted(report.variants),
             "output_ids": list(report.output_ids),
-            "judgment_input": "comparisons/judgment-input.json",
-            "judgments": judgment_path,
+            "facts": str(rendered.facts),
+            "duplicate_groups": str(rendered.duplicate_groups),
+            "contact_sheet": str(rendered.contact_sheet),
+            "gallery": str(rendered.gallery),
+            "judgment_input": str(rendered.judgment_input),
+            "judgments": (
+                None
+                if rendered.judgments is None
+                else str(rendered.judgments)
+            ),
         },
         artifacts,
     )

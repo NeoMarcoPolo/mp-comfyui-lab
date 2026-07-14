@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from mp_comfyui_lab.config import LabConfig, safe_load_yaml
+from mp_comfyui_lab.discovery.models import ContentClassification
 from mp_comfyui_lab.evidence.models import EvidenceGraph, EvidenceSource, EvidenceSourceKind
 from mp_comfyui_lab.graph.hashing import capability_hash
 from mp_comfyui_lab.graph.models import SemanticRole
@@ -561,6 +562,7 @@ def _variant(
     patch: SemanticPatch,
     hypothesis: DimensionName | None,
     candidate: Candidate | None,
+    content_classification: ContentClassification,
     fixture_fingerprints: tuple[FixtureFingerprint, ...],
     expected_output_count: int,
     output_node_ids: tuple[str, ...],
@@ -609,6 +611,7 @@ def _variant(
         materialized_graph=graph,
         hypothesis=hypothesis,
         evidence_ids=() if candidate is None else candidate.evidence_ids,
+        content_classification=content_classification,
         confidence=None if candidate is None else candidate.confidence,
         warnings=tuple(sorted(set(warnings))),
         exact_run_hash=exact_run_hash,
@@ -644,6 +647,7 @@ def build_plan(
     )
     common_patch, prompt_fanout_node_id = _common_fixture_patch(brief, source)
     fixture_fingerprints = _fixture_fingerprints(brief, config)
+    evidence_graph = evidence_graph_for_bundle(source_bundle)
     variants = [
         _variant(
             brief=brief,
@@ -652,6 +656,10 @@ def build_plan(
             patch=common_patch,
             hypothesis=None,
             candidate=None,
+            content_classification=_content_classification(
+                evidence_graph,
+                (source.workflow_id,),
+            ),
             fixture_fingerprints=fixture_fingerprints,
             expected_output_count=0,
             output_node_ids=(),
@@ -682,6 +690,10 @@ def build_plan(
                 patch=_combine_patches(common_patch, patch),
                 hypothesis=candidate.hypothesis,
                 candidate=candidate,
+                content_classification=_content_classification(
+                    evidence_graph,
+                    tuple(sorted({source.workflow_id, *candidate.evidence_ids})),
+                ),
                 fixture_fingerprints=fixture_fingerprints,
                 expected_output_count=0,
                 output_node_ids=(),
@@ -714,3 +726,24 @@ def build_plan(
         warnings=tuple(sorted(set(warnings))),
         approval_payload=plan_payload,
     )
+
+
+def _content_classification(
+    evidence_graph: EvidenceGraph,
+    source_ids: tuple[str, ...],
+) -> ContentClassification:
+    classifications = {
+        observation.source_id: observation.content_classification
+        for observation in evidence_graph.observations
+    }
+    observed = tuple(
+        classifications.get(source_id, ContentClassification.UNKNOWN)
+        for source_id in source_ids
+    )
+    if ContentClassification.NSFW in observed:
+        return ContentClassification.NSFW
+    if observed and all(
+        item is ContentClassification.SFW for item in observed
+    ):
+        return ContentClassification.SFW
+    return ContentClassification.UNKNOWN

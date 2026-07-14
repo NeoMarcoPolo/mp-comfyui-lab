@@ -29,7 +29,6 @@ EXPECTED_LAYOUT = {
     "variants",
     "runs",
     "outputs",
-    "comparisons",
     "export",
 }
 NORMALIZED_WINDOWS_DEVICE_NAMES = (

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from mp_comfyui_lab.config import LabConfig
+from mp_comfyui_lab.discovery.models import ContentClassification
 from mp_comfyui_lab.evidence.models import (
     ConfidenceLabel,
     EvidenceGraph,
@@ -325,7 +327,12 @@ def _source(graph: dict | None = None, *, workflow_id: str = "123") -> PlanningS
     )
 
 
-def _bundle(*, candidates: tuple[Candidate, ...] = (), graph: dict | None = None) -> SourceBundle:
+def _bundle(
+    *,
+    candidates: tuple[Candidate, ...] = (),
+    graph: dict | None = None,
+    content_classification: ContentClassification = ContentClassification.UNKNOWN,
+) -> SourceBundle:
     source = _source(graph)
     return SourceBundle(
         sources=(source,),
@@ -338,7 +345,10 @@ def _bundle(*, candidates: tuple[Candidate, ...] = (), graph: dict | None = None
                 source_hash=source.source_hash,
                 capability_hash=source.capability_hash,
             ),),
-            observations=(EvidenceObservation(source_id=source.workflow_id),),
+            observations=(EvidenceObservation(
+                source_id=source.workflow_id,
+                content_classification=content_classification,
+            ),),
         ),
     )
 
@@ -408,6 +418,57 @@ def test_auto_three_prompt_lines_resolve_to_three_outputs(tmp_path: Path) -> Non
     plan = build_plan(_brief(), _bundle(), config=_config(tmp_path))
     assert plan.variants[0].expected_output_count == 3
     assert plan.variants[0].expected_media_types == ("image/png",)
+
+
+@pytest.mark.parametrize(
+    "classification",
+    [
+        ContentClassification.SFW,
+        ContentClassification.NSFW,
+        ContentClassification.UNKNOWN,
+    ],
+)
+def test_plan_persists_content_classification_from_immutable_evidence(
+    tmp_path: Path,
+    classification: ContentClassification,
+) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+
+    plan = build_plan(
+        _brief(),
+        _bundle(content_classification=classification),
+        config=_config(tmp_path),
+    )
+
+    assert plan.variants[0].content_classification is classification
+    assert plan.approval_payload["variants"][0]["content_classification"] == (
+        classification.value
+    )
+
+
+def test_legacy_plan_without_classification_loads_as_unknown(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    plan = build_plan(_brief(), _bundle(), config=_config(tmp_path))
+    legacy = plan.model_dump(mode="json")
+    for variant in legacy["variants"]:
+        variant.pop("content_classification")
+    for variant in legacy["approval_payload"]["variants"]:
+        variant.pop("content_classification")
+    legacy["plan_hash"] = hashlib.sha256(
+        json.dumps(
+            legacy["approval_payload"],
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    loaded = ExperimentPlan.model_validate(legacy)
+
+    assert loaded.variants[0].content_classification is ContentClassification.UNKNOWN
 
 
 def test_unresolved_auto_cardinality_requires_explicit_integer(tmp_path: Path) -> None:

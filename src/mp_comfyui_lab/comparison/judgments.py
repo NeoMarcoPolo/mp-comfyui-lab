@@ -25,7 +25,7 @@ MAX_JUDGMENT_BYTES = 1_048_576
 Score = Literal[1, 2, 3, 4, 5]
 NonBlankReason = Annotated[
     str,
-    StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=4096),
+    StringConstraints(strict=True, min_length=1, max_length=4096),
 ]
 
 
@@ -45,7 +45,7 @@ class _JudgmentModel(BaseModel):
 class VariantJudgment(_JudgmentModel):
     variant_id: Annotated[
         str,
-        StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=256),
+        StringConstraints(strict=True, min_length=1, max_length=256),
     ]
     identity_fidelity: Score
     prompt_adherence: Score
@@ -55,10 +55,10 @@ class VariantJudgment(_JudgmentModel):
     referenced_output_ids: tuple[
         Annotated[
             str,
-            StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=512),
+            StringConstraints(strict=True, min_length=1, max_length=512),
         ],
         ...,
-    ] = Field(min_length=1, max_length=512)
+    ] = Field(min_length=0, max_length=512)
 
     @field_validator(
         "identity_fidelity",
@@ -80,6 +80,13 @@ class VariantJudgment(_JudgmentModel):
             raise ValueError("field must be a JSON array")
         return tuple(value)
 
+    @field_validator("reasons")
+    @classmethod
+    def nonblank_reasons(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not value.strip() for value in values):
+            raise ValueError("reasons must not contain blank strings")
+        return values
+
     @field_validator("referenced_output_ids")
     @classmethod
     def unique_output_references(cls, values: tuple[str, ...]) -> tuple[str, ...]:
@@ -92,13 +99,13 @@ class JudgmentSubmission(_JudgmentModel):
     schema_version: Literal["1"]
     experiment_id: Annotated[
         str,
-        StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=96),
+        StringConstraints(strict=True, min_length=1, max_length=96),
     ]
     facts_sha256: Annotated[
         str,
         StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
     ]
-    judgments: tuple[VariantJudgment, ...] = Field(min_length=1, max_length=512)
+    judgments: tuple[VariantJudgment, ...] = Field(min_length=0)
 
     @field_validator("judgments", mode="before")
     @classmethod
@@ -158,6 +165,12 @@ def load_and_validate_judgments(
                 raise JudgmentValidationError(
                     "referenced output_id does not belong to the judged variant"
                 )
+    missing_variants = variant_ids - seen_variants
+    if missing_variants:
+        raise JudgmentValidationError(
+            "judgments must contain exactly one entry for every comparison "
+            f"variant; missing {sorted(missing_variants)}"
+        )
     return submission.model_copy(
         update={
             "judgments": tuple(

@@ -21,6 +21,7 @@ from pydantic import (
     model_validator,
 )
 
+from mp_comfyui_lab.discovery.models import ContentClassification
 from mp_comfyui_lab.discovery.urls import UnsupportedSourceError, parse_runninghub_url
 from mp_comfyui_lab.graph.models import FrozenJsonValue, NormalizedGraph
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
@@ -1004,6 +1005,7 @@ class PlannedVariant(_FrozenModel):
     materialized_graph: FrozenJsonObject
     hypothesis: DimensionName | None = None
     evidence_ids: tuple[str, ...] = Field(default=(), max_length=128)
+    content_classification: ContentClassification = ContentClassification.UNKNOWN
     confidence: PlanningConfidence | None = None
     warnings: tuple[str, ...] = Field(default=(), max_length=128)
     exact_run_hash: Sha256
@@ -1055,7 +1057,21 @@ class ExperimentPlan(_FrozenModel):
             "warnings": list(self.warnings),
         }
         for field_name, value in durable.items():
-            if payload.get(field_name) != value:
+            approval_value = payload.get(field_name)
+            if field_name == "variants" and isinstance(approval_value, list):
+                approval_value = [
+                    {
+                        **item,
+                        "content_classification": item.get(
+                            "content_classification",
+                            ContentClassification.UNKNOWN.value,
+                        ),
+                    }
+                    if isinstance(item, dict)
+                    else item
+                    for item in approval_value
+                ]
+            if approval_value != value:
                 raise ValueError(f"{field_name} does not match durable approval_payload")
         return self
 

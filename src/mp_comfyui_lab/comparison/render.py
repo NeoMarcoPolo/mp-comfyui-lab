@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 from io import BytesIO
 import hashlib
 import html
 from importlib import resources
 import json
 import math
+import os
 from pathlib import Path
+import shutil
 from string import Template
-from typing import Any
+import tempfile
+from typing import Any, Callable
 from urllib.parse import quote
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -18,7 +23,11 @@ from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.security import SafetyError
 
 from .metrics import ComparisonReport, MediaFacts, VariantComparison
-from .paths import hash_stored_artifact, resolve_stored_artifact
+from .paths import (
+    hash_stored_artifact,
+    path_component_is_link_or_junction,
+    resolve_stored_artifact,
+)
 
 
 _COMPARISON_DIRECTORY = Path("comparisons")
@@ -26,6 +35,15 @@ _TILE_WIDTH = 420
 _TILE_HEIGHT = 360
 _THUMBNAIL_SIZE = (380, 205)
 _CONTACT_COLUMNS = 3
+_OBJECTIVE_ARTIFACT_NAMES = (
+    "facts.json",
+    "duplicate-groups.json",
+    "contact-sheet.jpg",
+    "index.html",
+    "judgment-input.json",
+)
+_JUDGMENTS_NAME = "judgments.json"
+FaultInjector = Callable[[str], None]
 
 
 class ComparisonArtifactConflict(SafetyError):
@@ -35,16 +53,21 @@ class ComparisonArtifactConflict(SafetyError):
 class ComparisonArtifacts(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
+    experiment_root: Path
     facts: Path
     duplicate_groups: Path
     contact_sheet: Path
     gallery: Path
     judgment_input: Path
+    judgments: Path | None = None
 
 
 def render_comparison(
     report: ComparisonReport,
     experiment_root: str | Path,
+    *,
+    judgment_document: bytes | None = None,
+    fault_injector: FaultInjector | None = None,
 ) -> ComparisonArtifacts:
     """Render a deterministic, local-only comparison artifact set."""
     root = Path(experiment_root).resolve()
@@ -61,22 +84,29 @@ def render_comparison(
         }
     )
     artifact_values = {
-        _COMPARISON_DIRECTORY / "facts.json": facts_bytes,
-        _COMPARISON_DIRECTORY / "duplicate-groups.json": duplicate_groups_bytes,
-        _COMPARISON_DIRECTORY / "contact-sheet.jpg": _contact_sheet_bytes(
+        "facts.json": facts_bytes,
+        "duplicate-groups.json": duplicate_groups_bytes,
+        "contact-sheet.jpg": _contact_sheet_bytes(
             report,
             root,
         ),
-        _COMPARISON_DIRECTORY / "index.html": _gallery_html(
+        "index.html": _gallery_html(
             report,
             root,
         ).encode("utf-8"),
-        _COMPARISON_DIRECTORY / "judgment-input.json": _json_bytes(
+        "judgment-input.json": _json_bytes(
             _judgment_input(report, facts_bytes)
         ),
     }
-    _publish_artifacts(root, artifact_values)
+    _publish_artifact_set(
+        root,
+        artifact_values,
+        judgment_document=judgment_document,
+        fault_injector=fault_injector,
+    )
+    judgments_path = root / _COMPARISON_DIRECTORY / _JUDGMENTS_NAME
     return ComparisonArtifacts(
+        experiment_root=root,
         facts=root / _COMPARISON_DIRECTORY / "facts.json",
         duplicate_groups=(
             root / _COMPARISON_DIRECTORY / "duplicate-groups.json"
@@ -84,6 +114,7 @@ def render_comparison(
         contact_sheet=root / _COMPARISON_DIRECTORY / "contact-sheet.jpg",
         gallery=root / _COMPARISON_DIRECTORY / "index.html",
         judgment_input=root / _COMPARISON_DIRECTORY / "judgment-input.json",
+        judgments=judgments_path if judgments_path.exists() else None,
     )
 
 
@@ -104,34 +135,195 @@ def comparison_facts_sha256(report: ComparisonReport) -> str:
     return hashlib.sha256(_json_bytes(report.model_dump(mode="json"))).hexdigest()
 
 
-def _publish_artifacts(root: Path, artifacts: dict[Path, bytes]) -> None:
-    store = ExperimentStore(root.parent)
-    experiment_id = root.name
-    for relative_path, content in artifacts.items():
-        destination = root / relative_path
-        if destination.exists():
+def _publish_artifact_set(
+    root: Path,
+    objective_artifacts: dict[str, bytes],
+    *,
+    judgment_document: bytes | None,
+    fault_injector: FaultInjector | None,
+) -> None:
+    destination = root / _COMPARISON_DIRECTORY
+    if destination.exists() or destination.is_symlink():
+        _verify_existing_artifact_set(
+            destination,
+            objective_artifacts,
+            expected_judgments=judgment_document,
+            context="preexisting",
+        )
+        if judgment_document is not None and not (
+            destination / _JUDGMENTS_NAME
+        ).exists():
+            _inject(fault_injector, f"publish:{_JUDGMENTS_NAME}")
+            store = ExperimentStore(root.parent)
             try:
-                existing = store.read_bytes(experiment_id, relative_path)
-            except OSError as error:
-                raise ComparisonArtifactConflict(
-                    f"comparison artifact is not safely readable: {relative_path}"
-                ) from error
-            if existing != content:
-                raise ComparisonArtifactConflict(
-                    f"comparison render would clobber {relative_path.as_posix()}"
+                store.write_bytes_new(
+                    root.name,
+                    _COMPARISON_DIRECTORY / _JUDGMENTS_NAME,
+                    judgment_document,
+                    reuse_matching=True,
                 )
-    for relative_path, content in artifacts.items():
+            except SafetyError as error:
+                raise ComparisonArtifactConflict(
+                    "comparison judgments conflict with an existing artifact"
+                ) from error
+        return
+
+    stage = Path(
+        tempfile.mkdtemp(prefix=".comparison-stage-", dir=root)
+    )
+    staged_artifacts = dict(objective_artifacts)
+    if judgment_document is not None:
+        staged_artifacts[_JUDGMENTS_NAME] = judgment_document
+    try:
+        for name, content in staged_artifacts.items():
+            _inject(fault_injector, f"stage:{name}")
+            _write_staged_file(stage / name, content)
+        _inject(fault_injector, "fsync:staging")
+        _fsync_directory(stage)
+        _inject(fault_injector, "publish:comparisons")
         try:
-            store.write_bytes_new(
-                experiment_id,
-                relative_path,
-                content,
-                reuse_matching=True,
-            )
-        except SafetyError as error:
+            _rename_directory_new(stage, destination)
+        except (FileExistsError, FileNotFoundError, OSError) as error:
+            try:
+                _verify_existing_artifact_set(
+                    destination,
+                    objective_artifacts,
+                    expected_judgments=judgment_document,
+                    context="concurrent",
+                )
+            except ComparisonArtifactConflict as conflict:
+                raise conflict from error
+        else:
+            _fsync_directory(root)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def _verify_existing_artifact_set(
+    directory: Path,
+    objective_artifacts: dict[str, bytes],
+    *,
+    expected_judgments: bytes | None,
+    context: str,
+) -> None:
+    if path_component_is_link_or_junction(directory) or not directory.is_dir():
+        raise ComparisonArtifactConflict(
+            f"{context} comparisons path is not a safe local directory"
+        )
+    try:
+        entries = tuple(directory.iterdir())
+    except OSError as error:
+        raise ComparisonArtifactConflict(
+            f"{context} comparison artifact set is not safely readable"
+        ) from error
+    names = {entry.name for entry in entries}
+    objective_names = set(_OBJECTIVE_ARTIFACT_NAMES)
+    allowed_names = objective_names | {_JUDGMENTS_NAME}
+    if not objective_names.issubset(names):
+        raise ComparisonArtifactConflict(
+            f"{context} comparison artifact set is incomplete"
+        )
+    if not names.issubset(allowed_names):
+        raise ComparisonArtifactConflict(
+            f"{context} comparison artifact set contains unexpected files"
+        )
+    if expected_judgments is not None and _JUDGMENTS_NAME not in names:
+        if context == "concurrent":
             raise ComparisonArtifactConflict(
-                f"comparison render would clobber {relative_path.as_posix()}"
+                "concurrent comparison artifact set is incomplete"
+            )
+    expected = dict(objective_artifacts)
+    if expected_judgments is not None and _JUDGMENTS_NAME in names:
+        expected[_JUDGMENTS_NAME] = expected_judgments
+    elif _JUDGMENTS_NAME in names:
+        artifact = directory / _JUDGMENTS_NAME
+        if path_component_is_link_or_junction(artifact) or not artifact.is_file():
+            raise ComparisonArtifactConflict(
+                f"{context} comparison artifact is a link or junction: "
+                f"{_JUDGMENTS_NAME}"
+            )
+    for name, content in expected.items():
+        artifact = directory / name
+        if path_component_is_link_or_junction(artifact):
+            raise ComparisonArtifactConflict(
+                f"{context} comparison artifact is a link or junction: {name}"
+            )
+        try:
+            if not artifact.is_file() or artifact.read_bytes() != content:
+                raise ComparisonArtifactConflict(
+                    f"{context} comparison artifact would clobber {name}"
+                )
+        except OSError as error:
+            raise ComparisonArtifactConflict(
+                f"{context} comparison artifact is not safely readable: {name}"
             ) from error
+
+
+def _write_staged_file(path: Path, content: bytes) -> None:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("comparison staging write made no progress")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _rename_directory_new(source: Path, destination: Path) -> None:
+    if os.name == "nt":
+        os.rename(source, destination)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise SafetyError(
+            "atomic no-clobber comparison directory publish is unavailable"
+        )
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    at_fdcwd = -100
+    rename_noreplace = 1
+    result = renameat2(
+        at_fdcwd,
+        os.fsencode(source),
+        at_fdcwd,
+        os.fsencode(destination),
+        rename_noreplace,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), destination)
+    if error_number == errno.ENOENT:
+        raise FileNotFoundError(error_number, os.strerror(error_number), destination)
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _inject(injector: FaultInjector | None, point: str) -> None:
+    if injector is not None:
+        injector(point)
 
 
 def _judgment_input(report: ComparisonReport, facts_bytes: bytes) -> dict[str, Any]:
@@ -153,46 +345,69 @@ def _judgment_input(report: ComparisonReport, facts_bytes: bytes) -> dict[str, A
         if output.availability == "available"
         and output.artifact_relative_path is not None
     ]
+    variant_context = [
+        {
+            "variant_id": variant_id,
+            "content_classification": report.variants[
+                variant_id
+            ].content_classification.value,
+            "status": report.variants[variant_id].status,
+            "output_ids": [
+                output.output_id
+                for output in report.variants[variant_id].outputs
+                if output.availability == "available"
+                and output.artifact_relative_path is not None
+            ],
+        }
+        for variant_id in variant_ids
+    ]
     score_schema = {"type": "integer", "enum": [1, 2, 3, 4, 5]}
-    judgment_schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["variant_id", *requested_fields],
-        "properties": {
-            "variant_id": (
-                {"type": "string", "enum": variant_ids}
-                if variant_ids
-                else {"not": {}}
-            ),
-            "identity_fidelity": score_schema,
-            "prompt_adherence": score_schema,
-            "visual_quality": score_schema,
-            "creative_usefulness": score_schema,
-            "reasons": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 32,
-                "items": {"type": "string", "minLength": 1, "maxLength": 4096},
-            },
-            "referenced_output_ids": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 512,
-                "uniqueItems": True,
-                "items": (
-                    {"type": "string", "enum": output_ids}
-                    if output_ids
-                    else {"not": {}}
-                ),
-            },
-        },
+    per_variant_schemas = [
+        _variant_judgment_schema(
+            variant_id,
+            [
+                output.output_id
+                for output in report.variants[variant_id].outputs
+                if output.availability == "available"
+                and output.artifact_relative_path is not None
+            ],
+            requested_fields=requested_fields,
+            score_schema=score_schema,
+        )
+        for variant_id in variant_ids
+    ]
+    judgment_items_schema: dict[str, Any] | bool = (
+        {"oneOf": per_variant_schemas} if per_variant_schemas else False
+    )
+    judgments_schema: dict[str, Any] = {
+        "type": "array",
+        "minItems": len(variant_ids),
+        "maxItems": len(variant_ids),
+        "items": judgment_items_schema,
     }
+    if variant_ids:
+        judgments_schema["allOf"] = [
+            {
+                "type": "array",
+                "contains": {
+                    "type": "object",
+                    "required": ["variant_id"],
+                    "properties": {
+                        "variant_id": {"const": variant_id},
+                    },
+                },
+                "minContains": 1,
+                "maxContains": 1,
+            }
+            for variant_id in variant_ids
+        ]
     return {
         "schema_version": "1",
         "experiment_id": report.experiment_id,
         "facts_sha256": facts_sha256,
         "variant_ids": variant_ids,
         "output_ids": output_ids,
+        "variant_context": variant_context,
         "requested_fields": requested_fields,
         "score_enum": [1, 2, 3, 4, 5],
         "submission_schema": {
@@ -208,12 +423,50 @@ def _judgment_input(report: ComparisonReport, facts_bytes: bytes) -> dict[str, A
                 "schema_version": {"const": "1"},
                 "experiment_id": {"const": report.experiment_id},
                 "facts_sha256": {"const": facts_sha256},
-                "judgments": {
-                    "type": "array",
-                    "minItems": 1 if variant_ids else 0,
-                    "maxItems": len(variant_ids),
-                    "items": judgment_schema,
+                "judgments": judgments_schema,
+            },
+        },
+    }
+
+
+def _variant_judgment_schema(
+    variant_id: str,
+    output_ids: list[str],
+    *,
+    requested_fields: list[str],
+    score_schema: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["variant_id", *requested_fields],
+        "properties": {
+            "variant_id": {"type": "string", "const": variant_id},
+            "identity_fidelity": score_schema,
+            "prompt_adherence": score_schema,
+            "visual_quality": score_schema,
+            "creative_usefulness": score_schema,
+            "reasons": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 32,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "pattern": r"\S",
                 },
+            },
+            "referenced_output_ids": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": 512,
+                "uniqueItems": True,
+                "items": (
+                    {"type": "string", "enum": output_ids}
+                    if output_ids
+                    else False
+                ),
             },
         },
     }
@@ -268,6 +521,8 @@ def _variant_html(variant: VariantComparison, experiment_root: Path) -> str:
         f"{author}"
         f"<dt>Model stack</dt><dd>{_escape(variant.model_lora_summary)}</dd>"
         f"<dt>Prompt</dt><dd>{_escape(variant.prompt_label)}</dd>"
+        "<dt>Content classification</dt>"
+        f"<dd>{_escape(variant.content_classification.value)}</dd>"
         f"<dt>Status</dt><dd>{_escape(variant.status)}</dd>"
         f"{error}"
         "</dl>"
@@ -445,6 +700,7 @@ def _draw_contact_tile(
         variant.model_lora_summary,
         output.prompt_label,
         f"Output {output.output_ordinal}",
+        f"Classification: {variant.content_classification.value}",
         f"Status: {variant.status} / {output.availability}",
     )
     text_y = media_box[3] + 12

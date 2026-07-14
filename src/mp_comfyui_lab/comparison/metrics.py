@@ -11,6 +11,7 @@ import imagehash
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
 
+from mp_comfyui_lab.discovery.models import ContentClassification
 from mp_comfyui_lab.experiments.models import OutputRecord, RunRecord
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph
@@ -76,6 +77,7 @@ class VariantComparison(_FactModel):
     author: str | None = None
     model_lora_summary: str
     prompt_label: str
+    content_classification: ContentClassification
     status: str
     expected_output_count: int = Field(ge=1)
     actual_output_count: int = Field(ge=0)
@@ -188,6 +190,7 @@ def _variant_facts(run: RunRecord, experiment_root: Path) -> VariantComparison:
         source_workflow_id=source_workflow_id,
         model_lora_summary=_model_lora_summary(snapshot),
         prompt_label=_prompt_summary(prompts),
+        content_classification=_content_classification(snapshot),
         status=run.state.value,
         expected_output_count=run.expected_output_count,
         actual_output_count=run.actual_output_count,
@@ -338,6 +341,16 @@ def _prompt_lines(snapshot: Mapping[str, Any]) -> tuple[str, ...]:
     if not isinstance(values, (list, tuple)):
         return ()
     return tuple(value for value in values if isinstance(value, str) and value)
+
+
+def _content_classification(
+    snapshot: Mapping[str, Any],
+) -> ContentClassification:
+    value = snapshot.get("content_classification")
+    try:
+        return ContentClassification(value)
+    except (TypeError, ValueError):
+        return ContentClassification.UNKNOWN
 
 
 def _prompt_label(
