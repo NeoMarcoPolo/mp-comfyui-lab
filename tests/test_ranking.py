@@ -1094,6 +1094,11 @@ def _service(
     )
 
 
+def _read_attempts(path: Path) -> tuple[dict[str, Any], ...]:
+    store = ExperimentStore(path.parent.parent)
+    return store.read_jsonl(path.parent.name, path.name)
+
+
 def test_service_implicit_sort_fanout_and_workflow_dedup_precede_public_detail(
     tmp_path: Path,
 ) -> None:
@@ -1210,7 +1215,7 @@ def test_discovery_one_sort_failure_returns_partial_with_durable_attempts(
     assert snapshot["diagnostic_count"] == 1
     assert "attempts" not in snapshot
     attempts_path = Path(result.diagnostics_artifact.path)
-    attempts = [json.loads(line) for line in attempts_path.read_text().splitlines()]
+    attempts = _read_attempts(attempts_path)
     assert [item["order"] for item in attempts] == list(range(1, 7))
     assert attempts[0]["result_ids"] == [NEXT_SCENE_ID, QWEN_ID]
 
@@ -1319,7 +1324,7 @@ def test_discovery_all_search_failures_raise_incomplete_with_artifact(
     assert payload["results"] == []
     assert payload["attempt_count"] == 4
     assert payload["diagnostic_count"] == 4
-    attempts = [json.loads(line) for line in attempts_path.read_text().splitlines()]
+    attempts = _read_attempts(attempts_path)
     assert {item["status"] for item in attempts} == {"failed"}
     assert "provider-secret" not in snapshot.read_text(encoding="utf-8")
     assert executor.detail_calls == []
@@ -1352,7 +1357,7 @@ def test_discovery_attempt_journal_is_linear_for_400_candidates(
 
     elapsed = perf_counter() - started
     attempts_path = Path(result.diagnostics_artifact.path)
-    attempts = [json.loads(line) for line in attempts_path.read_text().splitlines()]
+    attempts = _read_attempts(attempts_path)
     assert elapsed < 30.0
     assert snapshot_writes <= 5
     assert len(attempts) == 401
@@ -1389,7 +1394,7 @@ def test_thousands_of_detail_failures_have_authoritative_bounded_diagnostics(
     assert result.diagnostic_count == 2_000
     assert 0 < len(result.diagnostics) <= 16
     attempts_path = Path(result.diagnostics_artifact.path)
-    attempts = [json.loads(line) for line in attempts_path.read_text().splitlines()]
+    attempts = _read_attempts(attempts_path)
     assert len(attempts) == 2_001
     assert sum(item["status"] == "failed" for item in attempts) == 2_000
     snapshot = next(Path(item.path) for item in result.artifacts if item.kind == "search")
@@ -1532,8 +1537,11 @@ def test_inspect_persists_secret_safe_graph_with_reproducible_hashes(
                 "endpoint": (
                     "https://alice:authority-secret@[2001:db8::1]:8443/base"
                     "?revision=1&format=fp16&X-Amz-Credential=aws-secret&"
-                    "X-Amz-Signature=aws-signature#section=weights&"
-                    "auth_token=fragment-secret"
+                    "X-Amz-Signature=aws-signature#section=weights;"
+                    "AcCeSsToKeN=fragment-secret"
+                ),
+                "documentation": (
+                    "https://models.example/docs#section=weights;revision=1"
                 ),
                 "password": "password-secret",
                 "auth_token": "auth-secret",
@@ -1571,7 +1579,13 @@ def test_inspect_persists_secret_safe_graph_with_reproducible_hashes(
     )
     assert (
         persisted_graph["1"]["inputs"]["endpoint"]
-        == "https://[2001:db8::1]:8443/base?revision=1&format=fp16#section=weights"
+        == "https://[2001:db8::1]:8443/base?revision=1&format=fp16"
+    )
+    assert persisted_graph["1"]["inputs"]["documentation"] == (
+        "https://models.example/docs#section=weights;revision=1"
+    )
+    assert "section=weights;revision=1" in paths["normalized.json"].read_text(
+        encoding="utf-8"
     )
     assert "A secret garden, preserve this ordinary prompt text" in serialized_artifacts
     for secret in (

@@ -111,6 +111,22 @@ DIAGNOSTIC_AUTHORIZATION_SCHEME = re.compile(
     r"(?P<separator>\s+)",
     re.IGNORECASE,
 )
+FRAGMENT_KEY_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_.\-/])"
+    r"(?P<key>[A-Za-z][A-Za-z0-9_.\-/]*)"
+    r"(?![A-Za-z0-9_.\-/])"
+)
+FRAGMENT_ASSIGNMENT_SEPARATOR = re.compile(r"^[&;,\s:=]+(?=\S)")
+FRAGMENT_AUTHORIZATION_CREDENTIAL = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"(?:Bearer|Basic|Token|Digest|ApiKey)"
+    r"(?:[&;,\s:=]+|$)",
+    re.IGNORECASE,
+)
+FRAGMENT_URL_USERINFO = re.compile(
+    r"https?://[^/?#\s]*@",
+    re.IGNORECASE,
+)
 
 
 class SafetyError(ValueError):
@@ -328,25 +344,22 @@ def _unparseable_graph_url_has_secret(value: str) -> bool:
 def _sanitize_graph_fragment(value: str) -> str:
     if not value:
         return value
-    value = unquote(value)
-    if HTTP_URL_START.match(value):
-        return _sanitize_graph_text(value)
-    if "=" not in value:
-        return _redact_diagnostic_assignments(_sanitize_graph_text(value))
-    try:
-        items = parse_qsl(value, keep_blank_values=True)
-    except ValueError:
-        return _redact_diagnostic_assignments(_sanitize_graph_text(value))
-    rejected = authentication_query_keys(items)
-    retained = [
-        (key, _sanitize_graph_url(item) if HTTP_URL_START.match(item) else item)
-        for key, item in items
-        if canonical_security_key(key) not in rejected
-    ]
-    return urlencode(retained, doseq=True)
+    inspected = unquote(value, encoding="utf-8", errors="replace")
+    if FRAGMENT_AUTHORIZATION_CREDENTIAL.search(inspected):
+        return ""
+    if FRAGMENT_URL_USERINFO.search(inspected):
+        return ""
+    for match in FRAGMENT_KEY_TOKEN.finditer(inspected):
+        if not _is_secret_key(match.group("key")):
+            continue
+        if FRAGMENT_ASSIGNMENT_SEPARATOR.match(inspected[match.end() :]):
+            return ""
+    return value
 
 
 def _sanitize_graph_text(value: str) -> str:
+    if HTTP_URL_START.match(value) and "#" in value:
+        return _sanitize_graph_url(value)
     sanitized: list[str] = []
     cursor = 0
     while match := HTTP_URL_START.search(value, cursor):

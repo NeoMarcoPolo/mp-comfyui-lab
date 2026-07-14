@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from time import perf_counter
 
 import pytest
 
@@ -220,16 +221,13 @@ def test_graph_persistence_sanitizer_removes_url_authority_and_fragment_secrets(
     assert sanitized == {
         "direct": (
             "https://[2001:db8::1]:8443/model?revision=1"
-            "#section=weights&format=fp16"
         ),
         "embedded": (
-            "load https://models.example/base?revision=1#tab=files now"
+            "load https://models.example/base?revision=1 now"
         ),
         "malformed_material": "https://models.example:notaport/base?revision=1",
         "malformed_secret": "https://models.example:notaport/base?revision=1",
-        "encoded_fragment": (
-            "https://models.example/base?revision=1#section=weights"
-        ),
+        "encoded_fragment": "https://models.example/base?revision=1",
     }
     serialized = json.dumps(sanitized, sort_keys=True)
     for secret in (
@@ -246,6 +244,46 @@ def test_graph_persistence_sanitizer_removes_url_authority_and_fragment_secrets(
         "auth_token",
     ):
         assert secret not in serialized
+    assert security_module.sanitize_graph_for_persistence(sanitized) == sanitized
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "section=weights&access_token=secret",
+        "section=weights;AcCeSsToKeN=secret",
+        "section=weights,apiKey:secret",
+        "section=weights auth_token secret",
+        "section=weights;clientSecret secret",
+        "authorization:Basic secret",
+        "Bearer secret",
+        "section%3Dweights%3BAccessToken%3Dencoded-secret",
+    ],
+)
+def test_graph_fragment_drops_entire_value_for_any_secret_marker(fragment):
+    url = f"https://models.example/base?revision=1#{fragment}"
+
+    sanitized = security_module.sanitize_graph_for_persistence(url)
+
+    assert sanitized == "https://models.example/base?revision=1"
+    assert security_module.sanitize_graph_for_persistence(sanitized) == sanitized
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "clean-anchor",
+        "section=weights;revision=1",
+        "section%3Dweights%3Brevision%3D1",
+        "password-reset",
+    ],
+)
+def test_graph_fragment_preserves_clean_material_value_byte_for_byte(fragment):
+    url = f"https://models.example/base?revision=1#{fragment}"
+
+    sanitized = security_module.sanitize_graph_for_persistence(url)
+
+    assert sanitized == url
     assert security_module.sanitize_graph_for_persistence(sanitized) == sanitized
 
 
@@ -742,7 +780,7 @@ def test_append_jsonl_is_sanitized_bounded_and_concurrency_safe(tmp_path):
 
     destination = tmp_path / "journal-001" / "attempts.jsonl"
     content = destination.read_text(encoding="utf-8")
-    records = [json.loads(line) for line in content.splitlines()]
+    records = store.read_jsonl("journal-001", "attempts.jsonl")
     assert content.endswith("\n")
     assert len(records) == 200
     assert {item["order"] for item in records} == set(range(200))
@@ -750,7 +788,7 @@ def test_append_jsonl_is_sanitized_bounded_and_concurrency_safe(tmp_path):
     assert "mapping-secret" not in content
 
 
-def test_append_jsonl_interrupted_write_leaves_existing_lines_parseable(
+def test_append_jsonl_loops_on_short_writes_without_concatenation(
     tmp_path,
     monkeypatch,
 ):
@@ -762,24 +800,180 @@ def test_append_jsonl_interrupted_write_leaves_existing_lines_parseable(
         {"order": 1, "status": "success"},
     )
     original_write = store_module.os.write
+    write_calls = 0
 
     def short_write(descriptor, value):
+        nonlocal write_calls
+        write_calls += 1
         written = original_write(descriptor, value[:5])
-        assert written == 5
+        assert 0 < written <= 5
         return written
 
     monkeypatch.setattr(store_module.os, "write", short_write)
 
-    with pytest.raises(OSError, match="incomplete JSONL append"):
-        store.append_jsonl(
-            "journal-002",
-            "attempts.jsonl",
-            {"order": 2, "status": "failed"},
-        )
+    store.append_jsonl(
+        "journal-002",
+        "attempts.jsonl",
+        {"order": 2, "status": "failed"},
+    )
 
-    assert [json.loads(line) for line in destination.read_text().splitlines()] == [
-        {"order": 1, "status": "success"}
-    ]
+    assert write_calls > 1
+    assert store.read_jsonl("journal-002", "attempts.jsonl") == (
+        {"order": 1, "status": "success"},
+        {"order": 2, "status": "failed"},
+    )
+    assert destination.read_bytes().count(b"\n") == 2
+
+
+def test_read_jsonl_repairs_hard_crash_tail_then_append_is_prefix_safe(tmp_path):
+    store = ExperimentStore(tmp_path)
+    store.create("journal-003")
+    destination = store.append_jsonl(
+        "journal-003",
+        "attempts.jsonl",
+        {"order": 1, "status": "success"},
+    )
+    store.append_jsonl(
+        "journal-003",
+        "attempts.jsonl",
+        {"order": 2, "status": "success"},
+    )
+    with destination.open("ab", buffering=0) as journal:
+        journal.write(b'{"order":3,"status":"in-flight"')
+        os.fsync(journal.fileno())
+
+    recovered = store.read_jsonl("journal-003", "attempts.jsonl")
+    store.append_jsonl(
+        "journal-003",
+        "attempts.jsonl",
+        {"order": 4, "status": "success"},
+    )
+
+    assert recovered == (
+        {"order": 1, "status": "success"},
+        {"order": 2, "status": "success"},
+    )
+    assert tuple(store.iter_jsonl("journal-003", "attempts.jsonl")) == (
+        {"order": 1, "status": "success"},
+        {"order": 2, "status": "success"},
+        {"order": 4, "status": "success"},
+    )
+    assert destination.read_bytes().endswith(b"\n")
+    assert destination.read_bytes().count(b"\n") == 3
+
+
+@pytest.mark.parametrize(
+    "invalid_tail",
+    [b"not-json\n", b"[]\n", b'"text"\n', b'{"score":NaN}\n'],
+)
+def test_read_jsonl_discards_only_invalid_final_complete_record(
+    tmp_path,
+    invalid_tail,
+):
+    store = ExperimentStore(tmp_path)
+    store.create("journal-004")
+    destination = store.append_jsonl(
+        "journal-004",
+        "attempts.jsonl",
+        {"order": 1},
+    )
+    prefix = destination.read_bytes()
+    with destination.open("ab", buffering=0) as journal:
+        journal.write(invalid_tail)
+        os.fsync(journal.fileno())
+
+    assert store.read_jsonl("journal-004", "attempts.jsonl") == ({"order": 1},)
+    assert destination.read_bytes() == prefix
+
+
+def test_read_jsonl_repairs_empty_and_no_newline_files(tmp_path):
+    store = ExperimentStore(tmp_path)
+    root = store.create("journal-005")
+    destination = root / "attempts.jsonl"
+    destination.write_bytes(b"")
+    assert store.read_jsonl("journal-005", "attempts.jsonl") == ()
+
+    destination.write_bytes(b'{"order":1}')
+    assert store.read_jsonl("journal-005", "attempts.jsonl") == ()
+    assert destination.read_bytes() == b""
+
+
+def test_read_jsonl_never_discards_invalid_earlier_record(tmp_path):
+    store = ExperimentStore(tmp_path)
+    root = store.create("journal-006")
+    destination = root / "attempts.jsonl"
+    content = b'{"order":1}\nnot-json\n{"order":3}\n'
+    destination.write_bytes(content)
+
+    with pytest.raises(SafetyError, match="record 2"):
+        store.read_jsonl("journal-006", "attempts.jsonl")
+
+    assert destination.read_bytes() == content
+
+
+def test_concurrent_append_repairs_one_crash_tail_once(tmp_path):
+    store = ExperimentStore(tmp_path)
+    store.create("journal-007")
+    destination = store.append_jsonl(
+        "journal-007",
+        "attempts.jsonl",
+        {"order": 1},
+    )
+    with destination.open("ab", buffering=0) as journal:
+        journal.write(b'{"order":999')
+        os.fsync(journal.fileno())
+    workers = 16
+    barrier = Barrier(workers)
+
+    def append(order: int) -> None:
+        barrier.wait()
+        store.append_jsonl("journal-007", "attempts.jsonl", {"order": order})
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(append, range(2, workers + 2)))
+
+    records = store.read_jsonl("journal-007", "attempts.jsonl")
+    assert records[0] == {"order": 1}
+    assert len(records) == workers + 1
+    assert {item["order"] for item in records} == set(range(1, workers + 2))
+    assert destination.read_bytes().count(b"\n") == workers + 1
+
+
+def test_jsonl_append_and_read_reject_symlink_leaf(tmp_path):
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create("journal-008")
+    target = root / "sources" / "target.jsonl"
+    target.write_text('{"order":1}\n', encoding="utf-8")
+    alias = root / "attempts.jsonl"
+    try:
+        alias.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("file symlinks are not supported")
+
+    with pytest.raises(SafetyError, match="symlink or junction"):
+        store.read_jsonl("journal-008", "attempts.jsonl")
+    with pytest.raises(SafetyError, match="symlink or junction"):
+        store.append_jsonl("journal-008", "attempts.jsonl", {"order": 2})
+    assert target.read_text(encoding="utf-8") == '{"order":1}\n'
+
+
+def test_jsonl_append_and_recovery_are_linear_at_scale(tmp_path):
+    store = ExperimentStore(tmp_path)
+    store.create("journal-009")
+    started = perf_counter()
+    for order in range(1_000):
+        store.append_jsonl("journal-009", "attempts.jsonl", {"order": order})
+    append_elapsed = perf_counter() - started
+
+    started = perf_counter()
+    records = store.read_jsonl("journal-009", "attempts.jsonl")
+    read_elapsed = perf_counter() - started
+
+    assert append_elapsed < 30.0
+    assert read_elapsed < 5.0
+    assert len(records) == 1_000
+    assert records[0] == {"order": 0}
+    assert records[-1] == {"order": 999}
 
 
 def test_write_text_creates_parent_directories_atomically(tmp_path):

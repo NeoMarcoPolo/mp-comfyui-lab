@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 import json
 import os
 from pathlib import Path
@@ -106,6 +107,8 @@ class ExperimentStore:
     ) -> Path:
         destination = self._artifact_path(experiment_id, relative_path)
         sanitized = self._sanitize_jsonl_value(sanitize_for_persistence(value))
+        if not isinstance(sanitized, dict):
+            raise SafetyError("JSONL record must be an object")
         serialized = json.dumps(
             sanitized,
             ensure_ascii=False,
@@ -121,24 +124,156 @@ class ExperimentStore:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination = self._artifact_path(experiment_id, relative_path)
         with self._append_lock(destination):
-            flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+            flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
             flags |= getattr(os, "O_BINARY", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(destination, flags, 0o600)
             try:
-                start = os.lseek(descriptor, 0, os.SEEK_END)
-                try:
-                    written = os.write(descriptor, encoded)
-                    if written != len(encoded):
-                        raise OSError("incomplete JSONL append")
-                    os.fsync(descriptor)
-                except BaseException:
-                    os.ftruncate(descriptor, start)
-                    os.fsync(descriptor)
-                    raise
+                self._repair_jsonl_tail(descriptor)
+                offset = 0
+                while offset < len(encoded):
+                    written = os.write(descriptor, encoded[offset:])
+                    if written <= 0:
+                        raise OSError("JSONL append made no progress")
+                    offset += written
+                os.fsync(descriptor)
             finally:
                 os.close(descriptor)
         return destination
+
+    def read_jsonl(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+    ) -> tuple[dict[str, Any], ...]:
+        source = self._artifact_path(experiment_id, relative_path)
+        with self._append_lock(source):
+            flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(source, flags)
+            except FileNotFoundError:
+                return ()
+            try:
+                self._repair_jsonl_tail(descriptor)
+                size = os.fstat(descriptor).st_size
+                content = self._read_descriptor_range(descriptor, 0, size)
+            finally:
+                os.close(descriptor)
+
+        records: list[dict[str, Any]] = []
+        for index, line in enumerate(content.splitlines(), start=1):
+            try:
+                records.append(self._parse_jsonl_object(line))
+            except (UnicodeDecodeError, ValueError) as error:
+                raise SafetyError(f"invalid JSONL record {index}: {error}") from error
+        return tuple(records)
+
+    def iter_jsonl(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+    ) -> Iterator[dict[str, Any]]:
+        return iter(self.read_jsonl(experiment_id, relative_path))
+
+    @classmethod
+    def _repair_jsonl_tail(cls, descriptor: int) -> None:
+        """Keep the durable prefix; a crash may lose only its in-flight record."""
+        size = os.fstat(descriptor).st_size
+        if size == 0:
+            return
+
+        repaired = False
+        if cls._read_descriptor_range(descriptor, size - 1, 1) != b"\n":
+            newline = cls._find_previous_newline(descriptor, size)
+            size = newline + 1 if newline >= 0 else 0
+            os.ftruncate(descriptor, size)
+            repaired = True
+        else:
+            start, line = cls._last_complete_jsonl_line(descriptor, size)
+            try:
+                cls._parse_jsonl_object(line)
+            except (UnicodeDecodeError, ValueError):
+                size = start
+                os.ftruncate(descriptor, size)
+                repaired = True
+
+        if repaired:
+            os.fsync(descriptor)
+            if size:
+                _, prior_line = cls._last_complete_jsonl_line(descriptor, size)
+                try:
+                    cls._parse_jsonl_object(prior_line)
+                except (UnicodeDecodeError, ValueError) as error:
+                    raise SafetyError(
+                        "invalid JSONL record precedes recoverable tail"
+                    ) from error
+
+    @classmethod
+    def _last_complete_jsonl_line(
+        cls,
+        descriptor: int,
+        size: int,
+    ) -> tuple[int, bytes]:
+        previous_newline = cls._find_previous_newline(descriptor, size - 1)
+        start = previous_newline + 1
+        return (
+            start,
+            cls._read_descriptor_range(descriptor, start, size - start - 1),
+        )
+
+    @staticmethod
+    def _find_previous_newline(descriptor: int, end: int) -> int:
+        cursor = end
+        while cursor > 0:
+            start = max(0, cursor - 8_192)
+            chunk = ExperimentStore._read_descriptor_range(
+                descriptor,
+                start,
+                cursor - start,
+            )
+            index = chunk.rfind(b"\n")
+            if index >= 0:
+                return start + index
+            cursor = start
+        return -1
+
+    @staticmethod
+    def _read_descriptor_range(
+        descriptor: int,
+        start: int,
+        length: int,
+    ) -> bytes:
+        os.lseek(descriptor, start, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = length
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 65_536))
+            if not chunk:
+                raise OSError("unexpected end of JSONL artifact")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _parse_jsonl_object(line: bytes) -> dict[str, Any]:
+        if not line:
+            raise ValueError("record must not be empty")
+        if len(line) + 1 > MAX_JSONL_RECORD_BYTES:
+            raise ValueError(
+                f"record exceeds {MAX_JSONL_RECORD_BYTES} byte limit"
+            )
+        parsed = json.loads(
+            line.decode("utf-8"),
+            parse_constant=ExperimentStore._reject_json_constant,
+        )
+        if not isinstance(parsed, dict):
+            raise ValueError("record must be an object")
+        return parsed
+
+    @staticmethod
+    def _reject_json_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant is not allowed: {value}")
 
     def _append_lock(self, destination: Path) -> threading.Lock:
         with self._append_locks_guard:
