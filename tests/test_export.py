@@ -7,6 +7,7 @@ from pathlib import Path
 import stat
 
 from PIL import Image
+from pydantic import ValidationError
 import pytest
 
 from mp_comfyui_lab.comparison.finalists import (
@@ -34,6 +35,8 @@ from mp_comfyui_lab.export.bundle import (
     BundleConflictError,
     BundleExporter,
     BundleIntegrityError,
+    HandoffArtifact,
+    HandoffManifest,
     SelectionRequiredError,
     suggested_workflow_name,
 )
@@ -309,6 +312,51 @@ def test_export_requires_current_explicit_human_selection(tmp_path: Path) -> Non
         BundleExporter(store).export(EXPERIMENT_ID)
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        "",
+        ".",
+        "..",
+        "/absolute.json",
+        "C:/drive.json",
+        "C:\\drive.json",
+        "\\\\server\\share\\artifact.json",
+        "directory\\artifact.json",
+        "./artifact.json",
+        "directory/./artifact.json",
+        "../artifact.json",
+        "directory/../artifact.json",
+        "directory//artifact.json",
+    ),
+)
+def test_handoff_artifact_rejects_non_relative_posix_paths(path: str) -> None:
+    with pytest.raises(ValidationError):
+        HandoffArtifact(
+            path=path,
+            sha256="a" * 64,
+            bytes=1,
+        )
+
+
+def test_handoff_manifest_requires_supported_schema_version() -> None:
+    payload = {
+        "experiment_id": EXPERIMENT_ID,
+        "variant_id": VARIANT_ID,
+        "suggested_workflow_name": "workflow",
+        "artifacts": (),
+        "instructions": ("Promote the selected workflow.",),
+    }
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        HandoffManifest.model_validate(payload, strict=True)
+    with pytest.raises(ValidationError, match="schema_version"):
+        HandoffManifest.model_validate(
+            {"schema_version": "2", **payload},
+            strict=True,
+        )
+
+
 def test_export_is_self_contained_byte_stable_and_production_read_only(
     tmp_path: Path,
 ) -> None:
@@ -356,7 +404,14 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
     execution = json.loads((bundle / "execution.json").read_text(encoding="utf-8"))
     exported_output = execution["exported_outputs"][0]
     assert hashlib.sha256((bundle / exported_output["path"]).read_bytes()).hexdigest() == exported_output["sha256"]
-    handoff = json.loads((bundle / "handoff.json").read_text(encoding="utf-8"))
+    handoff_path = bundle / "handoff.json"
+    handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    validated_handoff = HandoffManifest.model_validate_json(
+        handoff_path.read_bytes(),
+        strict=True,
+    )
+    assert validated_handoff.schema_version == "1"
+    assert all("\\" not in artifact.path for artifact in validated_handoff.artifacts)
     assert handoff["suggested_workflow_name"] == (
         "qwen_image_edit_2511_i2i_multiangle_consistency"
     )

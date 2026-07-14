@@ -1398,10 +1398,14 @@ def main(
     if parsed.command in {"run", "resume", "status", "reconcile"}:
         try:
             root = Path.cwd() if cwd is None else Path(cwd)
-            engine = experiment_engine or _make_experiment_engine(
-                root,
-                executor=executor,
-                output_downloader=output_downloader,
+            engine = (
+                experiment_engine
+                if experiment_engine is not None
+                else _make_experiment_engine(
+                    root,
+                    executor=executor,
+                    output_downloader=output_downloader,
+                )
             )
             if parsed.command == "run":
                 if parsed.rerun_variant_id is not None:
@@ -1505,8 +1509,12 @@ def main(
             root = Path.cwd() if cwd is None else Path(cwd)
             config = LabConfig.load(root)
             brief = load_experiment_brief(parsed.manifest)
-            loader = planning_loader or ReadOnlyPlanningBundleLoader(
-                executor if executor is not None else RunningHubExecutor()
+            loader = (
+                planning_loader
+                if planning_loader is not None
+                else ReadOnlyPlanningBundleLoader(
+                    executor if executor is not None else RunningHubExecutor()
+                )
             )
             source_bundle = loader.load_source_bundle(brief)
             if not isinstance(source_bundle, SourceBundle):

@@ -9,7 +9,10 @@
           "type": "integer"
         },
         "path": {
+          "description": "Relative POSIX path inside the handoff bundle; backslashes, drive or UNC prefixes, empty segments, and '.' or '..' segments are forbidden.",
+          "maxLength": 4096,
           "minLength": 1,
+          "pattern": "^(?:[^./\\\\:][^/\\\\:]*|\\.[^./\\\\:][^/\\\\:]*|\\.\\.[^/\\\\:][^/\\\\:]*)(?:/(?:[^./\\\\:][^/\\\\:]*|\\.[^./\\\\:][^/\\\\:]*|\\.\\.[^/\\\\:][^/\\\\:]*))*$",
           "title": "Path",
           "type": "string"
         },
@@ -52,7 +55,7 @@
     },
     "schema_version": {
       "const": "1",
-      "default": "1",
+      "description": "Required supported handoff schema version.",
       "title": "Schema Version",
       "type": "string"
     },
@@ -68,6 +71,7 @@
     }
   },
   "required": [
+    "schema_version",
     "experiment_id",
     "variant_id",
     "suggested_workflow_name",

@@ -56,6 +56,21 @@ _MODEL_FIELDS = frozenset(
 )
 _LORA_FIELDS = frozenset({"lora_name", "lora_file", "lora"})
 NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+_HANDOFF_PATH_SEGMENT = (
+    r"(?:[^./\\:][^/\\:]*|\.[^./\\:][^/\\:]*|\.\.[^/\\:][^/\\:]*)"
+)
+HANDOFF_PATH_PATTERN = (
+    rf"^{_HANDOFF_PATH_SEGMENT}(?:/{_HANDOFF_PATH_SEGMENT})*$"
+)
+HandoffPath = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=4096,
+        pattern=HANDOFF_PATH_PATTERN,
+    ),
+]
 
 
 class _HandoffModel(BaseModel):
@@ -68,13 +83,21 @@ class _HandoffModel(BaseModel):
 
 
 class HandoffArtifact(_HandoffModel):
-    path: NonBlankStr
+    path: HandoffPath = Field(
+        description=(
+            "Relative POSIX path inside the handoff bundle; backslashes, "
+            "drive or UNC prefixes, empty segments, and '.' or '..' segments "
+            "are forbidden."
+        )
+    )
     sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
     bytes: int = Field(ge=0)
 
 
 class HandoffManifest(_HandoffModel):
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["1"] = Field(
+        description="Required supported handoff schema version."
+    )
     experiment_id: NonBlankStr
     variant_id: NonBlankStr
     suggested_workflow_name: NonBlankStr
@@ -346,6 +369,7 @@ class BundleExporter:
             for path, digest, size in self._artifact_hashes(stage)
         )
         handoff = HandoffManifest(
+            schema_version="1",
             experiment_id=experiment_id,
             variant_id=variant.variant_id,
             suggested_workflow_name=workflow_name,

@@ -29,8 +29,8 @@ EXPERIMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
 MAX_EXPERIMENT_ID_LENGTH = 96
 MAX_JSONL_RECORD_BYTES = 131_072
 WINDOWS_MOUNT_POINT_REPARSE_TAG = 0xA0000003
-_JSONL_PATH_LOCKS: dict[str, threading.Lock] = {}
-_JSONL_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
 EXPERIMENT_DIRECTORIES = (
     "sources",
     "evidence",
@@ -40,6 +40,17 @@ EXPERIMENT_DIRECTORIES = (
     "outputs",
     "export",
 )
+
+
+@contextmanager
+def advisory_file_lock(lock_path: str | Path) -> Iterator[None]:
+    """Serialize access to a durable resource within and across processes."""
+    path = Path(lock_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    process_lock = ExperimentStore._process_path_lock(path)
+    with process_lock:
+        with ExperimentStore(path.parent)._os_advisory_lock(path):
+            yield
 
 
 class ExperimentStore:
@@ -221,7 +232,7 @@ class ExperimentStore:
             experiment_id,
             f"runs/{run_id}.lock",
         )
-        process_lock = self._process_jsonl_lock(lock_path)
+        process_lock = self._process_path_lock(lock_path)
         with process_lock:
             lock_path = self._artifact_path(
                 experiment_id,
@@ -338,7 +349,7 @@ class ExperimentStore:
     ) -> Iterator[None]:
         lock_relative_path = self._jsonl_lock_relative_path(relative_path)
         lock_path = self._artifact_path(experiment_id, lock_relative_path)
-        process_lock = self._process_jsonl_lock(artifact_path)
+        process_lock = self._process_path_lock(artifact_path)
         with process_lock:
             lock_path = self._artifact_path(experiment_id, lock_relative_path)
             with self._os_advisory_lock(lock_path):
@@ -351,10 +362,10 @@ class ExperimentStore:
         return path.with_name(f"{path.name}.lock")
 
     @staticmethod
-    def _process_jsonl_lock(artifact_path: Path) -> threading.Lock:
+    def _process_path_lock(artifact_path: Path) -> threading.Lock:
         key = os.path.normcase(str(artifact_path))
-        with _JSONL_PATH_LOCKS_GUARD:
-            return _JSONL_PATH_LOCKS.setdefault(key, threading.Lock())
+        with _PATH_LOCKS_GUARD:
+            return _PATH_LOCKS.setdefault(key, threading.Lock())
 
     @contextmanager
     def _os_advisory_lock(self, lock_path: Path) -> Iterator[None]:

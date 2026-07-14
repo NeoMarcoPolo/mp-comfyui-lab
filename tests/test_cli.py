@@ -222,6 +222,51 @@ def test_run_cli_requires_and_passes_exact_plan_approval(capsys):
     assert payload["data"]["provider_task_id"] == "provider-task-1"
 
 
+def test_run_cli_retains_falsey_injected_engine(capsys, monkeypatch):
+    class FalseyExperimentEngine(FakeExperimentEngine):
+        def __bool__(self) -> bool:
+            return False
+
+    record = RunRecord(
+        run_id="run-falsey-engine",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.SUCCESS,
+        provider_task_id="provider-task-falsey",
+        expected_output_count=1,
+        actual_output_count=1,
+    )
+    engine = FalseyExperimentEngine(record)
+    monkeypatch.setattr(
+        app,
+        "_make_experiment_engine",
+        lambda *_args, **_kwargs: pytest.fail(
+            "falsey injected engine triggered production construction"
+        ),
+    )
+
+    code = main(
+        [
+            "run",
+            "plan-approved",
+            "baseline",
+            "--approve-plan-hash",
+            "a" * 64,
+        ],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.OK
+    assert payload["data"]["run_id"] == "run-falsey-engine"
+    assert engine.calls[0] == (
+        "run",
+        "plan-approved",
+        "baseline",
+        "a" * 64,
+    )
+
+
 def test_run_cli_rejects_missing_explicit_approval_hash(capsys):
     code = main(["run", "plan-approved", "baseline"])
 
@@ -1172,10 +1217,36 @@ def test_dependency_wiring_passes_cwd_and_injected_executor(
     assert calls == [(tmp_path, executor)]
 
 
-class OfflinePlanningLoader:
+def test_discovery_cli_retains_falsey_injected_service(
+    capsys,
+    monkeypatch,
+) -> None:
+    class FalseyCliService(FakeCliService):
+        def __bool__(self) -> bool:
+            return False
+
+    service = FalseyCliService()
+    monkeypatch.setattr(
+        app,
+        "_make_service",
+        lambda *_args, **_kwargs: pytest.fail(
+            "falsey injected service triggered production construction"
+        ),
+    )
+
+    code = main(["search", "qwen"], service=service)
+
+    _single_json_document(capsys.readouterr())
+    assert code == ExitCode.OK
+
+
+class FalseyOfflinePlanningLoader:
     def __init__(self, bundle):
         self.bundle = bundle
         self.briefs = []
+
+    def __bool__(self) -> bool:
+        return False
 
     def load_source_bundle(self, brief):
         self.briefs.append(brief)
@@ -1187,7 +1258,7 @@ class NoExecutorPath:
         raise AssertionError(f"plan CLI touched executor attribute {name}")
 
 
-def test_plan_cli_writes_dry_run_artifacts_and_never_touches_executor(
+def test_plan_cli_retains_falsey_loader_and_never_touches_executor(
     tmp_path,
     capsys,
 ):
@@ -1212,7 +1283,7 @@ def test_plan_cli_writes_dry_run_artifacts_and_never_touches_executor(
             observations=(EvidenceObservation(source_id=source.workflow_id),),
         ),
     )
-    loader = OfflinePlanningLoader(bundle)
+    loader = FalseyOfflinePlanningLoader(bundle)
     manifest = tmp_path / "plan.yaml"
     manifest.write_text(
         """goal: character variation
