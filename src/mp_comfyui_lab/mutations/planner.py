@@ -12,6 +12,9 @@ from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import GraphNormalizationError, normalize_graph
 from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.mutations.models import (
+    BoundaryInputMapping,
+    BoundaryOutputMapping,
+    DonorNode,
     ReplaceLoraStack,
     LoraLoaderTemplate,
     LoraSpec,
@@ -51,6 +54,19 @@ _ROLE_DIMENSIONS = {
     SemanticRole.DIMENSIONS: "output_dimensions",
     SemanticRole.SEED: "seed_variance",
 }
+_TOPOLOGY_ROLES = {
+    DimensionName.CHECKPOINT: (
+        SemanticRole.CHECKPOINT,
+        SemanticRole.MODEL,
+        SemanticRole.UNET,
+    ),
+    DimensionName.ENCODER: (SemanticRole.ENCODER,),
+    DimensionName.PROMPT_GRAMMAR: (
+        SemanticRole.PROMPT_SOURCE,
+        SemanticRole.PROMPT_FANOUT,
+    ),
+    DimensionName.REFERENCE_STRATEGY: (SemanticRole.REFERENCE_IMAGE,),
+}
 
 
 @dataclass(frozen=True)
@@ -76,16 +92,18 @@ def compile_observed_candidates(
     for donor in sources:
         if donor.workflow_id == baseline.workflow_id:
             continue
+        scalar_warnings: dict[DimensionName, str] = {}
+        compiled_dimensions: set[DimensionName] = set()
         for dimension, role in roles.items():
             if brief.policy_for(dimension).value != "approved":
                 continue
             left = baseline.normalized_graph.bindings(role)
             right = donor.normalized_graph.bindings(role)
             if len(left) != 1 or len(right) != 1:
-                warnings.append(f"candidate {dimension.value}-{donor.workflow_id} omitted: ambiguous scalar bindings")
+                scalar_warnings[dimension] = "ambiguous scalar bindings"
                 continue
             if left[0].field_name != right[0].field_name or left[0].field_name == "$class_type":
-                warnings.append(f"candidate {dimension.value}-{donor.workflow_id} omitted: mismatched scalar bindings")
+                scalar_warnings[dimension] = "mismatched scalar bindings"
                 continue
             value = thaw_json(right[0].value)
             if value == thaw_json(left[0].value):
@@ -98,6 +116,31 @@ def compile_observed_candidates(
                 semantic_patch=SemanticPatch(mutations=(SetRoleInput(role=role, binding_index=0, field_name=left[0].field_name, value=value),)),
                 engagement=donor.engagement, provenance_rank=1,
             ))
+            compiled_dimensions.add(dimension)
+        handled_topology_dimensions: set[DimensionName] = set()
+        for dimension, topology_roles in _TOPOLOGY_ROLES.items():
+            if (
+                brief.policy_for(dimension).value != "approved"
+                or dimension in compiled_dimensions
+            ):
+                continue
+            topology_candidate, topology_warning = _compile_one_node_topology_candidate(
+                dimension,
+                topology_roles,
+                baseline,
+                donor,
+            )
+            if topology_candidate is not None:
+                candidates.append(topology_candidate)
+                handled_topology_dimensions.add(dimension)
+            elif topology_warning is not None:
+                warnings.append(topology_warning)
+                handled_topology_dimensions.add(dimension)
+        for dimension, warning in scalar_warnings.items():
+            if dimension not in handled_topology_dimensions:
+                warnings.append(
+                    f"candidate {dimension.value}-{donor.workflow_id} omitted: {warning}"
+                )
         lora_candidate, lora_warning = _compile_lora_candidate(brief, baseline, donor)
         if lora_candidate is not None:
             candidates.append(lora_candidate)
@@ -105,6 +148,139 @@ def compile_observed_candidates(
             warnings.append(lora_warning)
     candidates.sort(key=lambda item: (item.capability_signature, item.candidate_id))
     return CandidateSelection(candidates=tuple(candidates), warnings=tuple(sorted(set(warnings))))
+
+
+def _compile_one_node_topology_candidate(
+    dimension: DimensionName,
+    roles: tuple[SemanticRole, ...],
+    baseline: PlanningSource,
+    donor: PlanningSource,
+) -> tuple[Candidate | None, str | None]:
+    warning_prefix = f"candidate {dimension.value}-{donor.workflow_id} omitted: "
+    baseline_bindings = {
+        (binding.node_id, binding.field_name)
+        for role in roles
+        for binding in baseline.normalized_graph.bindings(role)
+    }
+    donor_bindings = {
+        (binding.node_id, binding.field_name)
+        for role in roles
+        for binding in donor.normalized_graph.bindings(role)
+    }
+    if not baseline_bindings and not donor_bindings:
+        return None, None
+    if len(baseline_bindings) != 1 or len(donor_bindings) != 1:
+        return None, warning_prefix + "ambiguous one-node topology bindings"
+    baseline_node_id = next(iter(baseline_bindings))[0]
+    donor_node_id = next(iter(donor_bindings))[0]
+    baseline_nodes = {
+        node.node_id: node for node in baseline.normalized_graph.nodes
+    }
+    donor_nodes = {node.node_id: node for node in donor.normalized_graph.nodes}
+    baseline_node = baseline_nodes.get(baseline_node_id)
+    donor_node = donor_nodes.get(donor_node_id)
+    baseline_raw = thaw_json(baseline.raw_graph).get(baseline_node_id)
+    donor_raw = thaw_json(donor.raw_graph).get(donor_node_id)
+    if (
+        baseline_node is None
+        or donor_node is None
+        or not isinstance(baseline_raw, Mapping)
+        or not isinstance(donor_raw, Mapping)
+        or not isinstance(baseline_raw.get("class_type"), str)
+        or not isinstance(donor_raw.get("class_type"), str)
+        or not isinstance(donor_raw.get("inputs"), Mapping)
+    ):
+        return None, warning_prefix + "exact one-node topology unavailable"
+    if baseline_raw["class_type"] == donor_raw["class_type"]:
+        return None, None
+
+    baseline_inputs = dict(baseline_node.input_links)
+    donor_inputs = dict(donor_node.input_links)
+    if (
+        baseline_inputs != donor_inputs
+        or any(link[0] == baseline_node_id for link in baseline_inputs.values())
+        or any(link[0] == donor_node_id for link in donor_inputs.values())
+    ):
+        return None, warning_prefix + "incompatible one-node topology boundary"
+
+    boundary_outputs = []
+    for consumer in baseline.normalized_graph.nodes:
+        for field_name, link in consumer.input_links.items():
+            if link[0] != baseline_node_id:
+                continue
+            if consumer.node_id == baseline_node_id or link[1] != 0:
+                return None, warning_prefix + "incompatible one-node topology boundary"
+            boundary_outputs.append(
+                BoundaryOutputMapping(
+                    donor_node_id=donor_node_id,
+                    donor_output_index=link[1],
+                    consumer_node_id=consumer.node_id,
+                    consumer_field_name=field_name,
+                )
+            )
+    if not boundary_outputs:
+        return None, warning_prefix + "incompatible one-node topology boundary"
+
+    exact_donor_node = DonorNode(
+        node_id=donor_node_id,
+        class_type=donor_raw["class_type"],
+        inputs=donor_raw["inputs"],
+        metadata={
+            key: value
+            for key, value in donor_raw.items()
+            if key not in {"class_type", "inputs"}
+        },
+    )
+    boundary_inputs = tuple(
+        BoundaryInputMapping(
+            donor_node_id=donor_node_id,
+            donor_field_name=field_name,
+            source_node_id=link[0],
+            source_output_index=link[1],
+        )
+        for field_name, link in sorted(donor_inputs.items())
+    )
+    mutation = ReplaceSubgraph(
+        target_node_ids=(baseline_node_id,),
+        donor_nodes=(exact_donor_node,),
+        boundary_inputs=boundary_inputs,
+        boundary_outputs=tuple(boundary_outputs),
+        donor_workflow_id=donor.workflow_id,
+        evidence_ids=(donor.workflow_id,),
+    )
+    if _mutation_dimensions(mutation, baseline) != {dimension.value}:
+        return None, warning_prefix + "compiled one-node topology affects multiple dimensions"
+    signature_payload = {
+        "dimension": dimension.value,
+        "donor_nodes": [
+            item.model_dump(mode="json") for item in mutation.donor_nodes
+        ],
+        "boundary_inputs": [
+            item.model_dump(mode="json") for item in mutation.boundary_inputs
+        ],
+        "boundary_outputs": [
+            item.model_dump(mode="json") for item in mutation.boundary_outputs
+        ],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            signature_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()[:16]
+    candidate = Candidate(
+        candidate_id=f"{dimension.value}-{donor.workflow_id}"[:96],
+        hypothesis=dimension,
+        capability_signature=f"{dimension.value}:topology:{digest}",
+        confidence="observed",
+        evidence_ids=(donor.workflow_id,),
+        semantic_patch=SemanticPatch(mutations=(mutation,)),
+        engagement=donor.engagement,
+        provenance_rank=1,
+    )
+    return candidate, None
 
 
 def _compile_lora_candidate(brief, baseline, donor):

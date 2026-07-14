@@ -88,6 +88,28 @@ def _graph(*, reference_count: int = 1, prompt_fanout: bool = True) -> dict:
     return graph
 
 
+def _encoder_topology_graph(
+    class_type: str,
+    *,
+    node_id: str = "2",
+    clip_output_index: int = 0,
+    text: str | None = None,
+) -> dict:
+    graph = _graph()
+    inputs: dict[str, object] = {"clip": ["4", clip_output_index]}
+    if text is not None:
+        inputs["text"] = text
+    graph.pop("2")
+    graph[node_id] = {
+        "class_type": class_type,
+        "inputs": inputs,
+        "display_name": f"Exact {class_type}",
+    }
+    graph["6"]["inputs"]["negative"] = [node_id, 0]
+    graph["8"]["inputs"]["prompt"] = [node_id, 0]
+    return graph
+
+
 def _brief(**overrides: object) -> ExperimentBrief:
     values = {
         "goal": "Test a character variation",
@@ -711,3 +733,134 @@ def test_replace_subgraph_rejects_equal_multi_dimension_topology() -> None:
         )
         == "affected dimension cannot be proven"
     )
+
+
+def test_compiler_emits_exact_one_node_encoder_topology_candidate() -> None:
+    baseline_graph = _encoder_topology_graph("TextEncoderAlpha")
+    baseline = _source(baseline_graph, workflow_id="123")
+    donor = _source(
+        _encoder_topology_graph("TextEncoderBeta", node_id="20"),
+        workflow_id="124",
+    )
+    second_donor = _source(
+        _encoder_topology_graph("TextEncoderGamma", node_id="30"),
+        workflow_id="125",
+    )
+    brief = _brief(dimensions={"encoder": "approved"})
+
+    forward = compile_observed_candidates(brief, baseline, (donor, second_donor))
+    reverse = compile_observed_candidates(brief, baseline, (second_donor, donor))
+
+    assert [item.model_dump(mode="json") for item in forward.candidates] == [
+        item.model_dump(mode="json") for item in reverse.candidates
+    ]
+    assert {item.candidate_id for item in forward.candidates} == {
+        "encoder-124",
+        "encoder-125",
+    }
+    candidate = next(
+        item for item in forward.candidates if item.candidate_id == "encoder-124"
+    )
+    assert candidate.capability_signature.startswith("encoder:topology:")
+    assert candidate.evidence_ids == ("124",)
+    mutation = candidate.semantic_patch.mutations[0]
+    assert isinstance(mutation, ReplaceSubgraph)
+    assert mutation.target_node_ids == ("2",)
+    assert mutation.donor_workflow_id == "124"
+    assert mutation.evidence_ids == ("124",)
+    assert mutation.donor_nodes == (
+        DonorNode(
+            node_id="20",
+            class_type="TextEncoderBeta",
+            inputs={"clip": ["4", 0]},
+            metadata={"display_name": "Exact TextEncoderBeta"},
+        ),
+    )
+    assert mutation.boundary_inputs == (
+        BoundaryInputMapping(
+            donor_node_id="20",
+            donor_field_name="clip",
+            source_node_id="4",
+            source_output_index=0,
+        ),
+    )
+    assert [
+        (item.consumer_node_id, item.consumer_field_name, item.donor_output_index)
+        for item in mutation.boundary_outputs
+    ] == [("6", "negative", 0), ("8", "prompt", 0)]
+    assert validate_candidate_patch(
+        candidate,
+        candidate.semantic_patch,
+        baseline,
+        brief,
+    ) is None
+
+    result = materialize_variant(baseline_graph, candidate.semantic_patch)
+    assert result.validation.errors == ()
+    added_node_id = result.diff.mutations[0].added_node_ids[0]
+    assert result.model_dump(mode="json")["graph"][added_node_id] == {
+        "class_type": "TextEncoderBeta",
+        "inputs": {"clip": ["4", 0]},
+        "display_name": "Exact TextEncoderBeta",
+    }
+    assert result.diff.mutations[0].donor_workflow_id == "124"
+    assert result.diff.mutations[0].evidence_ids == ("124",)
+
+
+def test_compiler_warns_on_incompatible_one_node_topology_boundary() -> None:
+    baseline = _source(
+        _encoder_topology_graph("TextEncoderAlpha"),
+        workflow_id="123",
+    )
+    donor = _source(
+        _encoder_topology_graph(
+            "TextEncoderBeta",
+            node_id="20",
+            clip_output_index=1,
+        ),
+        workflow_id="124",
+    )
+
+    compiled = compile_observed_candidates(
+        _brief(dimensions={"encoder": "approved"}),
+        baseline,
+        (donor,),
+    )
+
+    assert compiled.candidates == ()
+    assert (
+        "candidate encoder-124 omitted: incompatible one-node topology boundary"
+        in compiled.warnings
+    )
+
+
+def test_compiler_rejects_misleading_and_multi_dimension_topology_roles() -> None:
+    baseline = _source(
+        _encoder_topology_graph("TextEncoderAlpha"),
+        workflow_id="123",
+    )
+    misleading = _source(
+        _encoder_topology_graph("EncodePromptShim", node_id="20"),
+        workflow_id="124",
+    )
+    multi_dimension = _source(
+        _encoder_topology_graph(
+            "TextEncoderBeta",
+            node_id="30",
+            text="donor prompt",
+        ),
+        workflow_id="125",
+    )
+
+    compiled = compile_observed_candidates(
+        _brief(dimensions={"encoder": "approved"}),
+        baseline,
+        (misleading, multi_dimension),
+    )
+
+    assert compiled.candidates == ()
+    assert any(
+        "ambiguous one-node topology bindings" in item
+        for item in compiled.warnings
+    )
+    assert any("affects multiple dimensions" in item for item in compiled.warnings)
