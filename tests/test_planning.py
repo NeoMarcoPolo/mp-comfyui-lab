@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
+import types
+import ctypes
 
 import pytest
 from pydantic import ValidationError
@@ -311,6 +314,75 @@ def test_fixture_descriptor_walk_rejects_fifo_and_intermediate_symlink(tmp_path:
     race_brief = _brief(fixtures={"reference_images": [{"uri": "swapped/portrait.png", "binding_index": 0}], "prompt_lines": ["x"]})
     with pytest.raises(Exception):
         build_plan(race_brief, _bundle(), config=_config(tmp_path))
+
+
+class _Win32Function:
+    def __init__(self, callback):
+        self.callback = callback
+
+    def __call__(self, *args):
+        return self.callback(*args)
+
+
+def _mock_win32_handles(monkeypatch: pytest.MonkeyPatch, *, reparse_handles=(), final_paths=None):
+    opened: list[str] = []
+    closed: list[int] = []
+    handles = iter((10, 11, 12))
+    final_paths = final_paths or {10: r"\\?\C:\fixtures", 11: r"\\?\C:\fixtures\parent", 12: r"\\?\C:\fixtures\parent\fixture.png"}
+    reparse_handles = set(reparse_handles)
+
+    def create(path, *_args):
+        opened.append(path)
+        return next(handles)
+
+    def information(handle, _kind, pointer, _size):
+        info = pointer._obj
+        info.attributes = 0x00000400 if handle in reparse_handles else 0
+        info.reparse_tag = 0xA000000C if handle in reparse_handles else 0
+        return True
+
+    def final(handle, buffer, _size, _flags):
+        value = final_paths[handle]
+        if buffer is None:
+            return len(value)
+        buffer.value = value
+        return len(value)
+
+    kernel32 = types.SimpleNamespace(
+        CreateFileW=_Win32Function(create),
+        GetFileInformationByHandleEx=_Win32Function(information),
+        GetFinalPathNameByHandleW=_Win32Function(final),
+        GetFileType=_Win32Function(lambda _handle: 1),
+        CloseHandle=_Win32Function(lambda handle: closed.append(handle) or True),
+    )
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+    msvcrt = types.SimpleNamespace(open_osfhandle=lambda *_args: pytest.fail("fixture bytes must not be readable"))
+    monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
+    return opened, closed
+
+
+@pytest.mark.parametrize(("reparse_handle", "opened_count"), ((11, 2), (12, 3)))
+def test_windows_opened_reparse_metadata_fails_before_fixture_read(
+    monkeypatch: pytest.MonkeyPatch,
+    reparse_handle: int,
+    opened_count: int,
+) -> None:
+    opened, closed = _mock_win32_handles(monkeypatch, reparse_handles=(reparse_handle,))
+    with pytest.raises(Exception, match="reparse"):
+        planning_module._windows_open_fixture(Path(r"C:\fixtures"), ("parent", "fixture.png"))
+    assert len(opened) == opened_count
+    assert closed == list(range(10, 10 + opened_count))
+
+
+def test_windows_parent_swap_final_handle_path_fails_before_fixture_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened, closed = _mock_win32_handles(
+        monkeypatch,
+        final_paths={10: r"\\?\C:\fixtures", 11: r"\\?\D:\swapped-parent"},
+    )
+    with pytest.raises(Exception, match="escapes configured containment"):
+        planning_module._windows_open_fixture(Path(r"C:\fixtures"), ("parent", "fixture.png"))
+    assert len(opened) == 2
+    assert closed == [10, 11]
 
 
 def test_fixture_fingerprint_detects_a_change_during_descriptor_read(
