@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
+from functools import partial
 import hashlib
 from html.parser import HTMLParser
 from ipaddress import ip_address
@@ -17,13 +18,12 @@ from urllib.parse import urlsplit
 from mp_runninghub_api.config import load_default_config
 from mp_runninghub_api.errors import RunningHubApiError
 from mp_runninghub_api.runninghub import (
-    create_task,
     get_task_info,
     get_task_outputs,
     get_task_status,
     get_workflow_json,
 )
-from mp_runninghub_api.types import NodeInfo
+from mp_runninghub_api.types import NodeInfo, TaskCreateResult
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 import requests
 
@@ -75,9 +75,12 @@ GRAPH_ENDPOINT = "/api/openapi/getJsonApiFormat"
 PUBLIC_REQUEST_TIMEOUT = (10, 60)
 UPLOAD_ENDPOINT = f"{BASE_URL}/task/openapi/upload"
 UPLOAD_REQUEST_TIMEOUT = 300
+CREATE_TASK_ENDPOINT = f"{BASE_URL}/task/openapi/create"
+CREATE_TASK_REQUEST_TIMEOUT = 60
 PROVIDER_NUMERIC_STRING_MAX_LENGTH = 64
 MAX_GRAPH_DEPTH = 256
 MAX_GRAPH_NODES = 100_000
+DEFAULT_OUTPUT_HOST_SUFFIXES = ("runninghub.ai", "xiaoyaoyou.com")
 
 NSFW_TERMS = frozenset({"nsfw", "nude", "nudity", "\u88f8\u4f53", "\u6210\u4eba", "\u8272\u60c5"})
 SFW_CONTEXT_WINDOW = 8
@@ -223,6 +226,97 @@ def upload_file_bytes(
         raise RunningHubApiError("Upload returned an unsafe fileName") from error
 
 
+def create_task_once(
+    api_key: str | None,
+    workflow_id: str,
+    node_info_list: list[NodeInfo] | None = None,
+    *,
+    workflow: str | None = None,
+    instance_type: str | None = None,
+    timeout: int = CREATE_TASK_REQUEST_TIMEOUT,
+    session: requests.Session | None = None,
+    credential_loader: CredentialLoader = load_default_config,
+) -> TaskCreateResult:
+    """Transmit one paid create request exactly once, without redirects."""
+    if not api_key:
+        try:
+            api_key = credential_loader().apiKey
+        except Exception as error:
+            raise ExecutorError("RunningHub credentials could not be loaded") from error
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise ExecutorError("RunningHub credentials are missing an API key")
+
+    payload: dict[str, Any] = {
+        "workflowId": workflow_id,
+        "addMetadata": True,
+        "usePersonalQueue": False,
+        "apiKey": api_key,
+    }
+    if node_info_list:
+        payload["nodeInfoList"] = [
+            {
+                "nodeId": item.nodeId,
+                "fieldName": item.fieldName,
+                "fieldValue": item.fieldValue,
+            }
+            for item in node_info_list
+        ]
+    if workflow:
+        payload["workflow"] = workflow
+    if instance_type:
+        payload["instanceType"] = instance_type
+
+    post = requests.post if session is None else session.post
+    try:
+        response = post(
+            CREATE_TASK_ENDPOINT,
+            json=payload,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        raise AmbiguousSubmissionError(
+            "RunningHub submission outcome is ambiguous"
+        ) from None
+
+    if response.status_code >= 500 or response.status_code == 429:
+        raise AmbiguousSubmissionError(
+            "RunningHub submission outcome is ambiguous"
+        )
+    try:
+        envelope = response.json()
+    except (TypeError, ValueError):
+        raise AmbiguousSubmissionError(
+            "RunningHub submission returned an unconfirmed response"
+        ) from None
+    if not isinstance(envelope, Mapping):
+        raise AmbiguousSubmissionError(
+            "RunningHub submission returned an unconfirmed response"
+        )
+    code = envelope.get("code")
+    valid_code = type(code) is int or type(code) is str
+    success_code = (type(code) is int and code == 0) or (
+        type(code) is str and code == "0"
+    )
+    if response.status_code != 200 or not success_code:
+        if valid_code and not success_code and isinstance(envelope.get("msg"), str):
+            raise ExecutorError("RunningHub submission was rejected")
+        raise AmbiguousSubmissionError(
+            "RunningHub submission returned an unconfirmed response"
+        )
+    data = envelope.get("data")
+    if not isinstance(data, Mapping):
+        raise AmbiguousSubmissionError(
+            "RunningHub submission returned an unconfirmed response"
+        )
+    return TaskCreateResult(
+        taskId=data.get("taskId"),
+        taskStatus=data.get("taskStatus"),
+        clientId=data.get("clientId"),
+        promptTips=data.get("promptTips"),
+    )
+
+
 def _provider_aware_timestamp(value: str) -> str:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -282,6 +376,65 @@ def _provider_http_url(value: str) -> str:
         ):
             raise ValueError("expected a valid hostname")
     return value
+
+
+def _provider_output_url(
+    value: str,
+    allowed_host_suffixes: tuple[str, ...],
+) -> str:
+    _provider_http_url(value)
+    parsed = urlsplit(value)
+    if parsed.scheme.casefold() != "https":
+        raise ValueError("output URL must use HTTPS")
+    hostname = parsed.hostname
+    if hostname is None or "%" in hostname or "\\" in value:
+        raise ValueError("output URL hostname is invalid")
+    try:
+        normalized = hostname.encode("idna").decode("ascii").casefold().rstrip(".")
+    except UnicodeError:
+        raise ValueError("output URL hostname is invalid") from None
+    try:
+        ip_address(normalized)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("output URL IP literals are not allowed")
+    if not any(
+        normalized == suffix or normalized.endswith(f".{suffix}")
+        for suffix in allowed_host_suffixes
+    ):
+        raise ValueError("output URL hostname is not provider-approved")
+    return value
+
+
+def _normalize_output_host_suffixes(values: Iterable[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("output host suffixes must be nonblank domains")
+        candidate = value.strip().casefold().rstrip(".")
+        try:
+            ascii_candidate = candidate.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError("output host suffix is invalid") from None
+        if (
+            "%" in ascii_candidate
+            or "/" in ascii_candidate
+            or ":" in ascii_candidate
+            or any(
+                re.fullmatch(
+                    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                    label,
+                )
+                is None
+                for label in ascii_candidate.split(".")
+            )
+        ):
+            raise ValueError("output host suffix is invalid")
+        normalized.append(ascii_candidate)
+    if not normalized:
+        raise ValueError("at least one output host suffix is required")
+    return tuple(sorted(set(normalized)))
 
 
 ProviderNumericString = Annotated[
@@ -1073,10 +1226,11 @@ class RunningHubExecutor(Executor):
         *,
         credential_loader: CredentialLoader = load_default_config,
         upload_call: UploadCall = upload_file_bytes,
-        create_task_call: CreateTaskCall = create_task,
+        create_task_call: CreateTaskCall | None = None,
         status_call: StatusCall = get_task_status,
         info_call: InfoCall = get_task_info,
         outputs_call: OutputsCall = get_task_outputs,
+        output_host_suffixes: Iterable[str] = DEFAULT_OUTPUT_HOST_SUFFIXES,
     ) -> None:
         self.session = requests.Session() if session is None else session
         self.graph_fetcher = (
@@ -1084,10 +1238,20 @@ class RunningHubExecutor(Executor):
         )
         self._credential_loader = credential_loader
         self._upload_call = upload_call
-        self._create_task_call = create_task_call
+        self._create_task_call = (
+            partial(
+                create_task_once,
+                credential_loader=credential_loader,
+            )
+            if create_task_call is None
+            else create_task_call
+        )
         self._status_call = status_call
         self._info_call = info_call
         self._outputs_call = outputs_call
+        self._output_host_suffixes = _normalize_output_host_suffixes(
+            output_host_suffixes
+        )
 
     @property
     def name(self) -> str:
@@ -1492,6 +1656,8 @@ class RunningHubExecutor(Executor):
                 workflow=json.dumps(materialized_graph, ensure_ascii=False),
                 instance_type=variant.instance_type,
             )
+        except AmbiguousSubmissionError:
+            raise
         except Exception as error:
             if self._ambiguous_request_error(error):
                 raise AmbiguousSubmissionError(
@@ -1509,14 +1675,24 @@ class RunningHubExecutor(Executor):
                 "RunningHub submission returned no usable task ID"
             )
         task_status = getattr(result, "taskStatus", None)
-        provider_state = (
-            None
-            if task_status is None
-            else self._provider_task_state(task_status)
-        )
+        provider_state = None
+        provider_metadata: dict[str, str] = {}
+        if task_status is not None:
+            normalized_status = (
+                _PAID_PROVIDER_STATES.get(task_status.strip().upper())
+                if isinstance(task_status, str) and task_status.strip()
+                else None
+            )
+            if normalized_status is None:
+                provider_metadata["warning"] = (
+                    "RunningHub create returned an unrecognized optional task status"
+                )
+            else:
+                provider_state = ProviderTaskState(normalized_status)
         return SubmissionReceipt(
             provider_task_id=task_id.strip(),
             provider_state=provider_state,
+            provider_metadata=provider_metadata,
         )
 
     @staticmethod
@@ -1638,7 +1814,7 @@ class RunningHubExecutor(Executor):
             if not isinstance(url, str):
                 raise ProviderSchemaError("RunningHub output URL must be a string")
             try:
-                _provider_http_url(url)
+                _provider_output_url(url, self._output_host_suffixes)
             except ValueError as error:
                 raise ProviderSchemaError("RunningHub output URL is invalid") from error
             if not isinstance(node_id, str) or not node_id.strip():

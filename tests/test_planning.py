@@ -521,9 +521,9 @@ def test_explicit_count_keeps_all_valid_output_nodes_and_infers_media(tmp_path: 
     (tmp_path / "portrait.png").write_bytes(b"fixture")
     graph = _graph()
     graph["9"] = {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}}
-    brief = _brief(expectations={"output_count": 7, "media_types": []})
+    brief = _brief(expectations={"output_count": 8, "media_types": []})
     variant = build_plan(brief, _bundle(graph=graph), config=_config(tmp_path)).variants[0]
-    assert variant.expected_output_count == 7
+    assert variant.expected_output_count == 8
     assert variant.output_node_ids == ("3", "9")
     assert variant.expected_media_types == ("image/png", "image/png")
 

@@ -12,8 +12,9 @@ from types import SimpleNamespace
 
 from mp_runninghub_api.errors import RunningHubApiError
 import pytest
+import requests
 
-from helpers import FakeExecutor
+from helpers import FakeExecutor, valid_media_bytes
 from mp_comfyui_lab.config import LabConfig
 from mp_comfyui_lab.executors.base import (
     ExecutorError,
@@ -55,6 +56,8 @@ def _persist_plan(
     experiment_id: str = "plan-approved",
     with_fixture: bool = False,
     expected_output_count: int = 1,
+    output_node_ids: tuple[str, ...] = ("9",),
+    expected_media_types: tuple[str, ...] = ("image/png",),
 ) -> tuple[LabConfig, ExperimentPlan]:
     config = LabConfig.model_validate(
         {"experiments_root": tmp_path / "experiments"},
@@ -90,12 +93,12 @@ def _persist_plan(
         exact_run_hash="0" * 64,
         capability_hash="b" * 64,
         expected_output_count=expected_output_count,
-        output_node_ids=("9",),
-        expected_media_types=("image/png",),
+        output_node_ids=output_node_ids,
+        expected_media_types=expected_media_types,
         execution_parameters={
             "prompt_lines": ["one"],
             "expected_output_count": expected_output_count,
-            "output_node_ids": ["9"],
+            "output_node_ids": list(output_node_ids),
         },
         fixture_fingerprints=fixture_fingerprints,
     )
@@ -530,6 +533,97 @@ def test_real_runninghub_invalid_task_id_is_durable_ambiguous_without_retry(
     assert "ambiguous_submission" in persisted
 
 
+def test_default_runninghub_create_lost_response_is_durable_ambiguous_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, plan = _persist_plan(tmp_path, with_fixture=True)
+    posts: list[str] = []
+
+    def lost_response(url, **_kwargs):
+        posts.append(url)
+        raise requests.Timeout("response lost after paid create transmission")
+
+    runninghub_module = importlib.import_module(
+        "mp_comfyui_lab.executors.runninghub"
+    )
+    monkeypatch.setattr(runninghub_module.requests, "post", lost_response)
+    executor = RunningHubExecutor(
+        credential_loader=lambda: SimpleNamespace(apiKey="secret"),
+        upload_call=lambda **_kwargs: "uploaded.png",
+        status_call=lambda **_kwargs: pytest.fail("ambiguous task polled"),
+        info_call=lambda **_kwargs: pytest.fail("ambiguous task info fetched"),
+        outputs_call=lambda **_kwargs: pytest.fail("ambiguous outputs collected"),
+    )
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert thaw_json(record.error)["kind"] == "ambiguous_submission"
+    assert posts == [runninghub_module.CREATE_TASK_ENDPOINT]
+
+
+def test_real_runninghub_valid_id_is_persisted_before_malformed_status_poll(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_plan(tmp_path, with_fixture=True)
+    observed: list[RunRecord] = []
+
+    def status_call(**_kwargs):
+        run_path = next(
+            (config.experiments_root / "plan-approved" / "runs").glob("*.json")
+        )
+        observed.append(
+            RunRecord.model_validate_json(
+                run_path.read_text(encoding="utf-8"),
+                strict=True,
+            )
+        )
+        return "FAILED"
+
+    executor = RunningHubExecutor(
+        credential_loader=lambda: SimpleNamespace(apiKey="secret"),
+        upload_call=lambda **_kwargs: "uploaded.png",
+        create_task_call=lambda **_kwargs: SimpleNamespace(
+            taskId="provider-task-1",
+            taskStatus=7,
+        ),
+        status_call=status_call,
+        info_call=lambda **_kwargs: {"taskId": "provider-task-1"},
+        outputs_call=lambda **_kwargs: pytest.fail("failed task collected outputs"),
+    )
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.FAILED
+    assert record.provider_task_id == "provider-task-1"
+    assert len(observed) == 1
+    assert observed[0].state is RunState.SUBMITTED
+    assert observed[0].provider_task_id == "provider-task-1"
+
+
 def test_submit_intent_recovers_crash_after_remote_return_without_resubmit(
     tmp_path: Path,
 ) -> None:
@@ -793,12 +887,12 @@ def test_partial_output_batch_is_incomplete_and_retains_verified_output(
     tmp_path: Path,
 ) -> None:
     config, plan = _persist_plan(tmp_path, expected_output_count=2)
-    output_bytes = b"verified png output"
+    output_bytes = valid_media_bytes("image/png")
     output = ProviderOutput(
         node_id="9",
         url="https://cdn.example/output.png?token=live-secret",
         media_type="image/png",
-        provider_order=7,
+        provider_order=0,
     )
     executor = FakeExecutor.success(outputs=(output,))
 
@@ -825,7 +919,7 @@ def test_partial_output_batch_is_incomplete_and_retains_verified_output(
     assert record.actual_output_count == 1
     assert len(record.outputs) == 1
     durable_output = record.outputs[0]
-    assert durable_output.provider_order == 7
+    assert durable_output.provider_order == 0
     assert durable_output.node_id == "9"
     assert durable_output.media_type == "image/png"
     assert durable_output.content_sha256 == hashlib.sha256(output_bytes).hexdigest()
@@ -845,6 +939,166 @@ def test_partial_output_batch_is_incomplete_and_retains_verified_output(
     assert "live-secret" not in persisted
     assert "https://cdn.example" not in persisted
     assert thaw_json(record.error)["kind"] == "partial_outputs"
+    assert executor.calls.count("collect_outputs") == 4
+    assert len(record.diagnostics) == 4
+
+
+@pytest.mark.parametrize("first_count", [0, 1])
+def test_incomplete_success_batch_retries_until_exact_without_resubmit(
+    tmp_path: Path,
+    first_count: int,
+) -> None:
+    config, plan = _persist_plan(tmp_path, expected_output_count=2)
+    first = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/first.png?sig=one",
+        media_type="image/png",
+        provider_order=0,
+    )
+    second = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/second.png?sig=two",
+        media_type="image/png",
+        provider_order=1,
+    )
+    first_batch = () if first_count == 0 else (first,)
+    executor = FakeExecutor(
+        poll_sequences={"fake-task-1": (ProviderTaskState.SUCCESS,)},
+        output_scripts={"fake-task-1": (first_batch, (first, second))},
+    )
+
+    def downloader(url: str, target: Path) -> Path:
+        target.write_bytes(valid_media_bytes("image/png"))
+        return target
+
+    waits: list[float] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=waits.append,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.SUCCESS
+    assert record.actual_output_count == 2
+    assert executor.calls.count("submit") == 1
+    assert executor.calls.count("collect_outputs") == 2
+    assert waits == [1]
+    assert thaw_json(record.diagnostics[0]) == {
+        "kind": "incomplete_output_batch",
+        "operation": "collect_outputs",
+        "attempt": 1,
+        "observed_output_count": first_count,
+        "expected_output_count": 2,
+    }
+
+
+@pytest.mark.parametrize("observed_count", [0, 1])
+def test_persistent_incomplete_success_batch_keeps_final_evidence(
+    tmp_path: Path,
+    observed_count: int,
+) -> None:
+    config, plan = _persist_plan(tmp_path, expected_output_count=2)
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/partial.png",
+        media_type="image/png",
+        provider_order=0,
+    )
+    batch = () if observed_count == 0 else (output,)
+    executor = FakeExecutor(
+        poll_sequences={"fake-task-1": (ProviderTaskState.SUCCESS,)},
+        output_scripts={"fake-task-1": (batch,)},
+    )
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(valid_media_bytes("image/png"))
+        return target
+
+    waits: list[float] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=waits.append,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert record.actual_output_count == observed_count
+    assert len(record.outputs) == observed_count
+    assert thaw_json(record.error)["kind"] == "partial_outputs"
+    assert executor.calls.count("submit") == 1
+    assert executor.calls.count("collect_outputs") == 4
+    assert waits == [1, 2, 4]
+    assert len(record.diagnostics) == 4
+
+
+def test_partial_batch_survives_later_transient_collection_exhaustion(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_plan(tmp_path, expected_output_count=2)
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/partial.png",
+        media_type="image/png",
+        provider_order=0,
+    )
+    executor = FakeExecutor(
+        poll_sequences={"fake-task-1": (ProviderTaskState.SUCCESS,)},
+    )
+    attempts = 0
+
+    def collect_outputs(task_id: str) -> tuple[ProviderOutput, ...]:
+        nonlocal attempts
+        executor.calls.append("collect_outputs")
+        executor.collections.append(task_id)
+        attempts += 1
+        if attempts == 1:
+            return (output,)
+        raise TimeoutError("collection response was lost")
+
+    executor.collect_outputs = collect_outputs  # type: ignore[method-assign]
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(valid_media_bytes("image/png"))
+        return target
+
+    waits: list[float] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=waits.append,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert record.actual_output_count == 1
+    assert len(record.outputs) == 1
+    assert thaw_json(record.error)["kind"] == "partial_outputs"
+    assert executor.calls.count("submit") == 1
+    assert executor.calls.count("collect_outputs") == 4
+    assert waits == [1, 2, 4]
 
 
 def test_complete_verified_output_batch_is_success(tmp_path: Path) -> None:
@@ -858,7 +1112,7 @@ def test_complete_verified_output_batch_is_success(tmp_path: Path) -> None:
     executor = FakeExecutor.success(outputs=(output,))
 
     def downloader(_url: str, target: Path) -> Path:
-        target.write_bytes(b"complete output")
+        target.write_bytes(valid_media_bytes("image/png"))
         return target
 
     engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
@@ -891,7 +1145,7 @@ def test_resume_reuses_orphan_published_before_output_record_persistence(
     tmp_path: Path,
 ) -> None:
     config, plan = _persist_plan(tmp_path)
-    content = b"published before crash"
+    content = valid_media_bytes("image/png")
     output = ProviderOutput(
         node_id="9",
         url="https://cdn.example/output.png?sig=secret",
@@ -911,7 +1165,7 @@ def test_resume_reuses_orphan_published_before_output_record_persistence(
         downloader=downloader,
         sleep=lambda _seconds: None,
     )
-    original_write = crashing_engine._store.write_bytes_new
+    original_write = crashing_engine._store.publish_file_new
 
     def crash_after_output_publish(experiment_id, relative_path, value, **kwargs):
         published = original_write(
@@ -924,7 +1178,7 @@ def test_resume_reuses_orphan_published_before_output_record_persistence(
             raise SystemExit("crash after final output publish")
         return published
 
-    crashing_engine._store.write_bytes_new = crash_after_output_publish
+    crashing_engine._store.publish_file_new = crash_after_output_publish
 
     with pytest.raises(SystemExit, match="crash after final output publish"):
         crashing_engine.run(
@@ -967,7 +1221,7 @@ def test_resume_reuses_orphan_published_before_output_record_persistence(
 
 def test_identical_second_run_reuses_matching_variant_output(tmp_path: Path) -> None:
     config, plan = _persist_plan(tmp_path)
-    content = b"identical rerun output"
+    content = valid_media_bytes("image/png")
     output = ProviderOutput(
         node_id="9",
         url="https://cdn.example/output.png?sig=secret",
@@ -1027,7 +1281,7 @@ def test_extra_provider_output_is_incomplete(tmp_path: Path) -> None:
     executor = FakeExecutor.success(outputs=outputs)
 
     def downloader(url: str, target: Path) -> Path:
-        target.write_bytes(url.encode("ascii"))
+        target.write_bytes(valid_media_bytes("image/png"))
         return target
 
     engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
@@ -1054,8 +1308,8 @@ def test_resume_provider_batch_shrink_replaces_stale_output_records(
     tmp_path: Path,
 ) -> None:
     config, _ = _persist_plan(tmp_path)
-    first_content = b"current first"
-    stale_content = b"stale second"
+    first_content = valid_media_bytes("image/png")
+    stale_content = valid_media_bytes("image/png")
     durable_outputs = (
         OutputRecord(
             ordinal=0,
@@ -1159,7 +1413,7 @@ def test_malformed_output_is_incomplete_and_preserves_prior_output(
     executor = FakeExecutor.success(outputs=outputs)
 
     def downloader(_url: str, target: Path) -> Path:
-        target.write_bytes(b"one")
+        target.write_bytes(valid_media_bytes("image/png"))
         return target
 
     engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
@@ -1214,7 +1468,7 @@ def test_collection_and_download_retries_never_resubmit(tmp_path: Path) -> None:
         download_attempts.append(url)
         if len(download_attempts) <= 3:
             raise TimeoutError(f"download {len(download_attempts)}")
-        target.write_bytes(b"retried output")
+        target.write_bytes(valid_media_bytes("image/png"))
         return target
 
     waits: list[float] = []
@@ -1247,15 +1501,15 @@ def test_production_downloader_retries_runninghub_error_then_succeeds(
     config, plan = _persist_plan(tmp_path)
     output = ProviderOutput(
         node_id="9",
-        url="https://cdn.example/output.png?sig=live-signed-secret",
+        url="https://cdn.xiaoyaoyou.com/output.png?sig=live-signed-secret",
         media_type="image/png",
         provider_order=0,
     )
     executor = FakeExecutor.success(outputs=(output,))
     attempts: list[int] = []
-    output_bytes = b"production wrapper output"
+    output_bytes = valid_media_bytes("image/png")
 
-    def download_file(_url: str, target: Path) -> Path:
+    def download_file(_url: str, target: Path, **_kwargs) -> Path:
         attempts.append(len(attempts) + 1)
         if len(attempts) <= 3:
             raise RunningHubApiError(
@@ -1267,7 +1521,11 @@ def test_production_downloader_retries_runninghub_error_then_succeeds(
         return target
 
     cli_app = importlib.import_module("mp_comfyui_lab.cli.app")
-    monkeypatch.setattr(cli_app, "download_file", download_file)
+    monkeypatch.setattr(
+        cli_app,
+        "_download_runninghub_output_http",
+        download_file,
+    )
     waits: list[float] = []
     engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
     engine = engine_module.ExperimentEngine(
@@ -1306,7 +1564,7 @@ def test_resume_reuses_matching_durable_output_without_overwrite(
     tmp_path: Path,
 ) -> None:
     config, _ = _persist_plan(tmp_path)
-    content = b"already published"
+    content = valid_media_bytes("image/png")
     durable_output = OutputRecord(
         ordinal=0,
         provider_order=0,
@@ -1394,7 +1652,7 @@ def test_reconcile_attaches_operator_task_id_then_polls_without_submit(
     executors = iter((ambiguous_executor, polling_executor))
 
     def downloader(_url: str, target: Path) -> Path:
-        target.write_bytes(b"reconciled")
+        target.write_bytes(valid_media_bytes("image/png"))
         return target
 
     engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
@@ -1757,14 +2015,14 @@ def test_production_downloader_exhaustion_is_durable_incomplete(
     config, plan = _persist_plan(tmp_path)
     output = ProviderOutput(
         node_id="9",
-        url="https://cdn.example/output.png?sig=live-signed-secret",
+        url="https://cdn.xiaoyaoyou.com/output.png?sig=live-signed-secret",
         media_type="image/png",
         provider_order=0,
     )
     executor = FakeExecutor.success(outputs=(output,))
     attempts: list[int] = []
 
-    def download_file(_url: str, _target: Path) -> None:
+    def download_file(_url: str, _target: Path, **_kwargs) -> None:
         attempts.append(len(attempts) + 1)
         raise RunningHubApiError(
             "download failed api_key=durable-secret "
@@ -1773,7 +2031,11 @@ def test_production_downloader_exhaustion_is_durable_incomplete(
         )
 
     cli_app = importlib.import_module("mp_comfyui_lab.cli.app")
-    monkeypatch.setattr(cli_app, "download_file", download_file)
+    monkeypatch.setattr(
+        cli_app,
+        "_download_runninghub_output_http",
+        download_file,
+    )
     waits: list[float] = []
     engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
     engine = engine_module.ExperimentEngine(
@@ -1901,6 +2163,347 @@ def test_output_media_mismatch_is_incomplete_without_download(
     assert record.state is RunState.INCOMPLETE
     assert record.outputs == ()
     assert thaw_json(record.error)["kind"] == "malformed_output"
+
+
+def test_html_declared_as_png_is_incomplete_without_publication(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_plan(tmp_path)
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output.png",
+        media_type="image/png",
+        provider_order=0,
+    )
+    executor = FakeExecutor.success(outputs=(output,))
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(b"<html><body>not an image</body></html>")
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert thaw_json(record.error)["kind"] == "malformed_output"
+    assert not list(
+        (config.experiments_root / "plan-approved" / "outputs").rglob("*.png")
+    )
+
+
+@pytest.mark.parametrize(
+    "media_type",
+    [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "video/mp4",
+        "video/webm",
+        "audio/mpeg",
+        "audio/wav",
+        "audio/ogg",
+        "application/zip",
+    ],
+)
+def test_supported_media_types_require_valid_minimal_content(
+    tmp_path: Path,
+    media_type: str,
+) -> None:
+    config, plan = _persist_plan(
+        tmp_path,
+        expected_media_types=(media_type,),
+    )
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output",
+        media_type=media_type,
+        provider_order=0,
+    )
+    executor = FakeExecutor.success(outputs=(output,))
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(valid_media_bytes(media_type))
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.SUCCESS
+    assert record.outputs[0].media_type == media_type
+
+
+@pytest.mark.parametrize(
+    ("declared", "actual"),
+    [
+        ("image/png", "image/jpeg"),
+        ("video/mp4", "video/webm"),
+        ("audio/wav", "audio/mpeg"),
+    ],
+)
+def test_mismatched_download_signature_is_incomplete(
+    tmp_path: Path,
+    declared: str,
+    actual: str,
+) -> None:
+    config, plan = _persist_plan(
+        tmp_path,
+        expected_media_types=(declared,),
+    )
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output",
+        media_type=declared,
+        provider_order=0,
+    )
+    executor = FakeExecutor.success(outputs=(output,))
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(valid_media_bytes(actual))
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert thaw_json(record.error)["kind"] == "malformed_output"
+    assert record.outputs == ()
+
+
+def test_injected_downloader_output_cannot_exceed_engine_byte_limit(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_plan(tmp_path)
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output.png",
+        media_type="image/png",
+        provider_order=0,
+    )
+    executor = FakeExecutor.success(outputs=(output,))
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(valid_media_bytes("image/png"))
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+        max_output_bytes=8,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert thaw_json(record.error)["kind"] == "malformed_output"
+    assert record.outputs == ()
+
+
+@pytest.mark.parametrize(
+    ("first_pair", "second_pair"),
+    [
+        (("9", "image/png"), ("9", "image/png")),
+        (("9", "image/jpeg"), ("10", "image/png")),
+        (("9", "image/png"), ("9", "image/jpeg")),
+    ],
+    ids=["duplicate-node", "swapped-media", "missing-pair"],
+)
+def test_exact_output_pairs_reject_independent_allowlist_matches(
+    tmp_path: Path,
+    first_pair: tuple[str, str],
+    second_pair: tuple[str, str],
+) -> None:
+    config, plan = _persist_plan(
+        tmp_path,
+        expected_output_count=2,
+        output_node_ids=("9", "10"),
+        expected_media_types=("image/png", "image/jpeg"),
+    )
+    outputs = tuple(
+        ProviderOutput(
+            node_id=node_id,
+            url=f"https://cdn.example/{order}.png",
+            media_type=media_type,
+            provider_order=order,
+        )
+        for order, (node_id, media_type) in enumerate(
+            (first_pair, second_pair)
+        )
+    )
+    executor = FakeExecutor.success(outputs=outputs)
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(b"provider output")
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert thaw_json(record.error)["kind"] == "malformed_output"
+
+
+def test_provider_outputs_are_canonicalized_by_provider_order(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_plan(
+        tmp_path,
+        expected_output_count=2,
+        output_node_ids=("9", "10"),
+        expected_media_types=("image/png", "image/jpeg"),
+    )
+    outputs = (
+        ProviderOutput(
+            node_id="10",
+            url="https://cdn.example/second.jpg",
+            media_type="image/jpeg",
+            provider_order=1,
+        ),
+        ProviderOutput(
+            node_id="9",
+            url="https://cdn.example/first.png",
+            media_type="image/png",
+            provider_order=0,
+        ),
+    )
+    executor = FakeExecutor.success(outputs=outputs)
+
+    def downloader(url: str, target: Path) -> Path:
+        media_type = "image/jpeg" if url.endswith(".jpg") else "image/png"
+        target.write_bytes(valid_media_bytes(media_type))
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.SUCCESS
+    assert [item.provider_order for item in record.outputs] == [0, 1]
+    assert [item.node_id for item in record.outputs] == ["9", "10"]
+    assert [item.local_relative_path for item in record.outputs] == [
+        "outputs/baseline/0000-9.png",
+        "outputs/baseline/0001-10.jpg",
+    ]
+
+
+@pytest.mark.parametrize("orders", [(0, 0), (0, 2)])
+def test_provider_output_order_must_be_unique_and_contiguous(
+    tmp_path: Path,
+    orders: tuple[int, int],
+) -> None:
+    config, plan = _persist_plan(tmp_path, expected_output_count=2)
+    outputs = tuple(
+        ProviderOutput(
+            node_id="9",
+            url=f"https://cdn.example/{index}.png",
+            media_type="image/png",
+            provider_order=order,
+        )
+        for index, order in enumerate(orders)
+    )
+    executor = FakeExecutor.success(outputs=outputs)
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=lambda _url, _target: pytest.fail("invalid order downloaded"),
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert thaw_json(record.error)["kind"] == "malformed_output"
+    assert record.outputs == ()
+
+
+@pytest.mark.parametrize(
+    ("count", "node_ids", "media_types"),
+    [
+        (2, ("9", "10"), ("image/png",)),
+        (2, ("9", "9"), ("image/png", "image/jpeg")),
+        (3, ("9", "10"), ("image/png", "image/jpeg")),
+    ],
+    ids=["unaligned", "duplicate-node", "indivisible"],
+)
+def test_planned_output_expectations_require_aligned_divisible_unique_pairs(
+    tmp_path: Path,
+    count: int,
+    node_ids: tuple[str, ...],
+    media_types: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        _persist_plan(
+            tmp_path,
+            expected_output_count=count,
+            output_node_ids=node_ids,
+            expected_media_types=media_types,
+        )
 
 
 def test_durable_output_hash_mismatch_fails_closed_without_overwrite(

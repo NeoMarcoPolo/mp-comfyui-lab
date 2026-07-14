@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -1365,4 +1366,67 @@ def test_serialization_failure_leaves_no_temporary_artifacts(tmp_path):
     with pytest.raises(TypeError):
         store.write_json("serialize-001", "runs/result.json", {"bad": object()})
 
+    assert not list(root.rglob("*.tmp"))
+
+
+def test_publish_file_new_streams_with_max_byte_guard(tmp_path: Path) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create("stream-output-001")
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"12345")
+
+    with pytest.raises(SafetyError, match="byte limit"):
+        store.publish_file_new(
+            "stream-output-001",
+            "outputs/baseline/0000-9.bin",
+            source,
+            max_bytes=4,
+            reuse_matching=True,
+        )
+
+    assert not (root / "outputs" / "baseline" / "0000-9.bin").exists()
+    assert not list(root.rglob("*.tmp"))
+
+
+def test_publish_file_new_reuses_matching_content_and_rejects_mismatch(
+    tmp_path: Path,
+) -> None:
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create("stream-output-002")
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"approved output bytes")
+    relative_path = "outputs/baseline/0000-9.bin"
+
+    first = store.publish_file_new(
+        "stream-output-002",
+        relative_path,
+        source,
+        max_bytes=1_024,
+        reuse_matching=True,
+    )
+    second = store.publish_file_new(
+        "stream-output-002",
+        relative_path,
+        source,
+        max_bytes=1_024,
+        reuse_matching=True,
+    )
+
+    assert first == second
+    assert first[1:] == (
+        hashlib.sha256(b"approved output bytes").hexdigest(),
+        len(b"approved output bytes"),
+    )
+
+    source.write_bytes(b"different output bytes")
+    with pytest.raises(SafetyError, match="different content"):
+        store.publish_file_new(
+            "stream-output-002",
+            relative_path,
+            source,
+            max_bytes=1_024,
+            reuse_matching=True,
+        )
+
+    assert (root / relative_path).read_bytes() == b"approved output bytes"
     assert not list(root.rglob("*.tmp"))

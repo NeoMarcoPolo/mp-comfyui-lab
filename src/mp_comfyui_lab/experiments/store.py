@@ -473,6 +473,27 @@ class ExperimentStore:
         )
         return destination
 
+    def publish_file_new(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+        source_path: str | Path,
+        *,
+        max_bytes: int,
+        reuse_matching: bool = False,
+    ) -> tuple[Path, str, int]:
+        """Stream, hash, and atomically publish one bounded regular file."""
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+            raise ValueError("max_bytes must be a positive integer")
+        destination = self._artifact_path(experiment_id, relative_path)
+        digest, size = self._atomic_publish_file_new(
+            destination,
+            Path(source_path),
+            max_bytes=max_bytes,
+            reuse_matching=reuse_matching,
+        )
+        return destination, digest, size
+
     def read_json(self, experiment_id: str, relative_path: str | Path) -> Any:
         source = self._artifact_path(experiment_id, relative_path)
         return json.loads(source.read_text(encoding="utf-8"))
@@ -668,6 +689,134 @@ class ExperimentStore:
                     temporary_path.unlink()
                 except FileNotFoundError:
                     pass
+
+    @classmethod
+    def _atomic_publish_file_new(
+        cls,
+        destination: Path,
+        source_path: Path,
+        *,
+        max_bytes: int,
+        reuse_matching: bool,
+    ) -> tuple[str, int]:
+        source_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        source_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            source_descriptor = os.open(source_path, source_flags)
+        except OSError as error:
+            raise SafetyError("source artifact cannot be opened safely") from error
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            before = os.fstat(source_descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise SafetyError("source artifact is not a regular file")
+            if before.st_size > max_bytes:
+                raise SafetyError("source artifact exceeds byte limit")
+            temporary_descriptor, temporary_name = tempfile.mkstemp(
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary_name)
+            digest = hashlib.sha256()
+            size = 0
+            with os.fdopen(temporary_descriptor, "wb") as temporary_file:
+                while True:
+                    chunk = os.read(source_descriptor, 65_536)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise SafetyError("source artifact exceeds byte limit")
+                    digest.update(chunk)
+                    temporary_file.write(chunk)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            after = os.fstat(source_descriptor)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise SafetyError("source artifact changed during publication")
+            digest_hex = digest.hexdigest()
+            try:
+                os.link(temporary_path, destination)
+            except FileExistsError as error:
+                if not reuse_matching:
+                    raise SafetyError(
+                        "artifact already exists; refusing to overwrite"
+                    ) from error
+                if not cls._existing_file_matches_digest(
+                    destination,
+                    expected_size=size,
+                    expected_sha256=digest_hex,
+                ):
+                    raise SafetyError(
+                        "artifact already exists with different content"
+                    ) from error
+                return digest_hex, size
+            except (AttributeError, NotImplementedError, OSError) as error:
+                raise SafetyError(
+                    "safe no-clobber artifact publish is unavailable"
+                ) from error
+            if os.name != "nt":
+                directory_fd = os.open(
+                    destination.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            return digest_hex, size
+        finally:
+            os.close(source_descriptor)
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    @classmethod
+    def _existing_file_matches_digest(
+        cls,
+        destination: Path,
+        *,
+        expected_size: int,
+        expected_sha256: str,
+    ) -> bool:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(destination, flags)
+        except OSError as error:
+            raise SafetyError("existing artifact cannot be opened safely") from error
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_size != expected_size:
+                return False
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 65_536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        return (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            and digest.hexdigest() == expected_sha256
+        )
 
     @classmethod
     def _existing_bytes_match(cls, destination: Path, expected: bytes) -> bool:

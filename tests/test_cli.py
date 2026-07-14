@@ -49,7 +49,7 @@ from mp_comfyui_lab.experiments.models import (
 )
 from mp_comfyui_lab.experiments.planning import recompute_exact_run_hash
 from mp_comfyui_lab.experiments.store import ExperimentStore
-from mp_comfyui_lab.security import sanitize_for_persistence
+from mp_comfyui_lab.security import SafetyError, sanitize_for_persistence
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
 
@@ -294,24 +294,242 @@ def test_default_cli_downloader_translates_runninghub_transport_error(
     )
     monkeypatch.setattr(app.LabConfig, "load", lambda _root: config)
 
-    def failing_download(_url, _target):
+    def failing_download(_url, _target, **_kwargs):
         raise RunningHubApiError(
             "download failed api_key=durable-secret "
             "https://cdn.example/output.png?sig=signed-secret"
         )
 
-    monkeypatch.setattr(app, "download_file", failing_download)
+    monkeypatch.setattr(
+        app,
+        "_download_runninghub_output_http",
+        failing_download,
+    )
     engine = app._make_experiment_engine(tmp_path)
 
     with pytest.raises(RuntimeError) as raised:
         engine._downloader(
-            "https://cdn.example/output.png?sig=live",
+            "https://cdn.xiaoyaoyou.com/output.png?sig=live",
             tmp_path / "output.png",
         )
 
     assert type(raised.value).__name__ == "TransientOperationError"
     assert "durable-secret" not in str(raised.value)
     assert "signed-secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://cdn.xiaoyaoyou.com/output.png",
+        "https://user:pass@cdn.xiaoyaoyou.com/output.png",
+        "https://127.0.0.1/output.png",
+        "https://10.0.0.1/output.png",
+        "https://169.254.1.1/output.png",
+        "https://[::1]/output.png",
+        "https://[fc00::1]/output.png",
+        "https://2130706433/output.png",
+        "https://xiaoyaoyou.com%2eevil.example/output.png",
+    ],
+)
+def test_production_downloader_rejects_unsafe_url_before_http(
+    tmp_path: Path,
+    url: str,
+) -> None:
+    calls: list[str] = []
+
+    class Session:
+        @staticmethod
+        def get(*_args, **_kwargs):
+            calls.append("http")
+            raise AssertionError("unsafe URL reached HTTP")
+
+    with pytest.raises(SafetyError):
+        app._download_runninghub_output(
+            url,
+            tmp_path / "output.png",
+            session=Session(),
+        )
+
+    assert calls == []
+
+
+def test_production_downloader_rejects_redirect_to_private_address(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Response:
+        status_code = 302
+        headers = {"Location": "https://127.0.0.1/private.png"}
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    class Session:
+        @staticmethod
+        def get(url, **kwargs):
+            calls.append({"url": url, **kwargs})
+            return Response()
+
+    def public_resolver(*_args, **_kwargs):
+        return [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+    with pytest.raises(SafetyError):
+        app._download_runninghub_output(
+            "https://cdn.xiaoyaoyou.com/output.png",
+            tmp_path / "output.png",
+            session=Session(),
+            resolver=public_resolver,
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["allow_redirects"] is False
+
+
+def test_production_downloader_rejects_private_dns_before_http(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    class Session:
+        @staticmethod
+        def get(*_args, **_kwargs):
+            calls.append("http")
+            raise AssertionError("private DNS result reached HTTP")
+
+    def private_resolver(*_args, **_kwargs):
+        return [(2, 1, 6, "", ("10.0.0.7", 443))]
+
+    with pytest.raises(SafetyError, match="non-public"):
+        app._download_runninghub_output(
+            "https://cdn.xiaoyaoyou.com/output.png",
+            tmp_path / "output.png",
+            session=Session(),
+            resolver=private_resolver,
+        )
+
+    assert calls == []
+
+
+def test_production_downloader_follows_safe_redirect_without_credentials(
+    tmp_path: Path,
+) -> None:
+    content = b"safe cdn bytes"
+    calls: list[dict[str, object]] = []
+
+    class Cookies:
+        clears = 0
+
+        def clear(self) -> None:
+            self.clears += 1
+
+    class Response:
+        def __init__(self, status_code, headers, chunks=()):
+            self.status_code = status_code
+            self.headers = headers
+            self._chunks = chunks
+
+        def iter_content(self, *, chunk_size):
+            assert chunk_size > 0
+            return iter(self._chunks)
+
+        def close(self) -> None:
+            return None
+
+    responses = [
+        Response(
+            302,
+            {"Location": "https://assets.runninghub.ai/final.png"},
+        ),
+        Response(200, {"Content-Length": str(len(content))}, (content,)),
+    ]
+
+    class Session:
+        trust_env = True
+        auth = ("user", "secret")
+        cookies = Cookies()
+        headers = {
+            "Authorization": "Bearer session-secret",
+            "Cookie": "session=session-secret",
+            "X-API-Key": "session-secret",
+        }
+
+        def get(self, url, **kwargs):
+            effective_headers = {**self.headers, **kwargs["headers"]}
+            calls.append(
+                {
+                    "url": url,
+                    "auth": self.auth,
+                    **kwargs,
+                    "headers": effective_headers,
+                }
+            )
+            return responses.pop(0)
+
+    def public_resolver(*_args, **_kwargs):
+        return [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+    target = app._download_runninghub_output(
+        "https://cdn.xiaoyaoyou.com/output.png",
+        tmp_path / "output.png",
+        session=Session(),
+        resolver=public_resolver,
+    )
+
+    assert target.read_bytes() == content
+    assert [item["url"] for item in calls] == [
+        "https://cdn.xiaoyaoyou.com/output.png",
+        "https://assets.runninghub.ai/final.png",
+    ]
+    assert all(item["auth"] is None for item in calls)
+    assert all(
+        not {"Authorization", "Cookie", "X-API-Key"}
+        & set(item["headers"])
+        for item in calls
+    )
+    assert all(item["allow_redirects"] is False for item in calls)
+    assert Session.cookies.clears >= 2
+
+
+@pytest.mark.parametrize("mode", ["header", "stream"])
+def test_production_downloader_enforces_maximum_stream_bytes(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    class Response:
+        status_code = 200
+        headers = {"Content-Length": "5"} if mode == "header" else {}
+
+        @staticmethod
+        def iter_content(*, chunk_size):
+            assert chunk_size > 0
+            return iter((b"123", b"45"))
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    class Session:
+        @staticmethod
+        def get(_url, **_kwargs):
+            return Response()
+
+    def public_resolver(*_args, **_kwargs):
+        return [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+    target = tmp_path / "output.png"
+    with pytest.raises(SafetyError, match="byte limit"):
+        app._download_runninghub_output(
+            "https://cdn.xiaoyaoyou.com/output.png",
+            target,
+            session=Session(),
+            resolver=public_resolver,
+            max_bytes=4,
+        )
+
+    assert not target.exists() or target.stat().st_size <= 4
 
 
 @pytest.mark.parametrize(

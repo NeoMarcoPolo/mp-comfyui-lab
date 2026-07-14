@@ -56,6 +56,7 @@ def sample_variant() -> MaterializedVariant:
         capability_hash="b" * 64,
         expected_output_count=1,
         expected_output_node_ids=("9",),
+        expected_media_types=("image/png",),
     )
 
 

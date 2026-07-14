@@ -133,6 +133,31 @@ def _sanitize_diagnostic_json(value: Any) -> Any:
     return value
 
 
+def _validate_output_expectations(
+    expected_output_count: int,
+    node_ids: tuple[str, ...],
+    media_types: tuple[str, ...],
+    *,
+    required: bool,
+) -> None:
+    if not node_ids and not media_types:
+        if required:
+            raise ValueError("output node/media expectations are required")
+        return
+    if len(node_ids) != len(media_types):
+        raise ValueError("output node IDs and media types must be aligned")
+    if not node_ids:
+        raise ValueError("output node/media expectations must not be empty")
+    if any(not value.strip() for value in (*node_ids, *media_types)):
+        raise ValueError("output node/media expectations must not be blank")
+    if len(set(node_ids)) != len(node_ids):
+        raise ValueError("output node IDs must be unique")
+    if expected_output_count % len(node_ids) != 0:
+        raise ValueError(
+            "expected output count must be divisible by output expectation pairs"
+        )
+
+
 class ResolvedFixture(_FrozenModel):
     uri: NonBlankStr
     path: Path
@@ -176,6 +201,16 @@ class MaterializedVariant(_FrozenModel):
         if any(not node_id.strip() for node_id in graph):
             raise ValueError("graph node IDs must not be blank")
         return graph
+
+    @model_validator(mode="after")
+    def validate_output_expectations(self) -> MaterializedVariant:
+        _validate_output_expectations(
+            self.expected_output_count,
+            self.expected_output_node_ids,
+            self.expected_media_types,
+            required=False,
+        )
+        return self
 
 
 class OutputRecord(_FrozenModel):
@@ -241,6 +276,12 @@ class RunRecord(_FrozenModel):
 
     @model_validator(mode="after")
     def validate_provider_task_id(self) -> RunRecord:
+        _validate_output_expectations(
+            self.expected_output_count,
+            self.expected_output_node_ids,
+            self.expected_media_types,
+            required=False,
+        )
         task_id_required_states = {
             RunState.SUBMITTED,
             RunState.RUNNING,
@@ -796,6 +837,16 @@ class PlannedVariant(_FrozenModel):
     @classmethod
     def json_arrays(cls, value: Any) -> Any:
         return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_output_expectations(self) -> PlannedVariant:
+        _validate_output_expectations(
+            self.expected_output_count,
+            self.output_node_ids,
+            self.expected_media_types,
+            required=True,
+        )
+        return self
 
 
 class ExperimentPlan(_FrozenModel):

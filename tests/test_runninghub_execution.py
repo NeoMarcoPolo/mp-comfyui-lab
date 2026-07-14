@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import requests
 from mp_comfyui_lab.executors.base import (
     AmbiguousSubmissionError,
     ExecutorError,
+    ProviderSchemaError,
     ProviderTaskState,
 )
 from mp_comfyui_lab.executors.runninghub import (
@@ -71,6 +73,135 @@ def _fixtures(tmp_path: Path) -> ResolvedFixtures:
             ),
         )
     )
+
+
+@pytest.mark.parametrize("failure", ["timeout", "transient-status"])
+def test_create_task_once_never_retries_ambiguous_transmission(
+    failure: str,
+) -> None:
+    runninghub_module = importlib.import_module(
+        "mp_comfyui_lab.executors.runninghub"
+    )
+    create_once = getattr(runninghub_module, "create_task_once", None)
+    assert callable(create_once), "adapter must own a single-attempt create primitive"
+    calls: list[dict[str, object]] = []
+
+    class Response:
+        status_code = 503
+
+        @staticmethod
+        def json():
+            return {"code": 503, "msg": "temporarily unavailable", "data": None}
+
+    class Session:
+        @staticmethod
+        def post(url, **kwargs):
+            calls.append({"url": url, **kwargs})
+            if failure == "timeout":
+                raise requests.Timeout("response lost after transmission")
+            return Response()
+
+    with pytest.raises(AmbiguousSubmissionError):
+        create_once(
+            api_key=None,
+            workflow_id="workflow-1",
+            node_info_list=[],
+            workflow='{"1": {}}',
+            instance_type="plus",
+            credential_loader=lambda: SimpleNamespace(apiKey="secret"),
+            session=Session(),
+        )
+
+    assert len(calls) == 1
+
+
+def test_create_task_once_uses_exact_payload_and_one_post() -> None:
+    runninghub_module = importlib.import_module(
+        "mp_comfyui_lab.executors.runninghub"
+    )
+    calls: list[dict[str, object]] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "code": 0,
+                "msg": "success",
+                "data": {"taskId": "provider-task-1", "taskStatus": "QUEUED"},
+            }
+
+    class Session:
+        @staticmethod
+        def post(url, **kwargs):
+            calls.append({"url": url, **kwargs})
+            return Response()
+
+    node = NodeInfo(nodeId="1", fieldName="image", fieldValue="uploaded.png")
+    result = runninghub_module.create_task_once(
+        api_key=None,
+        workflow_id="workflow-1",
+        node_info_list=[node],
+        workflow='{"1": {}}',
+        instance_type="plus",
+        credential_loader=lambda: SimpleNamespace(apiKey="secret"),
+        session=Session(),
+    )
+
+    assert result.taskId == "provider-task-1"
+    assert calls == [
+        {
+            "url": runninghub_module.CREATE_TASK_ENDPOINT,
+            "json": {
+                "workflowId": "workflow-1",
+                "addMetadata": True,
+                "usePersonalQueue": False,
+                "apiKey": "secret",
+                "nodeInfoList": [
+                    {
+                        "nodeId": "1",
+                        "fieldName": "image",
+                        "fieldValue": "uploaded.png",
+                    }
+                ],
+                "workflow": '{"1": {}}',
+                "instanceType": "plus",
+            },
+            "timeout": 60,
+            "allow_redirects": False,
+        }
+    ]
+
+
+def test_create_task_once_treats_explicit_business_rejection_as_confirmed() -> None:
+    runninghub_module = importlib.import_module(
+        "mp_comfyui_lab.executors.runninghub"
+    )
+    calls: list[str] = []
+
+    class Response:
+        status_code = 400
+
+        @staticmethod
+        def json():
+            return {"code": 400, "msg": "invalid parameter", "data": None}
+
+    class Session:
+        @staticmethod
+        def post(url, **_kwargs):
+            calls.append(url)
+            return Response()
+
+    with pytest.raises(ExecutorError) as raised:
+        runninghub_module.create_task_once(
+            api_key="secret",
+            workflow_id="workflow-1",
+            session=Session(),
+        )
+
+    assert not isinstance(raised.value, AmbiguousSubmissionError)
+    assert calls == [runninghub_module.CREATE_TASK_ENDPOINT]
 
 
 def test_construction_and_validation_do_not_touch_credentials_or_paid_calls(
@@ -158,6 +289,33 @@ def test_submit_uploads_and_uses_exact_create_task_shape(tmp_path: Path) -> None
     materialized = json.loads(captured_create["workflow"])
     assert materialized["1"]["inputs"]["image"] == "uploaded-portrait.png"
     assert "fixture://0" not in captured_create["workflow"]
+
+
+@pytest.mark.parametrize("task_status", ["", 7, "FUTURE_PROVIDER_STATE"])
+def test_submit_keeps_valid_task_id_when_optional_status_is_malformed(
+    tmp_path: Path,
+    task_status: object,
+) -> None:
+    executor = RunningHubExecutor(
+        credential_loader=lambda: SimpleNamespace(apiKey="secret"),
+        upload_call=lambda **_kwargs: "uploaded.png",
+        create_task_call=lambda **_kwargs: SimpleNamespace(
+            taskId="provider-task-1",
+            taskStatus=task_status,
+        ),
+        status_call=lambda **_kwargs: None,
+        info_call=lambda **_kwargs: None,
+        outputs_call=lambda **_kwargs: None,
+    )
+
+    receipt = executor.submit(_variant(), _fixtures(tmp_path))
+
+    assert receipt.provider_task_id == "provider-task-1"
+    assert receipt.provider_state is None
+    metadata = receipt.model_dump(mode="json")["provider_metadata"]
+    assert metadata == {
+        "warning": "RunningHub create returned an unrecognized optional task status"
+    }
 
 
 def test_submit_binds_snapshot_bytes_before_injected_upload_can_mutate_path(
@@ -416,6 +574,7 @@ def test_collect_outputs_preserves_provider_order_and_maps_media() -> None:
         status_call=lambda **_kwargs: None,
         info_call=lambda **_kwargs: None,
         outputs_call=outputs_call,
+        output_host_suffixes=("cdn.example",),
     )
 
     outputs = executor.collect_outputs("provider-task-1")
@@ -432,6 +591,68 @@ def test_collect_outputs_preserves_provider_order_and_maps_media() -> None:
             {"api_key": None, "task_id": "provider-task-1"},
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://cdn.xiaoyaoyou.com/output.png",
+        "https://user:pass@cdn.xiaoyaoyou.com/output.png",
+        "https://127.0.0.1/output.png",
+        "https://[::1]/output.png",
+        "https://runninghub.ai.evil.example/output.png",
+        "https://runninghub.ai%2eevil.example/output.png",
+        "https://2130706433/output.png",
+    ],
+)
+def test_collect_outputs_rejects_urls_outside_provider_host_policy(
+    url: str,
+) -> None:
+    executor = RunningHubExecutor(
+        credential_loader=lambda: SimpleNamespace(apiKey="secret"),
+        upload_call=lambda **_kwargs: None,
+        create_task_call=lambda **_kwargs: None,
+        status_call=lambda **_kwargs: None,
+        info_call=lambda **_kwargs: None,
+        outputs_call=lambda **_kwargs: [
+            SimpleNamespace(
+                fileUrl=url,
+                fileType="image/png",
+                nodeId="9",
+            )
+        ],
+    )
+
+    with pytest.raises(ProviderSchemaError, match="output URL"):
+        executor.collect_outputs("provider-task-1")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://runninghub.ai/output.png",
+        "https://cdn.runninghub.ai/output.png",
+        "https://xiaoyaoyou.com/output.png",
+        "https://assets.xiaoyaoyou.com/output.png",
+    ],
+)
+def test_collect_outputs_accepts_default_provider_hosts(url: str) -> None:
+    executor = RunningHubExecutor(
+        credential_loader=lambda: SimpleNamespace(apiKey="secret"),
+        upload_call=lambda **_kwargs: None,
+        create_task_call=lambda **_kwargs: None,
+        status_call=lambda **_kwargs: None,
+        info_call=lambda **_kwargs: None,
+        outputs_call=lambda **_kwargs: [
+            SimpleNamespace(
+                fileUrl=url,
+                fileType="image/png",
+                nodeId="9",
+            )
+        ],
+    )
+
+    assert executor.collect_outputs("provider-task-1")[0].url == url
 
 
 def test_cancel_is_structured_unsupported_without_provider_call() -> None:

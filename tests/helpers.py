@@ -1,4 +1,9 @@
 from collections.abc import Iterable, Mapping
+from functools import lru_cache
+from io import BytesIO
+import zipfile
+
+from PIL import Image
 
 from mp_comfyui_lab.executors.base import (
     AmbiguousSubmissionError,
@@ -16,6 +21,44 @@ from mp_comfyui_lab.executors.base import (
     WorkflowRef,
 )
 from mp_comfyui_lab.experiments.models import MaterializedVariant, ResolvedFixtures
+
+
+@lru_cache(maxsize=None)
+def valid_media_bytes(media_type: str) -> bytes:
+    if media_type in {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+    }:
+        formats = {
+            "image/png": "PNG",
+            "image/jpeg": "JPEG",
+            "image/webp": "WEBP",
+            "image/gif": "GIF",
+        }
+        output = BytesIO()
+        Image.new("RGB", (1, 1), color=(12, 34, 56)).save(
+            output,
+            format=formats[media_type],
+        )
+        return output.getvalue()
+    if media_type == "video/mp4":
+        return b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42"
+    if media_type == "video/webm":
+        return b"\x1aE\xdf\xa3\x87B\x82\x84webm"
+    if media_type == "audio/mpeg":
+        return b"ID3\x04\x00\x00\x00\x00\x00\x00"
+    if media_type == "audio/wav":
+        return b"RIFF\x04\x00\x00\x00WAVE"
+    if media_type == "audio/ogg":
+        return b"OggS\x00" + (b"\x00" * 21) + b"\x00"
+    if media_type == "application/zip":
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("result.txt", b"ok")
+        return output.getvalue()
+    raise ValueError(f"unsupported test media type: {media_type}")
 
 
 class FakeExecutor(Executor):

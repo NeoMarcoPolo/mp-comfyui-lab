@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 import hashlib
@@ -10,7 +11,10 @@ import stat
 import tempfile
 from typing import Any
 import uuid
+import warnings
+import zipfile
 
+from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 import requests
 
@@ -45,6 +49,7 @@ from .store import ExperimentStore
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _RETRY_DELAYS = (1, 2, 4)
 _POLL_INTERVAL_SECONDS = 1
+MAX_OUTPUT_BYTES = 512 * 1024 * 1024
 _OUTPUT_EXTENSIONS = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -83,6 +88,7 @@ class ExperimentEngine:
         downloader: Callable[[str, Path], Any],
         sleep: Callable[[float], None],
         now: Callable[[], datetime] | None = None,
+        max_output_bytes: int = MAX_OUTPUT_BYTES,
     ) -> None:
         self._config = config
         self._store = ExperimentStore(config.experiments_root)
@@ -90,6 +96,13 @@ class ExperimentEngine:
         self._downloader = downloader
         self._sleep = sleep
         self._now = now or (lambda: datetime.now(UTC))
+        if (
+            isinstance(max_output_bytes, bool)
+            or not isinstance(max_output_bytes, int)
+            or max_output_bytes <= 0
+        ):
+            raise ValueError("max_output_bytes must be a positive integer")
+        self._max_output_bytes = max_output_bytes
 
     def run(
         self,
@@ -588,17 +601,7 @@ class ExperimentEngine:
             try:
                 return function(), record
             except Exception as error:
-                if not isinstance(
-                    error,
-                    (
-                        TimeoutError,
-                        ConnectionError,
-                        OSError,
-                        requests.RequestException,
-                        TransientExecutorError,
-                        TransientOperationError,
-                    ),
-                ):
+                if not self._is_transient(error):
                     raise
                 observed_at = self._now()
                 values = record.model_dump(mode="python")
@@ -621,6 +624,70 @@ class ExperimentEngine:
                 self._sleep(_RETRY_DELAYS[attempt])
         raise AssertionError("retry loop did not terminate")
 
+    @staticmethod
+    def _is_transient(error: BaseException) -> bool:
+        return isinstance(
+            error,
+            (
+                TimeoutError,
+                ConnectionError,
+                OSError,
+                requests.RequestException,
+                TransientExecutorError,
+                TransientOperationError,
+            ),
+        )
+
+    def _collect_output_batch(
+        self,
+        record: RunRecord,
+        executor: Any,
+        task_id: str,
+    ) -> tuple[tuple[Any, ...], RunRecord]:
+        latest: tuple[Any, ...] = ()
+        observed_batch = False
+        for attempt in range(len(_RETRY_DELAYS) + 1):
+            try:
+                latest = tuple(executor.collect_outputs(task_id))
+            except Exception as error:
+                if not self._is_transient(error):
+                    raise
+                diagnostic = {
+                    "kind": "transient_error",
+                    "operation": "collect_outputs",
+                    "attempt": attempt + 1,
+                    "diagnostic": sanitize_untrusted_diagnostic(str(error)),
+                }
+                exhausted = attempt == len(_RETRY_DELAYS)
+            else:
+                observed_batch = True
+                if len(latest) >= record.expected_output_count:
+                    return latest, record
+                diagnostic = {
+                    "kind": "incomplete_output_batch",
+                    "operation": "collect_outputs",
+                    "attempt": attempt + 1,
+                    "observed_output_count": len(latest),
+                    "expected_output_count": record.expected_output_count,
+                }
+                exhausted = attempt == len(_RETRY_DELAYS)
+
+            observed_at = self._now()
+            values = record.model_dump(mode="python")
+            values["diagnostics"] = (
+                *record.diagnostics,
+                sanitize_for_persistence(diagnostic),
+            )
+            values["updated_at"] = observed_at
+            record = RunRecord.model_validate(values)
+            self._persist(record)
+            if exhausted:
+                if diagnostic["kind"] == "transient_error" and not observed_batch:
+                    raise _RetryExhausted(record, "collect_outputs")
+                return latest, record
+            self._sleep(_RETRY_DELAYS[attempt])
+        raise AssertionError("collection retry loop did not terminate")
+
     def _retry_incomplete(self, error: _RetryExhausted) -> RunRecord:
         completed_at = self._now()
         record = error.record.transition(
@@ -641,10 +708,10 @@ class ExperimentEngine:
         if task_id is None:
             raise SafetyError("output collection requires a provider task ID")
         try:
-            provider_outputs, record = self._retry_idempotent(
+            provider_outputs, record = self._collect_output_batch(
                 record,
-                "collect_outputs",
-                lambda: executor.collect_outputs(task_id),
+                executor,
+                task_id,
             )
         except _RetryExhausted as error:
             return self._retry_incomplete(error)
@@ -662,6 +729,25 @@ class ExperimentEngine:
                 updated_at=completed_at,
             )
             return self._persist(record)
+        try:
+            provider_outputs = self._ordered_provider_outputs(
+                record,
+                provider_outputs,
+            )
+        except SafetyError as error:
+            completed_at = self._now()
+            record = record.transition(
+                RunState.INCOMPLETE,
+                error=sanitize_for_persistence(
+                    {
+                        "kind": "malformed_output",
+                        "diagnostic": sanitize_untrusted_diagnostic(str(error)),
+                    }
+                ),
+                completed_at=completed_at,
+                updated_at=completed_at,
+            )
+            return self._persist(record)
         reset_at = self._now()
         reset_values = record.model_dump(mode="python")
         reset_values["outputs"] = ()
@@ -669,6 +755,9 @@ class ExperimentEngine:
         reset_values["updated_at"] = reset_at
         record = RunRecord.model_validate(reset_values)
         self._persist(record)
+        allow_pair_overflow = (
+            len(provider_outputs) > record.expected_output_count
+        )
         for ordinal, output in enumerate(provider_outputs):
             try:
                 durable, record = self._retry_idempotent(
@@ -678,6 +767,7 @@ class ExperimentEngine:
                         record,
                         output,
                         ordinal,
+                        allow_pair_overflow=allow_pair_overflow,
                     ),
                 )
             except _RetryExhausted as error:
@@ -725,6 +815,32 @@ class ExperimentEngine:
                 updated_at=completed_at,
             )
             return self._persist(record)
+        expected_pairs = Counter(
+            {
+                pair: record.expected_output_count
+                // len(record.expected_output_node_ids)
+                for pair in zip(
+                    record.expected_output_node_ids,
+                    record.expected_media_types,
+                    strict=True,
+                )
+            }
+        )
+        actual_pairs = Counter(
+            (item.node_id, item.media_type) for item in record.outputs
+        )
+        if actual_pairs != expected_pairs:
+            record = record.transition(
+                RunState.INCOMPLETE,
+                error=sanitize_for_persistence(
+                    {"kind": "malformed_output", "diagnostic": (
+                        "provider output node/media cardinality does not match approval"
+                    )}
+                ),
+                completed_at=completed_at,
+                updated_at=completed_at,
+            )
+            return self._persist(record)
         record = record.transition(
             RunState.SUCCESS,
             completed_at=completed_at,
@@ -732,23 +848,60 @@ class ExperimentEngine:
         )
         return self._persist(record)
 
+    @staticmethod
+    def _ordered_provider_outputs(
+        record: RunRecord,
+        provider_outputs: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        ordered = tuple(
+            sorted(provider_outputs, key=lambda item: item.provider_order)
+        )
+        orders = [item.provider_order for item in ordered]
+        if orders != list(range(len(ordered))):
+            raise SafetyError(
+                "provider output order must be unique and contiguous from zero"
+            )
+        if not record.expected_output_node_ids:
+            raise SafetyError("approved output node/media pairs are missing")
+        return ordered
+
     def _download_output(
         self,
         record: RunRecord,
         output: Any,
         ordinal: int,
+        *,
+        allow_pair_overflow: bool,
     ) -> OutputRecord:
-        if output.node_id is None or output.node_id not in record.expected_output_node_ids:
+        if output.node_id is None:
             raise SafetyError("provider output node does not match approved expectation")
         node_id = safe_filename(output.node_id)
         media_type = output.media_type
         if not isinstance(media_type, str) or media_type not in _OUTPUT_EXTENSIONS:
             raise SafetyError("provider output media type is unsupported")
-        if (
-            record.expected_media_types
-            and media_type not in record.expected_media_types
+        if (node_id, media_type) not in set(
+            zip(
+                record.expected_output_node_ids,
+                record.expected_media_types,
+                strict=True,
+            )
         ):
-            raise SafetyError("provider output media type does not match approval")
+            raise SafetyError(
+                "provider output node/media pair does not match approval"
+            )
+        if not allow_pair_overflow:
+            multiplicity = (
+                record.expected_output_count
+                // len(record.expected_output_node_ids)
+            )
+            existing_pair_count = sum(
+                item.node_id == node_id and item.media_type == media_type
+                for item in record.outputs
+            )
+            if existing_pair_count >= multiplicity:
+                raise SafetyError(
+                    "provider output node/media pair exceeds approved cardinality"
+                )
         extension = _OUTPUT_EXTENSIONS[media_type]
         relative_path = Path(
             "outputs",
@@ -759,22 +912,136 @@ class ExperimentEngine:
             temporary_target = Path(directory) / f"output.{extension}"
             returned = self._downloader(output.url, temporary_target)
             downloaded_path = returned if isinstance(returned, Path) else temporary_target
-            try:
-                content = downloaded_path.read_bytes()
-            except OSError as error:
-                raise SafetyError("output downloader did not produce a readable file") from error
-        self._store.write_bytes_new(
-            record.experiment_id,
-            relative_path,
-            content,
-            reuse_matching=True,
-        )
+            self._verify_downloaded_media(downloaded_path, media_type)
+            _, content_sha256, size = self._store.publish_file_new(
+                record.experiment_id,
+                relative_path,
+                downloaded_path,
+                max_bytes=self._max_output_bytes,
+                reuse_matching=True,
+            )
         return OutputRecord(
             ordinal=ordinal,
             provider_order=output.provider_order,
             node_id=node_id,
             media_type=media_type,
             local_relative_path=relative_path.as_posix(),
-            content_sha256=hashlib.sha256(content).hexdigest(),
-            size=len(content),
+            content_sha256=content_sha256,
+            size=size,
+        )
+
+    def _verify_downloaded_media(self, path: Path, media_type: str) -> None:
+        try:
+            file_stat = path.lstat()
+        except OSError as error:
+            raise SafetyError(
+                "output downloader did not produce a readable file"
+            ) from error
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise SafetyError("downloaded output is not a regular file")
+        if file_stat.st_size == 0:
+            raise SafetyError("downloaded output is empty")
+        if file_stat.st_size > self._max_output_bytes:
+            raise SafetyError("downloaded output exceeds byte limit")
+
+        image_formats = {
+            "image/png": "PNG",
+            "image/jpeg": "JPEG",
+            "image/webp": "WEBP",
+            "image/gif": "GIF",
+        }
+        if media_type in image_formats:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    with Image.open(path) as image:
+                        if image.format != image_formats[media_type]:
+                            raise SafetyError(
+                                "downloaded image format does not match media type"
+                            )
+                        image.verify()
+            except SafetyError:
+                raise
+            except (
+                Image.DecompressionBombError,
+                Image.DecompressionBombWarning,
+                UnidentifiedImageError,
+                OSError,
+                SyntaxError,
+                ValueError,
+            ) as error:
+                raise SafetyError("downloaded image failed verification") from error
+            return
+
+        try:
+            with path.open("rb") as source:
+                prefix = source.read(65_536)
+        except OSError as error:
+            raise SafetyError("downloaded output cannot be inspected") from error
+        if media_type == "video/mp4":
+            box_size = int.from_bytes(prefix[:4], "big") if len(prefix) >= 4 else 0
+            valid = (
+                len(prefix) >= 16
+                and prefix[4:8] == b"ftyp"
+                and 16 <= box_size <= file_stat.st_size
+                and prefix[8:12] != b"\x00\x00\x00\x00"
+            )
+        elif media_type == "video/webm":
+            valid = prefix.startswith(b"\x1aE\xdf\xa3") and b"webm" in prefix
+        elif media_type == "audio/mpeg":
+            valid = self._valid_mp3(prefix, file_stat.st_size)
+        elif media_type == "audio/wav":
+            valid = (
+                len(prefix) >= 12
+                and prefix[:4] == b"RIFF"
+                and prefix[8:12] == b"WAVE"
+                and int.from_bytes(prefix[4:8], "little") + 8
+                <= file_stat.st_size
+            )
+        elif media_type == "audio/ogg":
+            segment_count = prefix[26] if len(prefix) >= 27 else 0
+            header_size = 27 + segment_count
+            payload_size = (
+                sum(prefix[27:header_size])
+                if len(prefix) >= header_size
+                else file_stat.st_size + 1
+            )
+            valid = (
+                len(prefix) >= header_size
+                and prefix[:4] == b"OggS"
+                and prefix[4] == 0
+                and header_size + payload_size <= file_stat.st_size
+            )
+        elif media_type == "application/zip":
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    valid = archive.testzip() is None
+            except (OSError, zipfile.BadZipFile, RuntimeError):
+                valid = False
+        else:
+            valid = False
+        if not valid:
+            raise SafetyError(
+                "downloaded output signature does not match media type"
+            )
+
+    @staticmethod
+    def _valid_mp3(prefix: bytes, size: int) -> bool:
+        if prefix.startswith(b"ID3") and len(prefix) >= 10:
+            encoded_size = prefix[6:10]
+            if any(value >= 128 for value in encoded_size):
+                return False
+            tag_size = (
+                (encoded_size[0] << 21)
+                | (encoded_size[1] << 14)
+                | (encoded_size[2] << 7)
+                | encoded_size[3]
+            )
+            return 10 + tag_size <= size
+        return (
+            len(prefix) >= 4
+            and prefix[0] == 0xFF
+            and prefix[1] & 0xE0 == 0xE0
+            and prefix[1] & 0x18 != 0x08
+            and prefix[2] & 0xF0 != 0xF0
         )

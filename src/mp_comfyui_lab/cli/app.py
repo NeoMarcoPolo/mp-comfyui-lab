@@ -1,12 +1,14 @@
 import argparse
 import yaml
+from ipaddress import ip_address
 from pathlib import Path
+import socket
 import sys
 import time
 from enum import IntEnum
 from typing import Any, NoReturn, Protocol, Sequence
+from urllib.parse import urljoin, urlsplit
 
-from mp_runninghub_api.download import download_file
 from mp_runninghub_api.errors import RunningHubApiError
 from pydantic import ValidationError
 import requests
@@ -34,9 +36,16 @@ from mp_comfyui_lab.executors.base import (
     TransientOperationError,
     WorkflowRef,
 )
-from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
+from mp_comfyui_lab.executors.runninghub import (
+    DEFAULT_OUTPUT_HOST_SUFFIXES,
+    RunningHubExecutor,
+)
 from mp_comfyui_lab.experiments.store import ExperimentStore
-from mp_comfyui_lab.experiments.engine import ApprovalError, ExperimentEngine
+from mp_comfyui_lab.experiments.engine import (
+    MAX_OUTPUT_BYTES,
+    ApprovalError,
+    ExperimentEngine,
+)
 from mp_comfyui_lab.experiments.models import (
     Candidate,
     DimensionName,
@@ -360,18 +369,212 @@ def _make_experiment_engine(
     )
 
 
-def _download_runninghub_output(url: str, target: Path) -> Path:
+def _download_runninghub_output(
+    url: str,
+    target: Path,
+    *,
+    session: Any | None = None,
+    resolver: Any = socket.getaddrinfo,
+    max_redirects: int = 3,
+    max_bytes: int = MAX_OUTPUT_BYTES,
+) -> Path:
     try:
-        return download_file(url, target)
-    except (
-        RunningHubApiError,
-        requests.RequestException,
-        TimeoutError,
-        ConnectionError,
-    ) as error:
+        return _download_runninghub_output_http(
+            url,
+            target,
+            session=session,
+            resolver=resolver,
+            max_redirects=max_redirects,
+            max_bytes=max_bytes,
+        )
+    except RunningHubApiError as error:
         raise TransientOperationError(
             "RunningHub output download transport failed"
         ) from error
+
+
+def _download_runninghub_output_http(
+    url: str,
+    target: Path,
+    *,
+    session: Any | None = None,
+    resolver: Any = socket.getaddrinfo,
+    max_redirects: int = 3,
+    max_bytes: int = MAX_OUTPUT_BYTES,
+) -> Path:
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    request_session = requests.Session() if session is None else session
+    if hasattr(request_session, "trust_env"):
+        request_session.trust_env = False
+    current_url = url
+    redirects = 0
+    while True:
+        _validate_runninghub_download_url(
+            current_url,
+            resolver=resolver,
+        )
+        if hasattr(request_session, "auth"):
+            request_session.auth = None
+        cookies = getattr(request_session, "cookies", None)
+        if cookies is not None and hasattr(cookies, "clear"):
+            cookies.clear()
+        session_headers = getattr(request_session, "headers", None)
+        if session_headers is not None:
+            for header_name in tuple(session_headers):
+                normalized_header = str(header_name).casefold().replace("-", "")
+                if normalized_header in {
+                    "authorization",
+                    "proxyauthorization",
+                    "cookie",
+                    "apikey",
+                    "xapikey",
+                    "xauthtoken",
+                    "accesstoken",
+                }:
+                    session_headers.pop(header_name, None)
+        try:
+            response = request_session.get(
+                current_url,
+                allow_redirects=False,
+                stream=True,
+                timeout=(10, 60),
+                headers={"Accept": "*/*"},
+            )
+        except (
+            requests.RequestException,
+            TimeoutError,
+            ConnectionError,
+        ) as error:
+            raise TransientOperationError(
+                "RunningHub output download transport failed"
+            ) from error
+
+        if response.status_code in {301, 302, 303, 307, 308}:
+            location = response.headers.get("Location")
+            response.close()
+            if not isinstance(location, str) or not location.strip():
+                raise SafetyError("RunningHub output redirect is missing Location")
+            if redirects >= max_redirects:
+                raise SafetyError("RunningHub output redirect limit exceeded")
+            current_url = urljoin(current_url, location)
+            redirects += 1
+            continue
+        if response.status_code != 200:
+            status_code = response.status_code
+            response.close()
+            if status_code >= 500 or status_code == 429:
+                raise TransientOperationError(
+                    "RunningHub output download transport failed"
+                )
+            raise SafetyError("RunningHub output download was rejected")
+
+        declared_size = response.headers.get("Content-Length")
+        if declared_size is not None:
+            if (
+                not isinstance(declared_size, str)
+                or not declared_size.isdecimal()
+            ):
+                response.close()
+                raise SafetyError("RunningHub output Content-Length is invalid")
+            if int(declared_size) > max_bytes:
+                response.close()
+                raise SafetyError("RunningHub output exceeds byte limit")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        total = 0
+        try:
+            with target.open("wb") as output_file:
+                for chunk in response.iter_content(chunk_size=65_536):
+                    if chunk:
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise SafetyError(
+                                "RunningHub output exceeds byte limit"
+                            )
+                        output_file.write(chunk)
+            if total == 0:
+                raise SafetyError("RunningHub output is empty")
+        except SafetyError:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        except requests.RequestException as error:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            raise TransientOperationError(
+                "RunningHub output download transport failed"
+            ) from error
+        except OSError as error:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            raise SafetyError("RunningHub output could not be written safely") from error
+        finally:
+            response.close()
+        return target
+
+
+def _validate_runninghub_download_url(
+    url: str,
+    *,
+    resolver: Any = socket.getaddrinfo,
+    resolve_dns: bool = True,
+) -> None:
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, UnicodeError, ValueError):
+        raise SafetyError("RunningHub output URL is invalid") from None
+    if (
+        parsed.scheme.casefold() != "https"
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or "%" in hostname
+        or "\\" in url
+    ):
+        raise SafetyError("RunningHub output URL is not allowed")
+    try:
+        normalized = hostname.encode("idna").decode("ascii").casefold().rstrip(".")
+    except UnicodeError:
+        raise SafetyError("RunningHub output URL hostname is invalid") from None
+    if normalized.isdecimal() or not any(
+        normalized == suffix or normalized.endswith(f".{suffix}")
+        for suffix in DEFAULT_OUTPUT_HOST_SUFFIXES
+    ):
+        raise SafetyError("RunningHub output URL hostname is not provider-approved")
+    try:
+        literal = ip_address(normalized)
+    except ValueError:
+        literal = None
+    if literal is not None and not literal.is_global:
+        raise SafetyError("RunningHub output URL resolves to a non-public address")
+    if not resolve_dns:
+        return
+    try:
+        addresses = resolver(
+            normalized,
+            port or 443,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as error:
+        raise SafetyError("RunningHub output hostname could not be resolved") from error
+    if not addresses:
+        raise SafetyError("RunningHub output hostname has no addresses")
+    for address in addresses:
+        try:
+            resolved = ip_address(address[4][0])
+        except (IndexError, ValueError):
+            raise SafetyError("RunningHub output hostname resolution is invalid") from None
+        if not resolved.is_global:
+            raise SafetyError("RunningHub output URL resolves to a non-public address")
 
 
 def _run_payload(record: RunRecord) -> dict[str, Any]:
