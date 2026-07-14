@@ -37,7 +37,7 @@ from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.json_types import thaw_json
-from mp_comfyui_lab.mutations import SemanticPatch, SetRoleInput
+from mp_comfyui_lab.mutations import compile_observed_candidates
 from mp_comfyui_lab.security import (
     SafetyError,
     sanitize_for_persistence,
@@ -143,11 +143,12 @@ class ReadOnlyPlanningBundleLoader:
         baseline = next((item for item in sources if item.workflow_id == first_url_id), None)
         if baseline is None:
             baseline = min(sources, key=lambda item: (-item.engagement, item.source_hash, item.workflow_id))
-        candidates = self._compile_candidates(brief, baseline, sources)
+        compilation = compile_observed_candidates(brief, baseline, sources)
         return SourceBundle(
             sources=sources,
             baseline_workflow_id=first_url_id,
-            candidates=candidates,
+            candidates=compilation.candidates,
+            compiler_warnings=compilation.warnings,
             evidence_graph=build_evidence_graph(
                 tuple(record[1] for record in records),
                 prior_experiment_roots=(),

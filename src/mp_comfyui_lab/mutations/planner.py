@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 import json
 from typing import TYPE_CHECKING
 
@@ -16,14 +17,8 @@ from mp_comfyui_lab.mutations.models import (
     SetNodeInput,
     SetRoleInput,
 )
+from mp_comfyui_lab.experiments.models import Candidate, DimensionName, ExperimentBrief, PlanningSource
 
-if TYPE_CHECKING:
-    from mp_comfyui_lab.experiments.models import (
-        Candidate,
-        DimensionName,
-        ExperimentBrief,
-        PlanningSource,
-    )
 
 
 _CONFIDENCE_ORDER = {
@@ -59,6 +54,49 @@ _ROLE_DIMENSIONS = {
 class CandidateSelection:
     candidates: tuple[Candidate, ...]
     warnings: tuple[str, ...]
+
+
+def compile_observed_candidates(
+    brief: ExperimentBrief,
+    baseline: PlanningSource,
+    sources: tuple[PlanningSource, ...],
+) -> CandidateSelection:
+    roles = {
+        DimensionName.CHECKPOINT: SemanticRole.CHECKPOINT,
+        DimensionName.SAMPLER: SemanticRole.SAMPLER,
+        DimensionName.SCHEDULER: SemanticRole.SCHEDULER,
+        DimensionName.ENCODER: SemanticRole.ENCODER,
+        DimensionName.PROMPT_GRAMMAR: SemanticRole.PROMPT_SOURCE,
+    }
+    candidates: list[Candidate] = []
+    warnings: list[str] = []
+    for donor in sources:
+        if donor.workflow_id == baseline.workflow_id:
+            continue
+        for dimension, role in roles.items():
+            if brief.policy_for(dimension).value != "approved":
+                continue
+            left = baseline.normalized_graph.bindings(role)
+            right = donor.normalized_graph.bindings(role)
+            if len(left) != 1 or len(right) != 1:
+                warnings.append(f"candidate {dimension.value}-{donor.workflow_id} omitted: ambiguous scalar bindings")
+                continue
+            if left[0].field_name != right[0].field_name or left[0].field_name == "$class_type":
+                warnings.append(f"candidate {dimension.value}-{donor.workflow_id} omitted: mismatched scalar bindings")
+                continue
+            value = thaw_json(right[0].value)
+            if value == thaw_json(left[0].value):
+                continue
+            digest = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()[:16]
+            candidates.append(Candidate(
+                candidate_id=f"{dimension.value}-{donor.workflow_id}"[:96],
+                hypothesis=dimension, capability_signature=f"{dimension.value}:{digest}",
+                confidence="observed", evidence_ids=(donor.workflow_id,),
+                semantic_patch=SemanticPatch(mutations=(SetRoleInput(role=role, binding_index=0, field_name=left[0].field_name, value=value),)),
+                engagement=donor.engagement, provenance_rank=1,
+            ))
+    candidates.sort(key=lambda item: (item.capability_signature, item.candidate_id))
+    return CandidateSelection(candidates=tuple(candidates), warnings=tuple(sorted(set(warnings))))
 
 
 def select_candidates(

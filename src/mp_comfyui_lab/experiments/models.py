@@ -611,6 +611,17 @@ class SourceBundle(_FrozenModel):
     candidates: tuple[Candidate, ...] = Field(default=(), max_length=MAX_PLAN_VARIANTS)
     baseline_workflow_id: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=256)] | None = None
     evidence_graph: Any
+    compiler_warnings: tuple[str, ...] = Field(default=(), max_length=256)
+
+    @field_validator("compiler_warnings", mode="before")
+    @classmethod
+    def compiler_warning_array(cls, value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("compiler_warnings")
+    @classmethod
+    def canonical_compiler_warnings(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(sorted(set(value)))
 
     @field_validator("sources", "candidates", mode="before")
     @classmethod

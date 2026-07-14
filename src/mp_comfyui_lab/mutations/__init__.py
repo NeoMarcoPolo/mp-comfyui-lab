@@ -23,6 +23,7 @@ from mp_comfyui_lab.mutations.planner import (
     propose_patch,
     select_candidates,
     validate_candidate_patch,
+    compile_observed_candidates,
 )
 
 
@@ -49,4 +50,5 @@ __all__ = [
     "propose_patch",
     "select_candidates",
     "validate_candidate_patch",
+    "compile_observed_candidates",
 ]

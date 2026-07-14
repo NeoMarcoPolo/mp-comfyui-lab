@@ -661,7 +661,7 @@ def build_plan(
         )
     ]
     selection = select_candidates(brief, source_bundle.candidates)
-    warnings = list(selection.warnings)
+    warnings = [*source_bundle.compiler_warnings, *selection.warnings]
     coverage: set[DimensionName] = set()
     for candidate in selection.candidates:
         patch = propose_patch(candidate, source)
