@@ -35,6 +35,7 @@ from mp_comfyui_lab.experiments.models import (
 from mp_comfyui_lab.mutations import LoraSpec, ReplaceLoraStack, SemanticPatch, SetRoleInput
 from mp_comfyui_lab.mutations.planner import validate_candidate_patch
 from mp_comfyui_lab.mutations.planner import compile_observed_candidates
+from mp_comfyui_lab.graph.patch import materialize_variant
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
@@ -581,3 +582,38 @@ def test_compiler_emits_safe_lora_candidates_and_omits_mixed_delta() -> None:
     mixed = compile_observed_candidates(brief, baseline, (_source(mixed_graph, workflow_id="125"),))
     assert not mixed.candidates
     assert "lora_stack and lora_strength" in mixed.warnings[0]
+
+
+def test_compiler_emits_neutral_lora_stack_template_that_materializes() -> None:
+    baseline_graph = _graph()
+    baseline_graph["20"] = {"class_type": "LoraLoader", "inputs": {"lora_name": "base.safetensors", "strength_model": 1.0, "strength_clip": 1.0, "model": ["4", 0], "clip": ["4", 1]}}
+    baseline_graph["6"]["inputs"]["model"] = ["20", 0]
+    donor_graph = json.loads(json.dumps(baseline_graph))
+    donor_graph["21"] = {
+        "class_type": "LoraLoader",
+        "inputs": {
+            "lora_name": "donor.safetensors",
+            "strength_model": 1.0,
+            "strength_clip": 1.0,
+            "model": ["20", 0],
+            "clip": ["4", 1],
+        },
+    }
+    donor_graph["6"]["inputs"]["model"] = ["21", 0]
+    baseline = _source(baseline_graph, workflow_id="123")
+    donor = _source(donor_graph, workflow_id="124")
+    brief = _brief(dimensions={"checkpoint": "approved", "prompt_grammar": "approved", "sampler": "approved", "lora_stack": "approved"})
+    compiled = compile_observed_candidates(brief, baseline, (donor,))
+    assert len(compiled.candidates) == 1
+    candidate = compiled.candidates[0]
+    assert candidate.hypothesis.value == "lora_stack"
+    mutation = candidate.semantic_patch.mutations[0]
+    assert [item.name for item in mutation.loras] == ["base.safetensors", "donor.safetensors"]
+    assert mutation.loader_template.donor_node_id == "21"
+    assert mutation.loader_template.class_type == "LoraLoader"
+    assert mutation.loader_template.donor_workflow_id == "124"
+    assert mutation.loader_template.evidence_ids == ("124",)
+    assert validate_candidate_patch(candidate, candidate.semantic_patch, baseline, brief) is None
+    result = materialize_variant(baseline_graph, candidate.semantic_patch)
+    normalized = normalize_graph(result.graph)
+    assert "donor.safetensors" in [str(item.value) for item in normalized.bindings(SemanticRole.LORA)]
