@@ -1,10 +1,15 @@
 from pathlib import Path
-from typing import Any, Self
+from math import isfinite
+from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PrivateAttr
 import yaml
 
 from mp_comfyui_lab.security import SafetyError
+
+
+class LabConfigError(ValueError):
+    pass
 
 
 def _resolve_from(base: Path, path: Path) -> Path:
@@ -13,11 +18,42 @@ def _resolve_from(base: Path, path: Path) -> Path:
     return (base / path).resolve()
 
 
+def _ranking_weight(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("ranking weight must be a number")
+    parsed = float(value)
+    if not isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise ValueError("ranking weight must be finite and between 0 and 1")
+    return parsed
+
+
+RankingWeight = Annotated[float, BeforeValidator(_ranking_weight)]
+
+
+class RankingOverrides(BaseModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        allow_inf_nan=False,
+    )
+
+    relevance: RankingWeight | None = None
+    engagement: RankingWeight | None = None
+    output_evidence: RankingWeight | None = None
+    recency: RankingWeight | None = None
+    creator_track_record: RankingWeight | None = None
+    experimentability: RankingWeight | None = None
+    novelty: RankingWeight | None = None
+    duplicate_penalty: RankingWeight | None = None
+
+
 class LabConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     experiments_root: Path
     vaults: dict[str, Path] = Field(default_factory=dict)
+    ranking: RankingOverrides = Field(default_factory=RankingOverrides)
     _fixture_base: Path = PrivateAttr()
 
     def model_post_init(self, context: Any) -> None:
@@ -39,7 +75,10 @@ class LabConfig(BaseModel):
                 context={"base_dir": base},
             )
 
-        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        try:
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as error:
+            raise LabConfigError("config.local.yaml is malformed") from error
         return cls.model_validate(data, context={"base_dir": base})
 
     def resolve_fixture(self, fixture: str | Path) -> Path:

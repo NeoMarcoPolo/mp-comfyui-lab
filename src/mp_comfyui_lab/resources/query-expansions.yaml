@@ -1,0 +1,17 @@
+schema_version: 1
+concepts:
+  - concept: next_scene
+    terms:
+      - next scene
+      - 下一场景
+      - 分镜
+  - concept: multi_angle
+    terms:
+      - multi angle
+      - 多角度
+      - 多视角
+  - concept: character_consistency
+    terms:
+      - character consistency
+      - 角色一致性
+      - 人物一致性
