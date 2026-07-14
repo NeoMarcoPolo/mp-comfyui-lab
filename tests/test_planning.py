@@ -92,11 +92,20 @@ def _encoder_topology_graph(
     class_type: str,
     *,
     node_id: str = "2",
+    checkpoint_node_id: str = "4",
     clip_output_index: int = 0,
     text: str | None = None,
 ) -> dict:
     graph = _graph()
-    inputs: dict[str, object] = {"clip": ["4", clip_output_index]}
+    if checkpoint_node_id != "4":
+        graph[checkpoint_node_id] = graph.pop("4")
+        for node in graph.values():
+            for value in node["inputs"].values():
+                if isinstance(value, list) and len(value) == 2 and value[0] == "4":
+                    value[0] = checkpoint_node_id
+    inputs: dict[str, object] = {
+        "clip": [checkpoint_node_id, clip_output_index]
+    }
     if text is not None:
         inputs["text"] = text
     graph.pop("2")
@@ -911,11 +920,19 @@ def test_compiler_emits_exact_one_node_encoder_topology_candidate() -> None:
     baseline_graph = _encoder_topology_graph("TextEncoderAlpha")
     baseline = _source(baseline_graph, workflow_id="123")
     donor = _source(
-        _encoder_topology_graph("TextEncoderBeta", node_id="20"),
+        _encoder_topology_graph(
+            "TextEncoderBeta",
+            node_id="20",
+            checkpoint_node_id="40",
+        ),
         workflow_id="124",
     )
     second_donor = _source(
-        _encoder_topology_graph("TextEncoderGamma", node_id="30"),
+        _encoder_topology_graph(
+            "TextEncoderGamma",
+            node_id="30",
+            checkpoint_node_id="50",
+        ),
         workflow_id="125",
     )
     brief = _brief(dimensions={"encoder": "approved"})
@@ -944,7 +961,7 @@ def test_compiler_emits_exact_one_node_encoder_topology_candidate() -> None:
         DonorNode(
             node_id="20",
             class_type="TextEncoderBeta",
-            inputs={"clip": ["4", 0]},
+            inputs={"clip": None},
             metadata={"display_name": "Exact TextEncoderBeta"},
         ),
     )
@@ -977,6 +994,56 @@ def test_compiler_emits_exact_one_node_encoder_topology_candidate() -> None:
     }
     assert result.diff.mutations[0].donor_workflow_id == "124"
     assert result.diff.mutations[0].evidence_ids == ("124",)
+
+
+def test_compiler_rejects_equal_upstream_ids_with_incompatible_semantics() -> None:
+    baseline = _source(
+        _encoder_topology_graph("TextEncoderAlpha"),
+        workflow_id="123",
+    )
+    donor_graph = _encoder_topology_graph("TextEncoderBeta", node_id="20")
+    donor_graph["4"] = {
+        "class_type": "PrimitiveNode",
+        "inputs": {"value": "not a checkpoint"},
+    }
+    donor = _source(donor_graph, workflow_id="124")
+
+    compiled = compile_observed_candidates(
+        _brief(dimensions={"encoder": "approved"}),
+        baseline,
+        (donor,),
+    )
+
+    assert compiled.candidates == ()
+    assert (
+        "candidate encoder-124 omitted: incompatible one-node topology boundary"
+        in compiled.warnings
+    )
+
+
+def test_compiler_rejects_incompatible_donor_downstream_semantics() -> None:
+    baseline = _source(
+        _encoder_topology_graph("TextEncoderAlpha"),
+        workflow_id="123",
+    )
+    donor_graph = _encoder_topology_graph("TextEncoderBeta", node_id="20")
+    donor_graph["8"] = {
+        "class_type": "PrimitiveNode",
+        "inputs": {"value": ["20", 0]},
+    }
+    donor = _source(donor_graph, workflow_id="124")
+
+    compiled = compile_observed_candidates(
+        _brief(dimensions={"encoder": "approved"}),
+        baseline,
+        (donor,),
+    )
+
+    assert compiled.candidates == ()
+    assert (
+        "candidate encoder-124 omitted: incompatible one-node topology boundary"
+        in compiled.warnings
+    )
 
 
 def test_compiler_warns_on_incompatible_one_node_topology_boundary() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
@@ -197,9 +198,54 @@ def _compile_one_node_topology_candidate(
     baseline_inputs = dict(baseline_node.input_links)
     donor_inputs = dict(donor_node.input_links)
     if (
-        baseline_inputs != donor_inputs
+        set(baseline_inputs) != set(donor_inputs)
         or any(link[0] == baseline_node_id for link in baseline_inputs.values())
         or any(link[0] == donor_node_id for link in donor_inputs.values())
+    ):
+        return None, warning_prefix + "incompatible one-node topology boundary"
+
+    baseline_endpoints = _endpoint_signatures(baseline)
+    donor_endpoints = _endpoint_signatures(donor)
+    boundary_inputs = []
+    materializable_donor_inputs = dict(donor_raw["inputs"])
+    for field_name in sorted(donor_inputs):
+        baseline_link = baseline_inputs[field_name]
+        donor_link = donor_inputs[field_name]
+        baseline_endpoint = baseline_endpoints.get(baseline_link[0])
+        donor_endpoint = donor_endpoints.get(donor_link[0])
+        if (
+            baseline_link[1] != donor_link[1]
+            or baseline_endpoint is None
+            or donor_endpoint is None
+            or baseline_endpoint != donor_endpoint
+        ):
+            return None, warning_prefix + "incompatible one-node topology boundary"
+        boundary_inputs.append(
+            BoundaryInputMapping(
+                donor_node_id=donor_node_id,
+                donor_field_name=field_name,
+                source_node_id=baseline_link[0],
+                source_output_index=baseline_link[1],
+            )
+        )
+        materializable_donor_inputs[field_name] = None
+
+    baseline_consumers = _boundary_consumer_records(
+        baseline,
+        baseline_node_id,
+        baseline_endpoints,
+    )
+    donor_consumers = _boundary_consumer_records(
+        donor,
+        donor_node_id,
+        donor_endpoints,
+    )
+    if (
+        baseline_consumers is None
+        or donor_consumers is None
+        or not baseline_consumers
+        or baseline_consumers != donor_consumers
+        or any(record[0] != 0 for record in baseline_consumers)
     ):
         return None, warning_prefix + "incompatible one-node topology boundary"
 
@@ -208,8 +254,6 @@ def _compile_one_node_topology_candidate(
         for field_name, link in consumer.input_links.items():
             if link[0] != baseline_node_id:
                 continue
-            if consumer.node_id == baseline_node_id or link[1] != 0:
-                return None, warning_prefix + "incompatible one-node topology boundary"
             boundary_outputs.append(
                 BoundaryOutputMapping(
                     donor_node_id=donor_node_id,
@@ -218,32 +262,20 @@ def _compile_one_node_topology_candidate(
                     consumer_field_name=field_name,
                 )
             )
-    if not boundary_outputs:
-        return None, warning_prefix + "incompatible one-node topology boundary"
-
     exact_donor_node = DonorNode(
         node_id=donor_node_id,
         class_type=donor_raw["class_type"],
-        inputs=donor_raw["inputs"],
+        inputs=materializable_donor_inputs,
         metadata={
             key: value
             for key, value in donor_raw.items()
             if key not in {"class_type", "inputs"}
         },
     )
-    boundary_inputs = tuple(
-        BoundaryInputMapping(
-            donor_node_id=donor_node_id,
-            donor_field_name=field_name,
-            source_node_id=link[0],
-            source_output_index=link[1],
-        )
-        for field_name, link in sorted(donor_inputs.items())
-    )
     mutation = ReplaceSubgraph(
         target_node_ids=(baseline_node_id,),
         donor_nodes=(exact_donor_node,),
-        boundary_inputs=boundary_inputs,
+        boundary_inputs=tuple(boundary_inputs),
         boundary_outputs=tuple(boundary_outputs),
         donor_workflow_id=donor.workflow_id,
         evidence_ids=(donor.workflow_id,),
@@ -281,6 +313,76 @@ def _compile_one_node_topology_candidate(
         provenance_rank=1,
     )
     return candidate, None
+
+
+def _endpoint_signatures(source: PlanningSource) -> dict[str, str]:
+    roles_by_node: dict[str, set[SemanticRole]] = {
+        node.node_id: set() for node in source.normalized_graph.nodes
+    }
+    for role in SemanticRole:
+        for binding in source.normalized_graph.bindings(role):
+            roles_by_node[binding.node_id].add(role)
+
+    signatures: dict[str, str] = {}
+    for node in source.normalized_graph.nodes:
+        roles = roles_by_node[node.node_id]
+        if roles:
+            payload = {
+                "dimensions": sorted(
+                    {
+                        _ROLE_DIMENSIONS[role]
+                        for role in roles
+                        if role in _ROLE_DIMENSIONS
+                    }
+                ),
+                "roles": sorted(role.value for role in roles),
+                "type": "semantic",
+            }
+        else:
+            payload = {
+                "class": "".join(
+                    character
+                    for character in node.class_type.casefold()
+                    if character.isalnum()
+                ),
+                "linked_inputs": sorted(
+                    (field_name, link[1])
+                    for field_name, link in node.input_links.items()
+                ),
+                "literals": {
+                    field_name: thaw_json(value)
+                    for field_name, value in node.inputs.items()
+                    if field_name not in node.input_links
+                },
+                "type": "literal",
+            }
+        signatures[node.node_id] = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    return signatures
+
+
+def _boundary_consumer_records(
+    source: PlanningSource,
+    target_node_id: str,
+    endpoint_signatures: Mapping[str, str],
+) -> Counter[tuple[int, str, str]] | None:
+    records: Counter[tuple[int, str, str]] = Counter()
+    for consumer in source.normalized_graph.nodes:
+        for field_name, link in consumer.input_links.items():
+            if link[0] != target_node_id:
+                continue
+            if consumer.node_id == target_node_id:
+                return None
+            signature = endpoint_signatures.get(consumer.node_id)
+            if signature is None:
+                return None
+            records[(link[1], field_name, signature)] += 1
+    return records
 
 
 def _compile_lora_candidate(brief, baseline, donor):
