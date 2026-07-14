@@ -110,6 +110,25 @@ def _encoder_topology_graph(
     return graph
 
 
+def _lora_stack_graph(
+    specs: tuple[tuple[str, float, float | None], ...],
+) -> dict:
+    graph = _graph()
+    previous_node_id = "4"
+    for index, (name, model_strength, clip_strength) in enumerate(specs, start=20):
+        inputs: dict[str, object] = {
+            "lora_name": name,
+            "strength_model": model_strength,
+            "model": [previous_node_id, 0],
+        }
+        if clip_strength is not None:
+            inputs["strength_clip"] = clip_strength
+        graph[str(index)] = {"class_type": "LoraLoader", "inputs": inputs}
+        previous_node_id = str(index)
+    graph["6"]["inputs"]["model"] = [previous_node_id, 0]
+    return graph
+
+
 def _brief(**overrides: object) -> ExperimentBrief:
     values = {
         "goal": "Test a character variation",
@@ -648,6 +667,159 @@ def test_compiler_emits_neutral_lora_stack_template_that_materializes() -> None:
     result = materialize_variant(baseline_graph, candidate.semantic_patch)
     normalized = normalize_graph(result.graph)
     assert "donor.safetensors" in [str(item.value) for item in normalized.bindings(SemanticRole.LORA)]
+
+
+def test_lora_retained_strength_plus_neutral_add_is_two_dimensions() -> None:
+    baseline_graph = _lora_stack_graph(
+        (("base.safetensors", 1.0, 1.0),)
+    )
+    baseline = _source(baseline_graph, workflow_id="123")
+    mutation = ReplaceLoraStack(
+        loras=(
+            LoraSpec(
+                name="base.safetensors",
+                strength_model=19.0,
+                strength_clip=1.0,
+            ),
+            LoraSpec(
+                name="new.safetensors",
+                strength_model=1.0,
+                strength_clip=1.0,
+            ),
+        ),
+        evidence_ids=("124",),
+    )
+    candidate = Candidate(
+        candidate_id="lora-retained-strength",
+        hypothesis="lora_stack",
+        capability_signature="lora-retained-strength",
+        confidence="observed",
+        evidence_ids=("124",),
+        semantic_patch=SemanticPatch(mutations=(mutation,)),
+    )
+    stack_only = _brief(dimensions={"lora_stack": "approved"})
+
+    assert (
+        validate_candidate_patch(
+            candidate,
+            candidate.semantic_patch,
+            baseline,
+            stack_only,
+        )
+        == "candidate patch changes a dimension other than its hypothesis"
+    )
+
+    donor = _source(
+        _lora_stack_graph(
+            (
+                ("base.safetensors", 19.0, 1.0),
+                ("new.safetensors", 1.0, 1.0),
+            )
+        ),
+        workflow_id="124",
+    )
+    compiled = compile_observed_candidates(stack_only, baseline, (donor,))
+
+    assert compiled.candidates == ()
+    assert compiled.warnings == (
+        "candidate lora-124 omitted: lora_stack and lora_strength changed",
+    )
+
+
+def test_lora_reorder_with_unchanged_named_strengths_is_stack_only() -> None:
+    baseline = _source(
+        _lora_stack_graph(
+            (
+                ("base.safetensors", 2.0, None),
+                ("style.safetensors", 3.0, None),
+            )
+        )
+    )
+    mutation = ReplaceLoraStack(
+        loras=(
+            LoraSpec(name="style.safetensors", strength_model=3.0),
+            LoraSpec(name="base.safetensors", strength_model=2.0),
+        ),
+        evidence_ids=("124",),
+    )
+    candidate = Candidate(
+        candidate_id="lora-reorder",
+        hypothesis="lora_stack",
+        capability_signature="lora-reorder",
+        confidence="observed",
+        evidence_ids=("124",),
+        semantic_patch=SemanticPatch(mutations=(mutation,)),
+    )
+
+    assert validate_candidate_patch(
+        candidate,
+        candidate.semantic_patch,
+        baseline,
+        _brief(dimensions={"lora_stack": "approved"}),
+    ) is None
+
+
+def test_lora_remove_only_is_stack_only() -> None:
+    baseline = _source(
+        _lora_stack_graph(
+            (
+                ("base.safetensors", 2.0, None),
+                ("style.safetensors", 3.0, None),
+            )
+        )
+    )
+    mutation = ReplaceLoraStack(
+        loras=(LoraSpec(name="base.safetensors", strength_model=2.0),),
+        evidence_ids=("124",),
+    )
+    candidate = Candidate(
+        candidate_id="lora-remove",
+        hypothesis="lora_stack",
+        capability_signature="lora-remove",
+        confidence="observed",
+        evidence_ids=("124",),
+        semantic_patch=SemanticPatch(mutations=(mutation,)),
+    )
+
+    assert validate_candidate_patch(
+        candidate,
+        candidate.semantic_patch,
+        baseline,
+        _brief(dimensions={"lora_stack": "approved"}),
+    ) is None
+
+
+def test_lora_shared_identity_strength_change_is_strength_only() -> None:
+    baseline = _source(
+        _lora_stack_graph(
+            (
+                ("base.safetensors", 2.0, None),
+                ("style.safetensors", 3.0, None),
+            )
+        )
+    )
+    mutation = ReplaceLoraStack(
+        loras=(
+            LoraSpec(name="base.safetensors", strength_model=2.0),
+            LoraSpec(name="style.safetensors", strength_model=4.0),
+        ),
+        evidence_ids=("124",),
+    )
+    candidate = Candidate(
+        candidate_id="lora-strength",
+        hypothesis="lora_strength",
+        capability_signature="lora-strength",
+        confidence="observed",
+        evidence_ids=("124",),
+        semantic_patch=SemanticPatch(mutations=(mutation,)),
+    )
+
+    assert validate_candidate_patch(
+        candidate,
+        candidate.semantic_patch,
+        baseline,
+        _brief(dimensions={"lora_strength": "approved"}),
+    ) is None
 
 
 def test_replace_subgraph_uses_normalized_roles_not_class_name_keywords() -> None:

@@ -291,18 +291,17 @@ def _compile_lora_candidate(brief, baseline, donor):
         return None, f"candidate lora-{donor.workflow_id} omitted: {error}"
     if before == after:
         return None, None
-    before_names = tuple(item.name for item in before)
-    after_names = tuple(item.name for item in after)
-    strength_changed = tuple((item.strength_model, item.strength_clip) for item in before) != tuple((item.strength_model, item.strength_clip) for item in after)
-    identity_changed = before_names != after_names
-    if identity_changed and any(item.strength_model != 1.0 or item.strength_clip not in {None, 1.0} for item in after if item.name not in before_names):
+    dimensions = _lora_delta_dimensions(
+        tuple((item.name, item.strength_model, item.strength_clip) for item in before),
+        tuple((item.name, item.strength_model, item.strength_clip) for item in after),
+    )
+    if dimensions is None:
+        return None, f"candidate lora-{donor.workflow_id} omitted: ambiguous LoRA identities"
+    if dimensions == {"lora_stack", "lora_strength"}:
         return None, f"candidate lora-{donor.workflow_id} omitted: lora_stack and lora_strength changed"
-    if identity_changed:
-        dimension = DimensionName.LORA_STACK
-    elif strength_changed:
-        dimension = DimensionName.LORA_STRENGTH
-    else:
+    if not dimensions:
         return None, None
+    dimension = DimensionName(next(iter(dimensions)))
     if brief.policy_for(dimension).value != "approved":
         return None, None
     template = _lora_template(donor) if len(after) > len(before) else None
@@ -481,21 +480,7 @@ def _mutation_dimensions(mutation, source: PlanningSource) -> set[str] | None:
     if isinstance(mutation, ReplaceLoraStack):
         existing = _lora_effective_values(source)
         requested = tuple((item.name, item.strength_model, item.strength_clip) for item in mutation.loras)
-        if len(existing) != len(requested):
-            dimensions = {"lora_stack"}
-            existing_names = {item[0] for item in existing}
-            for name, model, clip in requested:
-                if name not in existing_names and (model != 1.0 or clip not in {None, 1.0}):
-                    dimensions.add("lora_strength")
-            return dimensions
-        identity_changed = tuple(item[0] for item in existing) != tuple(item[0] for item in requested)
-        strength_changed = any(left[1:] != right[1:] for left, right in zip(existing, requested, strict=True))
-        dimensions: set[str] = set()
-        if identity_changed:
-            dimensions.add("lora_stack")
-        if strength_changed:
-            dimensions.add("lora_strength")
-        return dimensions or set()
+        return _lora_delta_dimensions(existing, requested)
     if isinstance(mutation, ReplaceSubgraph):
         valid_dimensions = {dimension.value for dimension in DimensionName}
         target_dimensions = {
@@ -547,3 +532,35 @@ def _lora_effective_values(source: PlanningSource) -> tuple[tuple[str, float | N
         clip = node.inputs.get("strength_clip")
         values.append((name, float(model) if isinstance(model, (int, float)) and not isinstance(model, bool) else None, float(clip) if isinstance(clip, (int, float)) and not isinstance(clip, bool) else None))
     return tuple(values)
+
+
+def _lora_delta_dimensions(
+    existing: tuple[tuple[str, float | None, float | None], ...],
+    requested: tuple[tuple[str, float | None, float | None], ...],
+) -> set[str] | None:
+    existing_by_name = {item[0]: item[1:] for item in existing}
+    requested_by_name = {item[0]: item[1:] for item in requested}
+    if len(existing_by_name) != len(existing) or len(requested_by_name) != len(requested):
+        return None
+
+    dimensions: set[str] = set()
+    if tuple(item[0] for item in existing) != tuple(item[0] for item in requested):
+        dimensions.add("lora_stack")
+
+    for name, model, clip in requested:
+        requested_strength = (
+            1.0 if model is None else model,
+            1.0 if clip is None else clip,
+        )
+        retained_strength = existing_by_name.get(name)
+        if retained_strength is None:
+            if requested_strength != (1.0, 1.0):
+                dimensions.add("lora_strength")
+            continue
+        effective_retained = (
+            1.0 if retained_strength[0] is None else retained_strength[0],
+            1.0 if retained_strength[1] is None else retained_strength[1],
+        )
+        if effective_retained != requested_strength:
+            dimensions.add("lora_strength")
+    return dimensions
