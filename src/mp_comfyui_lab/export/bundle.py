@@ -223,7 +223,6 @@ class BundleExporter:
         selection_bytes: bytes,
     ) -> None:
         (stage / "fixtures" / "files").mkdir(parents=True)
-        (stage / "outputs").mkdir()
         selected_graph = thaw_json(variant.materialized_graph)
         source_graph = source["raw_graph"]
         self._write_json(stage / "source-workflow-api.json", source_graph)
@@ -262,7 +261,17 @@ class BundleExporter:
             stage / "prompts.json",
             {"prompt_lines": prompt_lines},
         )
-        exported_outputs = self._copy_outputs(stage, root, run)
+        self._write_review_contract(
+            stage,
+            selection=selection,
+            review=review,
+        )
+        exported_outputs = self._bind_exported_outputs(
+            stage,
+            root,
+            run,
+            review,
+        )
         self._write_json(
             stage / "execution.json",
             {
@@ -288,12 +297,6 @@ class BundleExporter:
                     else review.judgments.model_dump(mode="json")
                 ),
             },
-        )
-        self._write_bytes(stage / "finalists.json", review.finalists_bytes)
-        self._write_review_contract(
-            stage,
-            selection=selection,
-            review=review,
         )
         self._write_bytes(stage / "selection.json", selection_bytes)
 
@@ -503,13 +506,17 @@ class BundleExporter:
             raise BundleIntegrityError("fixture snapshot is a symlink or junction")
         return source
 
-    def _copy_outputs(
+    def _bind_exported_outputs(
         self,
         stage: Path,
         root: Path,
         run: RunRecord,
+        review: CanonicalReview,
     ) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
+        review_artifacts = {
+            artifact.path: artifact for artifact in review.manifest.artifacts
+        }
         for output in sorted(run.outputs, key=lambda item: item.ordinal):
             source, availability = resolve_stored_artifact(
                 root,
@@ -519,22 +526,46 @@ class BundleExporter:
                 raise BundleIntegrityError(
                     f"recorded output is {availability}"
                 )
-            suffix = source.suffix.casefold() or ".bin"
-            destination_relative = Path("outputs", f"{output.ordinal:04d}{suffix}")
-            self._copy_verified(
-                source,
-                stage / destination_relative,
-                expected_sha256=output.content_sha256,
-                expected_size=output.size,
-                context="recorded output",
+            manifest_entry = review_artifacts.get(output.local_relative_path)
+            if (
+                manifest_entry is None
+                or manifest_entry.sha256 != output.content_sha256
+                or manifest_entry.bytes != output.size
+            ):
+                raise BundleIntegrityError(
+                    "selected output is not bound by the review manifest"
+                )
+            exported, availability = resolve_stored_artifact(
+                stage,
+                output.local_relative_path,
             )
+            if exported is None:
+                raise BundleIntegrityError(
+                    f"exported selected output is {availability}"
+                )
+            try:
+                source_digest, source_size = hash_stored_artifact(source)
+                exported_digest, exported_size = hash_stored_artifact(exported)
+            except OSError as error:
+                raise BundleIntegrityError(
+                    "selected output cannot be verified safely"
+                ) from error
+            if (
+                source_digest != output.content_sha256
+                or source_size != output.size
+                or exported_digest != output.content_sha256
+                or exported_size != output.size
+            ):
+                raise BundleIntegrityError(
+                    "selected output differs from reviewed evidence"
+                )
             entries.append(
                 {
                     "ordinal": output.ordinal,
                     "provider_order": output.provider_order,
                     "node_id": output.node_id,
                     "media_type": output.media_type,
-                    "path": destination_relative.as_posix(),
+                    "path": output.local_relative_path,
                     "sha256": output.content_sha256,
                     "bytes": output.size,
                     "provenance_path": output.local_relative_path,
@@ -559,7 +590,7 @@ class BundleExporter:
                 )
             self._copy_verified(
                 source,
-                stage / "review" / artifact.path,
+                stage / artifact.path,
                 expected_sha256=artifact.sha256,
                 expected_size=artifact.bytes,
                 context="review artifact",
@@ -577,7 +608,7 @@ class BundleExporter:
             raise StaleSelectionError(
                 "selected review manifest hash changed during export"
             )
-        canonical_relative = Path("review", "manifest.json")
+        canonical_relative = Path("review-manifest.json")
         self._write_bytes(
             stage / canonical_relative,
             review.manifest_bytes,
@@ -604,16 +635,6 @@ class BundleExporter:
                 raise BundleIntegrityError(
                     "exported review artifact differs from its manifest"
                 )
-        self._write_json(
-            stage / "review-manifest.json",
-            {
-                "schema_version": "1",
-                "kind": "canonical_review_manifest_index",
-                "review_generation_id": review.manifest.generation_id,
-                "canonical_manifest_path": canonical_relative.as_posix(),
-                "canonical_manifest_sha256": canonical_sha256,
-            },
-        )
 
     def _brief_goal(self, root: Path, plan: ExperimentPlan) -> str:
         payload = thaw_json(plan.approval_payload)

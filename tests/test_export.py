@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import stat
 
 from PIL import Image
 import pytest
@@ -82,20 +83,10 @@ def _snapshot_tree(root: Path) -> dict[str, str]:
 
 def _exported_review_contract(
     bundle: Path,
-) -> tuple[dict[str, object], Path, dict[str, object]]:
-    index = json.loads(
-        (bundle / "review-manifest.json").read_text(encoding="utf-8")
-    )
-    relative_manifest = Path(index["canonical_manifest_path"])
-    assert not relative_manifest.is_absolute()
-    assert ".." not in relative_manifest.parts
-    manifest_path = (bundle / relative_manifest).resolve(strict=True)
+) -> tuple[Path, dict[str, object]]:
+    manifest_path = (bundle / "review-manifest.json").resolve(strict=True)
     manifest_path.relative_to(bundle.resolve(strict=True))
-    manifest_bytes = manifest_path.read_bytes()
-    assert hashlib.sha256(manifest_bytes).hexdigest() == index[
-        "canonical_manifest_sha256"
-    ]
-    return index, manifest_path, json.loads(manifest_bytes)
+    return manifest_path, json.loads(manifest_path.read_bytes())
 
 
 def _write_png(path: Path, color: tuple[int, int, int]) -> bytes:
@@ -350,9 +341,9 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
         "execution.json",
         "outputs",
         "comparison.json",
+        "comparisons",
         "finalists.json",
         "review-manifest.json",
-        "review",
         "selection.json",
         "handoff.json",
     }
@@ -379,15 +370,13 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
     assert selection["finalists_artifact_sha256"] == hashlib.sha256(
         (bundle / "finalists.json").read_bytes()
     ).hexdigest()
-    review_index, canonical_manifest_path, review_manifest = (
+    canonical_manifest_path, review_manifest = (
         _exported_review_contract(bundle)
     )
-    assert selection["review_generation_id"] == review_index[
-        "review_generation_id"
-    ]
-    assert selection["review_manifest_sha256"] == review_index[
-        "canonical_manifest_sha256"
-    ]
+    assert selection["review_generation_id"] == review_manifest["generation_id"]
+    assert selection["review_manifest_sha256"] == hashlib.sha256(
+        canonical_manifest_path.read_bytes()
+    ).hexdigest()
     assert review_manifest["finalists_sha256"] == selection[
         "finalists_artifact_sha256"
     ]
@@ -413,13 +402,13 @@ def test_exported_review_contract_resolves_every_manifest_artifact(
     store, _ = _persist_selected_experiment(tmp_path)
     bundle = BundleExporter(store).export(EXPERIMENT_ID)
 
-    index, manifest_path, manifest = _exported_review_contract(bundle)
+    manifest_path, manifest = _exported_review_contract(bundle)
 
     selection = json.loads(
         (bundle / "selection.json").read_text(encoding="utf-8")
     )
-    assert index["review_generation_id"] == selection["review_generation_id"]
-    assert index["canonical_manifest_sha256"] == selection[
+    assert manifest["generation_id"] == selection["review_generation_id"]
+    assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == selection[
         "review_manifest_sha256"
     ]
     artifact_root = manifest_path.parent.resolve(strict=True)
@@ -429,6 +418,40 @@ def test_exported_review_contract_resolves_every_manifest_artifact(
         content = artifact_path.read_bytes()
         assert hashlib.sha256(content).hexdigest() == artifact["sha256"]
         assert len(content) == artifact["bytes"]
+
+
+def test_export_stores_selected_media_once_for_review_and_execution(
+    tmp_path: Path,
+) -> None:
+    store, _ = _persist_selected_experiment(tmp_path)
+    bundle = BundleExporter(store).export(EXPERIMENT_ID)
+    manifest_path, manifest = _exported_review_contract(bundle)
+    execution = json.loads(
+        (bundle / "execution.json").read_text(encoding="utf-8")
+    )
+    selected = execution["exported_outputs"][0]
+    execution_path = (bundle / selected["path"]).resolve(strict=True)
+    manifest_entry = next(
+        artifact
+        for artifact in manifest["artifacts"]
+        if artifact["sha256"] == selected["sha256"]
+        and artifact["bytes"] == selected["bytes"]
+        and artifact["media_type"] == selected["media_type"]
+    )
+    manifest_output_path = (
+        manifest_path.parent / manifest_entry["path"]
+    ).resolve(strict=True)
+
+    assert execution_path == manifest_output_path
+    payload_copies = []
+    for path in bundle.rglob("*"):
+        if not path.is_file():
+            continue
+        if hashlib.sha256(path.read_bytes()).hexdigest() != selected["sha256"]:
+            continue
+        assert stat.S_ISREG(path.lstat().st_mode)
+        payload_copies.append(path.relative_to(bundle).as_posix())
+    assert payload_copies == [selected["path"]]
 
 
 def test_export_rejects_tampered_recorded_output(tmp_path: Path) -> None:
@@ -583,7 +606,7 @@ def test_later_review_generation_gets_new_export_and_preserves_old_bundle(
 
     assert second != first
     assert _snapshot_tree(first) == first_snapshot
-    _, _, second_manifest = _exported_review_contract(second)
+    _, second_manifest = _exported_review_contract(second)
     assert second_manifest["generation_id"] == (
         later_review.finalists.review_generation_id
     )
