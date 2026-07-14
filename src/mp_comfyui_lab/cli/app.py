@@ -15,6 +15,17 @@ import requests
 
 from mp_comfyui_lab import __version__
 from mp_comfyui_lab.cli.output import emit_error, emit_success
+from mp_comfyui_lab.comparison.judgments import (
+    JudgmentValidationError,
+    judgment_document_bytes,
+    load_and_validate_judgments,
+)
+from mp_comfyui_lab.comparison.metrics import compare_outputs
+from mp_comfyui_lab.comparison.paths import path_component_is_link_or_junction
+from mp_comfyui_lab.comparison.render import (
+    comparison_facts_sha256,
+    render_comparison,
+)
 from mp_comfyui_lab.config import LabConfig, LabConfigError
 from mp_comfyui_lab.discovery.query import QueryExpansionConfigError, expand_query
 from mp_comfyui_lab.discovery.ranking import RankedWorkflow, RankingConfigError
@@ -90,6 +101,10 @@ class HelpRequested(Exception):
 
 
 class UsageError(Exception):
+    pass
+
+
+class ComparisonNotFoundError(FileNotFoundError):
     pass
 
 
@@ -310,6 +325,13 @@ def _build_parser() -> StructuredArgumentParser:
     reconcile.add_argument("experiment_id", metavar="EXPERIMENT_ID")
     reconcile.add_argument("run_id", metavar="RUN_ID")
     reconcile.add_argument("--task-id", metavar="ID", required=True)
+
+    compare = subparsers.add_parser(
+        "compare",
+        usage="%(prog)s EXPERIMENT_ID [--judgments JSON]",
+    )
+    compare.add_argument("experiment_id", metavar="EXPERIMENT_ID")
+    compare.add_argument("--judgments", metavar="JSON")
     return parser
 
 
@@ -617,6 +639,117 @@ def _execution_exit(record: RunRecord) -> ExitCode:
     return ExitCode.INCOMPLETE
 
 
+def _load_comparison_runs(
+    store: ExperimentStore,
+    experiment_id: str,
+) -> tuple[RunRecord, ...]:
+    experiment_root = store.root(experiment_id)
+    if not experiment_root.is_dir():
+        raise ComparisonNotFoundError(
+            f"experiment {experiment_id!r} does not exist"
+        )
+    runs_root = experiment_root / "runs"
+    if runs_root.exists() and path_component_is_link_or_junction(runs_root):
+        raise SafetyError("runs directory must not be a link or junction")
+    if not runs_root.is_dir():
+        return ()
+    records = []
+    for path in sorted(runs_root.iterdir(), key=lambda item: item.name):
+        if path.suffix.casefold() != ".json":
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise SafetyError("run artifact must be a regular local JSON file")
+        records.append(
+            RunRecord.model_validate_json(
+                store.read_text(
+                    experiment_id,
+                    Path("runs", path.name),
+                ),
+                strict=True,
+            )
+        )
+    return tuple(records)
+
+
+def _comparison_artifacts_payload(include_judgments: bool) -> list[dict[str, str]]:
+    artifacts = [
+        {"kind": "comparison_facts", "path": "comparisons/facts.json"},
+        {
+            "kind": "duplicate_groups",
+            "path": "comparisons/duplicate-groups.json",
+        },
+        {
+            "kind": "contact_sheet",
+            "path": "comparisons/contact-sheet.jpg",
+        },
+        {"kind": "comparison_gallery", "path": "comparisons/index.html"},
+        {
+            "kind": "judgment_input",
+            "path": "comparisons/judgment-input.json",
+        },
+    ]
+    if include_judgments:
+        artifacts.append(
+            {"kind": "judgments", "path": "comparisons/judgments.json"}
+        )
+    return artifacts
+
+
+def _compare_command(
+    parsed: argparse.Namespace,
+    repository_root: Path,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    config = LabConfig.load(repository_root)
+    store = ExperimentStore(config.experiments_root)
+    experiment_root = store.root(parsed.experiment_id)
+    runs = _load_comparison_runs(store, parsed.experiment_id)
+    report = compare_outputs(
+        runs,
+        experiment_root,
+        experiment_id=parsed.experiment_id,
+    )
+    judgment_bytes: bytes | None = None
+    judgment_path = None
+    if parsed.judgments is not None:
+        source = Path(parsed.judgments)
+        if not source.is_absolute():
+            source = repository_root / source
+        submission = load_and_validate_judgments(
+            source,
+            report,
+            expected_facts_sha256=comparison_facts_sha256(report),
+        )
+        judgment_bytes = judgment_document_bytes(submission)
+        judgment_path = "comparisons/judgments.json"
+        destination = experiment_root / judgment_path
+        if destination.exists() and store.read_bytes(
+            parsed.experiment_id,
+            judgment_path,
+        ) != judgment_bytes:
+            raise SafetyError(
+                "comparison judgments already exist with different content"
+            )
+    render_comparison(report, experiment_root)
+    if judgment_bytes is not None and judgment_path is not None:
+        store.write_bytes_new(
+            parsed.experiment_id,
+            judgment_path,
+            judgment_bytes,
+            reuse_matching=True,
+        )
+    artifacts = _comparison_artifacts_payload(judgment_bytes is not None)
+    return (
+        {
+            "experiment_id": parsed.experiment_id,
+            "variant_ids": sorted(report.variants),
+            "output_ids": list(report.output_ids),
+            "judgment_input": "comparisons/judgment-input.json",
+            "judgments": judgment_path,
+        },
+        artifacts,
+    )
+
+
 def _ranked_payload(item: RankedWorkflow) -> dict[str, object]:
     return {
         "workflow_id": item.candidate.workflow_id,
@@ -774,6 +907,48 @@ def main(
     if parsed.command == "version":
         emit_success("version", {"version": __version__})
         return ExitCode.OK
+
+    if parsed.command == "compare":
+        try:
+            root = Path.cwd() if cwd is None else Path(cwd)
+            data, artifacts = _compare_command(parsed, root)
+            emit_success("compare", data, artifacts)
+            return ExitCode.OK
+        except JudgmentValidationError as error:
+            emit_error(
+                "compare",
+                "usage",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.USAGE
+        except ComparisonNotFoundError as error:
+            emit_error(
+                "compare",
+                "not_found",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.NOT_FOUND
+        except LabConfigError as error:
+            emit_error(
+                "compare",
+                "usage",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.USAGE
+        except SafetyError as error:
+            emit_error(
+                "compare",
+                "safety",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.SAFETY
+        except Exception as error:
+            emit_error(
+                "compare",
+                "execution",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.EXECUTION
 
     if parsed.command in {"run", "resume", "status", "reconcile"}:
         try:

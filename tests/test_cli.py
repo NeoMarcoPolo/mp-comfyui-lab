@@ -114,7 +114,7 @@ def test_unknown_command_preserves_argparse_diagnostic(capsys):
     assert document["error"]["message"] == (
         "argument command: invalid choice: 'unknown' "
         "(choose from version, search, inspect, similar, plan, run, resume, "
-        "status, reconcile)"
+        "status, reconcile, compare)"
     )
 
 
