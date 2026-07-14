@@ -32,7 +32,13 @@ from mp_comfyui_lab.executors.base import (
     SearchPage,
     WorkflowRef,
 )
-from mp_comfyui_lab.evidence.models import EvidenceGraph
+from mp_comfyui_lab.evidence.models import (
+    EvidenceGraph,
+    EvidenceObservation,
+    EvidenceSource,
+    EvidenceSourceKind,
+)
+from mp_comfyui_lab.evidence.build import build_evidence_graph
 from mp_comfyui_lab.experiments.models import PlanningSource, SourceBundle
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
@@ -463,9 +469,7 @@ def test_plan_cli_writes_dry_run_artifacts_and_never_touches_executor(
             encoding="utf-8"
         )
     )
-    bundle = SourceBundle(
-        sources=(
-            PlanningSource(
+    source = PlanningSource(
                 workflow_id="1980860923768426497",
                 canonical_url="https://www.runninghub.ai/post/1980860923768426497",
                 raw_graph=graph,
@@ -473,8 +477,13 @@ def test_plan_cli_writes_dry_run_artifacts_and_never_touches_executor(
                 source_hash=source_graph_hash(graph),
                 capability_hash=capability_hash(graph),
                 evidence_ids=("evidence-1",),
-            ),
-        )
+            )
+    bundle = SourceBundle(
+        sources=(source,),
+        evidence_graph=EvidenceGraph(
+            sources=(EvidenceSource(source_id=source.workflow_id, kind=EvidenceSourceKind.CURRENT_NORMALIZED_GRAPH, canonical_url=source.canonical_url, source_hash=source.source_hash, capability_hash=source.capability_hash),),
+            observations=(EvidenceObservation(source_id=source.workflow_id),),
+        ),
     )
     loader = OfflinePlanningLoader(bundle)
     manifest = tmp_path / "plan.yaml"
@@ -523,6 +532,9 @@ dimensions:
         if path.replace("\\", "/").endswith("evidence/graph.json")
     )
     assert EvidenceGraph.model_validate_json(evidence_path.read_text(encoding="utf-8")).schema_version == "1"
+    imported = build_evidence_graph((), prior_experiment_roots=(tmp_path / "experiments",))
+    assert {source.source_id for source in imported.sources} == {source.workflow_id}
+    assert not [warning for warning in imported.warnings if warning.code == "malformed_artifact"]
 
 
 class ReadOnlyExecutor:

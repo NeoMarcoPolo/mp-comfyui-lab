@@ -55,22 +55,11 @@ class PlanningValidationError(ValueError):
 
 
 def evidence_graph_for_bundle(source_bundle: SourceBundle) -> EvidenceGraph:
-    """Build the Task 7 evidence artifact from the strict planning source DTOs."""
-    try:
-        return EvidenceGraph(
-            sources=tuple(
-                EvidenceSource(
-                    source_id=source.workflow_id,
-                    kind=EvidenceSourceKind.CURRENT_NORMALIZED_GRAPH,
-                    canonical_url=source.canonical_url,
-                    source_hash=source.source_hash,
-                    capability_hash=source.capability_hash,
-                )
-                for source in source_bundle.sources
-            )
-        )
-    except ValidationError as error:
-        raise PlanningValidationError(f"invalid planning evidence graph: {error}") from error
+    """Return the already-validated Task 7 evidence artifact unchanged."""
+    graph = source_bundle.evidence_graph
+    if not isinstance(graph, EvidenceGraph):
+        raise PlanningValidationError("source bundle requires a strict EvidenceGraph")
+    return graph
 
 
 def _canonical_json(value: Any) -> str:
@@ -224,22 +213,105 @@ def _safe_open_fixture(config: LabConfig, uri: str) -> int:
         finally:
             os.close(current)
 
-    # The Windows fallback remains nonblocking and validates reparse points both
-    # before and after open.  It never opens a special file for blocking I/O.
-    candidate = root.joinpath(*parts)
-    current = root
-    for part in parts:
-        current = current / part
-        if current.is_symlink() or _is_reparse_point(current):
-            raise SafetyError("fixture path contains a symlink or reparse point")
+    if os.name == "nt":
+        return _windows_open_fixture(root, parts)
+
+    # Platforms without descriptor-relative opens fail closed rather than using
+    # a pathname-only fallback.
+    raise SafetyError("safe fixture descriptor walking is unavailable")
+
+
+def _windows_open_fixture(root: Path, parts: tuple[str, ...]) -> int:
+    """Use Win32 handles, reparse-point opens, and final-handle containment."""
     try:
-        descriptor = os.open(candidate, os.O_RDONLY | nofollow | nonblock | binary)
-    except OSError as error:
-        raise SafetyError(f"cannot open fixture safely: {error}") from error
-    if candidate.is_symlink() or _is_reparse_point(candidate):
-        os.close(descriptor)
-        raise SafetyError("fixture path changed to a symlink or reparse point")
-    return descriptor
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+    except ImportError as error:  # pragma: no cover - Windows only
+        raise SafetyError("required Windows handle APIs are unavailable") from error
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_attributes = kernel32.GetFileAttributesW
+    get_attributes.argtypes = (wintypes.LPCWSTR,)
+    get_attributes.restype = wintypes.DWORD
+    get_final = kernel32.GetFinalPathNameByHandleW
+    get_final.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    get_final.restype = wintypes.DWORD
+    get_type = kernel32.GetFileType
+    get_type.argtypes = (wintypes.HANDLE,)
+    get_type.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    invalid = wintypes.HANDLE(-1).value
+    generic_read = 0x80000000
+    share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    file_attribute_reparse_point = 0x00000400
+    invalid_attributes = 0xFFFFFFFF
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_backup_semantics = 0x02000000
+    file_type_disk = 0x0001
+
+    def open_handle(path: Path, *, directory: bool) -> int:
+        attributes = get_attributes(str(path))
+        if attributes == invalid_attributes or attributes & file_attribute_reparse_point:
+            raise SafetyError("fixture path contains a reparse point or unavailable component")
+        flags = file_flag_open_reparse_point
+        if directory:
+            flags |= file_flag_backup_semantics
+        handle = create_file(
+            str(path), generic_read, share_read_write_delete, None, open_existing, flags, None
+        )
+        if handle == invalid:
+            raise SafetyError("cannot open fixture safely with Windows handle APIs")
+        return handle
+
+    def final_path(handle: int) -> Path:
+        size = get_final(handle, None, 0, 0)
+        if not size:
+            raise SafetyError("cannot verify final fixture handle path")
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        if not get_final(handle, buffer, len(buffer), 0):
+            raise SafetyError("cannot verify final fixture handle path")
+        return Path(buffer.value.removeprefix("\\\\?\\")).resolve()
+
+    root_handle = open_handle(root, directory=True)
+    try:
+        root_final = final_path(root_handle)
+    finally:
+        close_handle(root_handle)
+    current = root
+    for part in parts[:-1]:
+        current /= part
+        handle = open_handle(current, directory=True)
+        try:
+            final_path(handle)
+        finally:
+            close_handle(handle)
+    candidate = current / parts[-1]
+    handle = open_handle(candidate, directory=False)
+    try:
+        if get_type(handle) != file_type_disk:
+            raise SafetyError("fixture must be a regular disk file")
+        actual = final_path(handle)
+        try:
+            actual.relative_to(root_final)
+        except ValueError as error:
+            raise SafetyError("fixture handle escapes configured containment") from error
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        handle = None
+        return descriptor
+    finally:
+        if handle is not None:
+            close_handle(handle)
 
 
 def _media_type(initial: bytes) -> str | None:

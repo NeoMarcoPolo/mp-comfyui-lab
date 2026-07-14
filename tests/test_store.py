@@ -61,6 +61,17 @@ def test_store_creates_complete_layout_and_redacts_secrets(tmp_path):
     }
 
 
+def test_new_artifact_writes_never_clobber_an_existing_destination(tmp_path):
+    store = ExperimentStore(tmp_path)
+    store.create("no-clobber-001")
+    store.write_text_new("no-clobber-001", "plans/one.json", "first")
+
+    with pytest.raises(SafetyError, match="refusing to overwrite"):
+        store.write_text_new("no-clobber-001", "plans/one.json", "second")
+
+    assert (tmp_path / "no-clobber-001" / "plans" / "one.json").read_text(encoding="utf-8") == "first"
+
+
 def test_store_root_is_resolved(tmp_path):
     store = ExperimentStore(tmp_path / "parent" / ".." / "runs")
 

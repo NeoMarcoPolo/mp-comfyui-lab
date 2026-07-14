@@ -98,6 +98,23 @@ class ExperimentStore:
         destination = self._artifact_path(experiment_id, relative_path)
         return self._write_json_value(destination, sanitize_for_persistence(value))
 
+    def write_json_new(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+        value: Any,
+    ) -> Path:
+        """Publish a sanitized artifact only when its final name is unused."""
+        destination = self._artifact_path(experiment_id, relative_path)
+        serialized = json.dumps(
+            sanitize_for_persistence(value),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        self._atomic_write_new(destination, f"{serialized}\n")
+        return destination
+
     def write_sanitized_json(
         self,
         experiment_id: str,
@@ -402,6 +419,16 @@ class ExperimentStore:
         self._atomic_write(destination, value)
         return destination
 
+    def write_text_new(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+        value: str,
+    ) -> Path:
+        destination = self._artifact_path(experiment_id, relative_path)
+        self._atomic_write_new(destination, value)
+        return destination
+
     def read_json(self, experiment_id: str, relative_path: str | Path) -> Any:
         source = self._artifact_path(experiment_id, relative_path)
         return json.loads(source.read_text(encoding="utf-8"))
@@ -496,6 +523,42 @@ class ExperimentStore:
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
             os.replace(temporary_path, destination)
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    @staticmethod
+    def _atomic_write_new(destination: Path, value: str) -> None:
+        """Hard-link a fully fsynced temp file into place without replacement."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            file_descriptor, temporary_name = tempfile.mkstemp(
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                text=True,
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as temporary_file:
+                temporary_file.write(value)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            try:
+                os.link(temporary_path, destination)
+            except FileExistsError as error:
+                raise SafetyError("artifact already exists; refusing to overwrite") from error
+            except (AttributeError, NotImplementedError, OSError) as error:
+                raise SafetyError("safe no-clobber artifact publish is unavailable") from error
+            if os.name != "nt":
+                directory_fd = os.open(destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             if temporary_path is not None:
                 try:

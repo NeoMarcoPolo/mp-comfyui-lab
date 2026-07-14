@@ -28,6 +28,7 @@ from mp_comfyui_lab.json_types import (
     FrozenJsonObject,
     SanitizedJsonObject,
 )
+from mp_comfyui_lab.security import SafetyError, safe_filename
 
 
 NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -381,8 +382,11 @@ class ReferenceImageFixture(_FrozenModel):
         parts = relative.split("/")
         if not parts or any(part in {"", ".", ".."} for part in parts):
             raise ValueError("fixture URI contains an unsafe path component")
-        if any(any(ord(character) < 32 for character in part) for part in parts):
-            raise ValueError("fixture URI contains an unsafe path component")
+        for part in parts:
+            try:
+                safe_filename(part)
+            except SafetyError as error:
+                raise ValueError("fixture URI contains an unsafe path component") from error
         return prefix + "/".join(parts)
 
 
@@ -507,6 +511,10 @@ class Candidate(_FrozenModel):
     @field_validator("candidate_id")
     @classmethod
     def safe_candidate_id(cls, value: str) -> str:
+        try:
+            safe_filename(value)
+        except SafetyError as error:
+            raise ValueError("candidate_id must be a safe non-baseline artifact ID") from error
         if value == "baseline" or not _ARTIFACT_ID.fullmatch(value):
             raise ValueError("candidate_id must be a safe non-baseline artifact ID")
         return value
@@ -600,6 +608,7 @@ class SourceBundle(_FrozenModel):
     sources: tuple[PlanningSource, ...] = Field(min_length=1, max_length=MAX_MANIFEST_SOURCES)
     candidates: tuple[Candidate, ...] = Field(default=(), max_length=MAX_PLAN_VARIANTS)
     baseline_workflow_id: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=256)] | None = None
+    evidence_graph: Any
 
     @field_validator("sources", "candidates", mode="before")
     @classmethod
@@ -644,11 +653,18 @@ class SourceBundle(_FrozenModel):
     @model_validator(mode="after")
     def validate_evidence_and_baseline(self) -> Self:
         workflow_ids = {item.workflow_id for item in self.sources}
-        evidence_ids = {
-            evidence_id
-            for source in self.sources
-            for evidence_id in (*source.evidence_ids, source.workflow_id)
-        }
+        graph = self.evidence_graph
+        if (
+            type(graph).__name__ != "EvidenceGraph"
+            or type(graph).__module__ != "mp_comfyui_lab.evidence.models"
+        ):
+            raise ValueError("source bundle requires a strict EvidenceGraph")
+        graph_sources = {item.source_id for item in graph.sources}
+        graph_observations = {item.source_id for item in graph.observations}
+        workflow_ids_with_evidence = {item.workflow_id for item in self.sources}
+        if not workflow_ids_with_evidence.issubset(graph_sources & graph_observations):
+            raise ValueError("every planning source requires an evidence source and observation")
+        evidence_ids = graph_sources
         if self.baseline_workflow_id is not None and self.baseline_workflow_id not in workflow_ids:
             raise ValueError("baseline_workflow_id must identify a bundle source")
         missing = sorted(

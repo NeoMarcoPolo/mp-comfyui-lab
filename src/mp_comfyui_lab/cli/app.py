@@ -21,6 +21,8 @@ from mp_comfyui_lab.discovery.service import (
     InspectResult,
 )
 from mp_comfyui_lab.discovery.urls import UnsupportedSourceError, parse_runninghub_url
+from mp_comfyui_lab.evidence.build import build_evidence_graph
+from mp_comfyui_lab.evidence.models import CurrentEvidenceInput
 from mp_comfyui_lab.executors.base import Executor, ExecutorError, SearchRequest, WorkflowRef
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
 from mp_comfyui_lab.experiments.store import ExperimentStore
@@ -79,12 +81,12 @@ class ReadOnlyPlanningBundleLoader:
             for value in candidate.engagement.model_dump(mode="json").values()
         )
 
-    def _source_for_ref(self, ref: WorkflowRef) -> PlanningSource:
+    def _source_for_ref(self, ref: WorkflowRef) -> tuple[PlanningSource, CurrentEvidenceInput]:
         fetched = self._executor.fetch_workflow(ref)
         # Inspection is intentional evidence collection, not provider validation.
-        self._executor.inspect_capabilities(fetched)
+        capability_report = self._executor.inspect_capabilities(fetched)
         graph = fetched.graph
-        return PlanningSource(
+        source = PlanningSource(
             workflow_id=fetched.detail.candidate.workflow_id,
             canonical_url=fetched.detail.candidate.canonical_url,
             raw_graph=graph,
@@ -93,6 +95,14 @@ class ReadOnlyPlanningBundleLoader:
             capability_hash=capability_hash(graph),
             evidence_ids=(fetched.detail.candidate.workflow_id,),
             engagement=self._engagement(fetched.detail.candidate),
+        )
+        return source, CurrentEvidenceInput(
+            source_id=source.workflow_id,
+            detail=fetched.detail,
+            normalized_graph=source.normalized_graph,
+            capability_report=capability_report,
+            source_hash=source.source_hash,
+            capability_hash=source.capability_hash,
         )
 
     def load_source_bundle(self, brief: ExperimentBrief) -> SourceBundle:
@@ -120,15 +130,20 @@ class ReadOnlyPlanningBundleLoader:
                             canonical_url=candidate.canonical_url,
                         ),
                     )
-        sources = tuple(
+        records = tuple(
             self._source_for_ref(ref)
             for _, ref in sorted(refs.items())
         )
+        sources = tuple(record[0] for record in records)
         if not sources:
             raise PlanningValidationError("public discovery returned no workflows")
         return SourceBundle(
             sources=sources,
             baseline_workflow_id=first_url_id,
+            evidence_graph=build_evidence_graph(
+                tuple(record[1] for record in records),
+                prior_experiment_roots=(),
+            ),
         )
 
 
@@ -281,15 +296,29 @@ def _plan_artifacts(
         default_flow_style=False,
         sort_keys=True,
     )
-    snapshots = {
-        "manifest_sources": brief.sources.model_dump(mode="json"),
-        "sources": [item.model_dump(mode="json") for item in source_bundle.sources],
+    discovery_snapshot = {
+        "queries": list(brief.sources.queries),
+        "urls": list(brief.sources.urls),
+    }
+    source_snapshot = {
+        "sources": [
+            {
+                "workflow_id": item.workflow_id,
+                "canonical_url": item.canonical_url,
+                "source_hash": item.source_hash,
+                "capability_hash": item.capability_hash,
+                "evidence_ids": list(item.evidence_ids),
+                "engagement": item.engagement,
+            }
+            for item in source_bundle.sources
+        ],
         "candidates": [item.model_dump(mode="json") for item in source_bundle.candidates],
     }
     evidence_graph = evidence_graph_for_bundle(source_bundle)
     paths = [
         "brief.yaml",
-        "sources/search-results.json",
+        "search-results.json",
+        "sources/source-bundle.json",
         "evidence/graph.json",
         *(f"variants/{variant.variant_id}.json" for variant in plan.variants),
         f"plans/{plan.plan_hash}.json",
@@ -297,9 +326,10 @@ def _plan_artifacts(
     if len(paths) != len(set(paths)):
         raise PlanningValidationError("planned artifact paths must be unique")
     written = [
-        store.write_text(experiment_id, "brief.yaml", brief_document),
-        store.write_json(experiment_id, "sources/search-results.json", snapshots),
-        store.write_json(
+        store.write_text_new(experiment_id, "brief.yaml", brief_document),
+        store.write_json_new(experiment_id, "search-results.json", discovery_snapshot),
+        store.write_json_new(experiment_id, "sources/source-bundle.json", source_snapshot),
+        store.write_json_new(
             experiment_id,
             "evidence/graph.json",
             evidence_graph.model_dump(mode="json"),
@@ -307,7 +337,7 @@ def _plan_artifacts(
     ]
     for variant in plan.variants:
         written.append(
-            store.write_json(
+            store.write_json_new(
                 experiment_id,
                 f"variants/{variant.variant_id}.json",
                 variant.model_dump(mode="json"),
@@ -315,7 +345,7 @@ def _plan_artifacts(
         )
     # This final artifact is the durable success marker for the experiment.
     written.append(
-        store.write_json(
+        store.write_json_new(
             experiment_id,
             f"plans/{plan.plan_hash}.json",
             plan.model_dump(mode="json"),

@@ -8,7 +8,13 @@ import pytest
 from pydantic import ValidationError
 
 from mp_comfyui_lab.config import LabConfig
-from mp_comfyui_lab.evidence.models import ConfidenceLabel
+from mp_comfyui_lab.evidence.models import (
+    ConfidenceLabel,
+    EvidenceGraph,
+    EvidenceObservation,
+    EvidenceSource,
+    EvidenceSourceKind,
+)
 from mp_comfyui_lab.experiments.planning import (
     PlanningValidationError,
     build_plan,
@@ -100,7 +106,21 @@ def _source(graph: dict | None = None, *, workflow_id: str = "123") -> PlanningS
 
 
 def _bundle(*, candidates: tuple[Candidate, ...] = (), graph: dict | None = None) -> SourceBundle:
-    return SourceBundle(sources=(_source(graph),), candidates=candidates)
+    source = _source(graph)
+    return SourceBundle(
+        sources=(source,),
+        candidates=candidates,
+        evidence_graph=EvidenceGraph(
+            sources=(EvidenceSource(
+                source_id=source.workflow_id,
+                kind=EvidenceSourceKind.CURRENT_NORMALIZED_GRAPH,
+                canonical_url=source.canonical_url,
+                source_hash=source.source_hash,
+                capability_hash=source.capability_hash,
+            ),),
+            observations=(EvidenceObservation(source_id=source.workflow_id),),
+        ),
+    )
 
 
 def _config(tmp_path: Path) -> LabConfig:
@@ -368,6 +388,11 @@ def test_candidate_ids_and_fixture_uris_are_safe_and_canonical() -> None:
         _brief(fixtures={"reference_images": [{"uri": "C:/secret.png", "binding_index": 0}], "prompt_lines": ["x"]})
     brief = _brief(fixtures={"reference_images": [{"uri": "vault://characters/nested/hero.png", "binding_index": 0}], "prompt_lines": ["x"]})
     assert brief.fixtures.reference_images[0].uri == "vault://characters/nested/hero.png"
+    for unsafe in ("folder/CON", "portrait.png.", "portrait.png ", "nul"):
+        with pytest.raises(ValidationError):
+            _brief(fixtures={"reference_images": [{"uri": unsafe, "binding_index": 0}], "prompt_lines": ["x"]})
+    with pytest.raises(ValidationError):
+        Candidate(candidate_id="con", hypothesis="checkpoint", capability_signature="x", confidence="observed", evidence_ids=("123",), semantic_patch=patch)
 
 
 def test_candidate_tie_prefers_provenance_before_engagement(tmp_path: Path) -> None:
