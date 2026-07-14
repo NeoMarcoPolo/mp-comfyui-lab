@@ -32,7 +32,16 @@ from mp_comfyui_lab.experiments.models import (
     SourceBundle,
     ExperimentPlan,
 )
-from mp_comfyui_lab.mutations import LoraSpec, ReplaceLoraStack, SemanticPatch, SetRoleInput
+from mp_comfyui_lab.mutations import (
+    BoundaryInputMapping,
+    BoundaryOutputMapping,
+    DonorNode,
+    LoraSpec,
+    ReplaceLoraStack,
+    ReplaceSubgraph,
+    SemanticPatch,
+    SetRoleInput,
+)
 from mp_comfyui_lab.mutations.planner import validate_candidate_patch
 from mp_comfyui_lab.mutations.planner import compile_observed_candidates
 from mp_comfyui_lab.graph.patch import materialize_variant
@@ -617,3 +626,88 @@ def test_compiler_emits_neutral_lora_stack_template_that_materializes() -> None:
     result = materialize_variant(baseline_graph, candidate.semantic_patch)
     normalized = normalize_graph(result.graph)
     assert "donor.safetensors" in [str(item.value) for item in normalized.bindings(SemanticRole.LORA)]
+
+
+def test_replace_subgraph_uses_normalized_roles_not_class_name_keywords() -> None:
+    graph = _graph()
+    del graph["2"]["inputs"]["text"]
+    source = _source(graph)
+    mutation = ReplaceSubgraph(
+        target_node_ids=("2",),
+        donor_nodes=(
+            DonorNode(
+                node_id="d",
+                class_type="CLIPTextEncode",
+                inputs={"clip": ["4", 0]},
+            ),
+        ),
+        boundary_inputs=(
+            BoundaryInputMapping(
+                donor_node_id="d",
+                donor_field_name="clip",
+                source_node_id="4",
+                source_output_index=0,
+            ),
+        ),
+        boundary_outputs=(BoundaryOutputMapping(donor_node_id="d", donor_output_index=0, consumer_node_id="6", consumer_field_name="negative"),),
+        donor_workflow_id="124",
+        evidence_ids=("123",),
+    )
+    candidate = Candidate(candidate_id="encoder-subgraph", hypothesis="encoder", capability_signature="encoder-subgraph", confidence="observed", evidence_ids=("123",), semantic_patch=SemanticPatch(mutations=(mutation,)))
+    brief = _brief(dimensions={"encoder": "approved"})
+    assert validate_candidate_patch(candidate, candidate.semantic_patch, source, brief) is None
+
+    misleading = mutation.model_copy(
+        update={
+            "donor_nodes": (
+                DonorNode(
+                    node_id="d",
+                    class_type="EncodePromptShim",
+                    inputs={"clip": ["4", 0]},
+                ),
+            )
+        }
+    )
+    assert validate_candidate_patch(candidate, SemanticPatch(mutations=(misleading,)), source, brief) == "affected dimension cannot be proven"
+
+
+def test_replace_subgraph_rejects_equal_multi_dimension_topology() -> None:
+    source = _source()
+    mutation = ReplaceSubgraph(
+        target_node_ids=("2",),
+        donor_nodes=(
+            DonorNode(
+                node_id="d",
+                class_type="CLIPTextEncode",
+                inputs={"text": "donor", "clip": "clip"},
+            ),
+        ),
+        boundary_outputs=(
+            BoundaryOutputMapping(
+                donor_node_id="d",
+                donor_output_index=0,
+                consumer_node_id="6",
+                consumer_field_name="negative",
+            ),
+        ),
+        donor_workflow_id="124",
+        evidence_ids=("123",),
+    )
+    candidate = Candidate(
+        candidate_id="encoder-subgraph",
+        hypothesis="encoder",
+        capability_signature="encoder-subgraph",
+        confidence="observed",
+        evidence_ids=("123",),
+        semantic_patch=SemanticPatch(mutations=(mutation,)),
+    )
+
+    assert (
+        validate_candidate_patch(
+            candidate,
+            candidate.semantic_patch,
+            source,
+            _brief(dimensions={"encoder": "approved", "prompt_grammar": "approved"}),
+        )
+        == "affected dimension cannot be proven"
+    )

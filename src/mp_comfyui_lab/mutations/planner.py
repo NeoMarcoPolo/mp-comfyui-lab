@@ -9,6 +9,7 @@ import json
 from typing import TYPE_CHECKING
 
 from mp_comfyui_lab.graph.models import SemanticRole
+from mp_comfyui_lab.graph.normalize import GraphNormalizationError, normalize_graph
 from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.mutations.models import (
     ReplaceLoraStack,
@@ -320,25 +321,42 @@ def _mutation_dimensions(mutation, source: PlanningSource) -> set[str] | None:
             dimensions.add("lora_strength")
         return dimensions or set()
     if isinstance(mutation, ReplaceSubgraph):
+        valid_dimensions = {dimension.value for dimension in DimensionName}
         target_dimensions = {
             _ROLE_DIMENSIONS[role]
             for role in SemanticRole
             for binding in source.normalized_graph.bindings(role)
             if binding.node_id in mutation.target_node_ids and role in _ROLE_DIMENSIONS
         }
-        if len(target_dimensions) != 1:
+        if len(target_dimensions) != 1 or not target_dimensions <= valid_dimensions:
             return None
-        dimension = next(iter(target_dimensions))
-        donor_classes = tuple(node.class_type.casefold() for node in mutation.donor_nodes)
-        required = {
-            "encoder": "encode",
-            "prompt_grammar": "prompt",
-            "reference_strategy": "image",
-            "checkpoint": "load",
-        }.get(dimension)
-        if required is None or not any(required in class_type for class_type in donor_classes):
+        try:
+            donor_graph = {
+                node.node_id: {"class_type": node.class_type, "inputs": thaw_json(node.inputs), **thaw_json(node.metadata)}
+                for node in mutation.donor_nodes
+            }
+            for mapping in mutation.boundary_inputs:
+                donor_graph.setdefault(
+                    mapping.source_node_id,
+                    {"class_type": "PrimitiveNode", "inputs": {}},
+                )
+            donor = normalize_graph(donor_graph)
+        except GraphNormalizationError:
             return None
-        return {dimension}
+        donor_node_ids = {node.node_id for node in mutation.donor_nodes}
+        donor_dimensions = {
+            _ROLE_DIMENSIONS[role]
+            for role in SemanticRole
+            for binding in donor.bindings(role)
+            if binding.node_id in donor_node_ids and role in _ROLE_DIMENSIONS
+        }
+        if (
+            len(donor_dimensions) != 1
+            or not donor_dimensions <= valid_dimensions
+            or donor_dimensions != target_dimensions
+        ):
+            return None
+        return donor_dimensions
     return None
 
 
