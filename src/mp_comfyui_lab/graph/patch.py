@@ -55,7 +55,7 @@ class PatchTopologyError(PatchError):
 class _OperationScope:
     writes: frozenset[tuple[str, str]] = frozenset()
     controlled_nodes: frozenset[str] = frozenset()
-    added_nodes: frozenset[str] = frozenset()
+    added_nodes: tuple[str, ...] = ()
     deleted_nodes: frozenset[str] = frozenset()
 
 
@@ -95,10 +95,6 @@ def _normalize(graph: Mapping[str, Any]):
         raise error_type(message) from error
     except GraphNormalizationError as error:
         raise PatchValidationError(str(error)) from error
-
-
-def _next_numeric_ids(graph: Mapping[str, Any], count: int) -> list[str]:
-    return _next_numeric_ids_for_node_ids(graph, count)
 
 
 def _next_numeric_ids_for_node_ids(
@@ -322,7 +318,11 @@ def _template_lora_node(mutation: ReplaceLoraStack) -> dict[str, Any]:
     return node
 
 
-def _replace_lora_stack(graph: dict[str, Any], mutation: ReplaceLoraStack) -> None:
+def _replace_lora_stack(
+    graph: dict[str, Any],
+    mutation: ReplaceLoraStack,
+    reserved_added_ids: tuple[str, ...],
+) -> None:
     plan = _assert_linear_lora_chain(graph)
     normalized = _normalize(graph)
     bindings = list(normalized.bindings(SemanticRole.LORA))
@@ -338,7 +338,11 @@ def _replace_lora_stack(graph: dict[str, Any], mutation: ReplaceLoraStack) -> No
         raise PatchTopologyError(
             "growing a LoRA stack requires a provenance-bearing loader template"
         )
-    new_ids = iter(_next_numeric_ids(graph, additional))
+    if len(reserved_added_ids) != additional or any(
+        node_id in graph for node_id in reserved_added_ids
+    ):
+        raise PatchValidationError("LoRA allocation does not match its reserved node IDs")
+    new_ids = iter(reserved_added_ids)
     assigned_ids: list[str] = []
     reusable = iter(node_id for node_id in old_ids if node_id not in {
         old_by_name[lora.name].node_id for lora in requested if lora.name in old_by_name
@@ -397,7 +401,11 @@ def _replace_lora_stack(graph: dict[str, Any], mutation: ReplaceLoraStack) -> No
             graph[terminal_id]["inputs"][terminal_field] = [previous_clip[0], previous_clip[1]]
 
 
-def _replace_subgraph(graph: dict[str, Any], mutation: ReplaceSubgraph) -> None:
+def _replace_subgraph(
+    graph: dict[str, Any],
+    mutation: ReplaceSubgraph,
+    reserved_added_ids: tuple[str, ...],
+) -> None:
     _normalize(graph)
     targets = set(mutation.target_node_ids)
     missing = sorted(targets.difference(graph), key=_node_sort_key)
@@ -506,9 +514,13 @@ def _replace_subgraph(graph: dict[str, Any], mutation: ReplaceSubgraph) -> None:
         raise PatchValidationError("every donor node must lie on a path to a boundary output")
 
     ordered_donors = _ordered_donors(mutation, link_universe)
+    if len(reserved_added_ids) != len(ordered_donors) or any(
+        node_id in graph for node_id in reserved_added_ids
+    ):
+        raise PatchValidationError("subgraph allocation does not match its reserved node IDs")
     allocated = dict(zip(
         (node.node_id for node in ordered_donors),
-        _next_numeric_ids(graph, len(ordered_donors)),
+        reserved_added_ids,
         strict=True,
     ))
     for target in targets:
@@ -562,10 +574,9 @@ def _operation_scope(
         return _OperationScope(
             writes=frozenset(writes),
             controlled_nodes=frozenset(plan.node_ids),
-            added_nodes=frozenset(
+            added_nodes=tuple(
                 _next_numeric_ids_for_node_ids(
-                    (set(graph) - {"_meta"}) | set(reserved_node_ids),
-                    added,
+                    (set(graph) - {"_meta"}) | set(reserved_node_ids), added
                 )
             ),
             deleted_nodes=frozenset(plan.node_ids),
@@ -578,7 +589,7 @@ def _operation_scope(
                 for item in mutation.boundary_outputs
             ),
             controlled_nodes=targets,
-            added_nodes=frozenset(
+            added_nodes=tuple(
                 _next_numeric_ids_for_node_ids(
                     (set(graph) - {"_meta"}) | set(reserved_node_ids),
                     len(mutation.donor_nodes),
@@ -620,7 +631,7 @@ def _assert_operation_scope(
     after_ids = set(after) - {"_meta"}
     added = after_ids - before_ids
     deleted = before_ids - after_ids
-    if not added.issubset(scope.added_nodes) or not deleted.issubset(scope.deleted_nodes):
+    if not added.issubset(set(scope.added_nodes)) or not deleted.issubset(scope.deleted_nodes):
         raise PatchValidationError("operation changed nodes outside its declared scope")
     for node_id in sorted(before_ids.intersection(after_ids), key=_node_sort_key):
         original = before[node_id]
@@ -721,9 +732,9 @@ def _materialize(
         elif isinstance(mutation, SetNodeInput):
             _set_node_input(working, mutation)
         elif isinstance(mutation, ReplaceLoraStack):
-            _replace_lora_stack(working, mutation)
+            _replace_lora_stack(working, mutation, scopes[index].added_nodes)
         elif isinstance(mutation, ReplaceSubgraph):
-            _replace_subgraph(working, mutation)
+            _replace_subgraph(working, mutation, scopes[index].added_nodes)
         else:  # pragma: no cover - discriminated DTO prevents this branch.
             raise TypeError(f"unsupported mutation type {type(mutation).__name__}")
         _normalize(working)

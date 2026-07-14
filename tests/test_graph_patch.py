@@ -1032,3 +1032,54 @@ def test_subgraph_target_identifiers_are_bounded() -> None:
             donor_workflow_id="donor",
             evidence_ids=["evidence"],
         )
+
+
+def test_preflight_reserved_ids_survive_a_prior_lora_shrink() -> None:
+    graph = {
+        "1": _node("UNETLoader", unet_name="base.safetensors"),
+        "99": _node(
+            "LoraLoaderModelOnly",
+            model=["1", 0],
+            lora_name="first.safetensors",
+            strength_model=1.0,
+        ),
+        "100": _node(
+            "LoraLoaderModelOnly",
+            model=["99", 0],
+            lora_name="second.safetensors",
+            strength_model=1.0,
+        ),
+        "50": _node("KSampler", model=["100", 0], seed=1),
+        "2": _node("Old"),
+        "3": _node("Consumer", value=["2", 0]),
+    }
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceLoraStack(
+                loras=[LoraSpec(name="first.safetensors", strength_model=1.0)],
+                evidence_ids=["lora-evidence"],
+            ),
+            ReplaceSubgraph(
+                target_node_ids=["2"],
+                donor_nodes=[DonorNode(node_id="replacement", class_type="New", inputs={})],
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="replacement",
+                        donor_output_index=0,
+                        consumer_node_id="3",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="donor",
+                evidence_ids=["subgraph-evidence"],
+            ),
+        ]
+    )
+
+    first = materialize_variant(graph, patch)
+    second = materialize_variant(graph, patch)
+
+    assert "100" not in first.graph
+    assert first.graph["3"]["inputs"]["value"] == ("101", 0)
+    assert first.diff.mutations[1].added_node_ids == ("101",)
+    assert first.diff == second.diff
