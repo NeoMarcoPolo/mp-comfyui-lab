@@ -3,6 +3,7 @@ from __future__ import annotations
 from importlib import resources
 import re
 from typing import Annotated, Any
+import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
@@ -166,16 +167,60 @@ def load_query_expansions() -> QueryExpansionMap:
     return parse_query_expansions_yaml(document)
 
 
+def _script_kind(character: str) -> str | None:
+    if not character.isalnum():
+        return None
+    name = unicodedata.name(character, "")
+    if name.startswith(("CJK", "HIRAGANA", "KATAKANA", "HANGUL", "BOPOMOFO")):
+        return "cjk"
+    return "alphanumeric"
+
+
+def query_tokens(value: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    current: list[str] = []
+    current_kind: str | None = None
+    for character in value:
+        kind = _script_kind(character)
+        if kind is None:
+            if current:
+                tokens.append("".join(current).casefold())
+                current = []
+            current_kind = None
+            continue
+        if current and kind != current_kind:
+            tokens.append("".join(current).casefold())
+            current = []
+        current.append(character)
+        current_kind = kind
+    if current:
+        tokens.append("".join(current).casefold())
+    return tuple(tokens)
+
+
 def _term_pattern(term: str) -> re.Pattern[str]:
-    pieces = re.findall(r"[^\W_]+", term, flags=re.UNICODE)
-    is_ascii_phrase = bool(pieces) and all(piece.isascii() for piece in pieces)
-    if is_ascii_phrase:
-        body = r"[\W_]+".join(re.escape(piece) for piece in pieces)
-        return re.compile(
-            rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])",
-            re.IGNORECASE,
+    pieces = query_tokens(term)
+    if not pieces:
+        return re.compile(re.escape(term), re.IGNORECASE)
+    body_parts = [re.escape(pieces[0])]
+    for previous, current in zip(pieces[:-1], pieces[1:], strict=True):
+        separator = (
+            r"[\W_]*"
+            if _script_kind(previous[0]) != _script_kind(current[0])
+            else r"[\W_]+"
         )
-    return re.compile(re.escape(term), re.IGNORECASE)
+        body_parts.extend((separator, re.escape(current)))
+    prefix = (
+        r"(?<![A-Za-z0-9])"
+        if _script_kind(pieces[0][0]) == "alphanumeric"
+        else ""
+    )
+    suffix = (
+        r"(?![A-Za-z0-9])"
+        if _script_kind(pieces[-1][-1]) == "alphanumeric"
+        else ""
+    )
+    return re.compile(f"{prefix}{''.join(body_parts)}{suffix}", re.IGNORECASE)
 
 
 def term_match(value: str, term: str) -> re.Match[str] | None:

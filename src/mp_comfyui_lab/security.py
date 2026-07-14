@@ -2,26 +2,79 @@ import json
 import re
 from typing import Any
 import unicodedata
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 CANONICAL_SECRET_KEYS = frozenset(
     {
         "accesstoken",
+        "accesskey",
         "apikey",
+        "auth",
+        "authtoken",
         "authorization",
+        "bearertoken",
         "clientsecret",
         "cookie",
         "cookies",
         "credential",
+        "idtoken",
+        "oauthtoken",
+        "passphrase",
+        "passwd",
+        "password",
+        "privatekey",
         "refreshtoken",
+        "secret",
+        "secretaccesskey",
+        "secretkey",
+        "securitytoken",
+        "sessiontoken",
         "sig",
         "signature",
         "signedurl",
         "token",
         "xamzcredential",
+        "xamzsecuritytoken",
         "xamzsignature",
         "xapikey",
+    }
+)
+CANONICAL_SIGNED_QUERY_KEYS = frozenset(
+    {
+        "awsaccesskeyid",
+        "xamzalgorithm",
+        "xamzcredential",
+        "xamzdate",
+        "xamzexpires",
+        "xamzsecuritytoken",
+        "xamzsignature",
+        "xamzsignedheaders",
+        "xgoogalgorithm",
+        "xgoogcredential",
+        "xgoogdate",
+        "xgoogexpires",
+        "xgoogsignature",
+        "xgoogsignedheaders",
+    }
+    | CANONICAL_SECRET_KEYS
+)
+CANONICAL_AZURE_SAS_QUERY_KEYS = frozenset(
+    {
+        "se",
+        "si",
+        "sig",
+        "sip",
+        "skoid",
+        "sks",
+        "skt",
+        "sktid",
+        "skv",
+        "sp",
+        "spr",
+        "sr",
+        "st",
+        "sv",
     }
 )
 REDACTED = "[REDACTED]"
@@ -78,6 +131,28 @@ def _canonical_key(value: str) -> str:
 
 def _is_secret_key(value: str) -> bool:
     return _canonical_key(value) in CANONICAL_SECRET_KEYS
+
+
+def authentication_query_keys(
+    query_items: list[tuple[str, str]],
+) -> frozenset[str]:
+    canonical = {canonical_security_key(key) for key, _ in query_items}
+    rejected = set(canonical & CANONICAL_SIGNED_QUERY_KEYS)
+    if any(key.startswith("xamz") for key in canonical):
+        rejected.update(
+            key
+            for key in canonical
+            if key.startswith("xamz") or key == "awsaccesskeyid"
+        )
+    if any(key.startswith("xgoog") for key in canonical):
+        rejected.update(key for key in canonical if key.startswith("xgoog"))
+    if "sig" in canonical and canonical & CANONICAL_AZURE_SAS_QUERY_KEYS:
+        rejected.update(canonical & CANONICAL_AZURE_SAS_QUERY_KEYS)
+    return frozenset(rejected)
+
+
+def has_authentication_query(query_items: list[tuple[str, str]]) -> bool:
+    return bool(authentication_query_keys(query_items))
 
 
 def safe_filename(name: str) -> str:
@@ -187,6 +262,68 @@ def sanitize_embedded_urls(value: str) -> str:
         cursor = end
     sanitized.append(value[cursor:])
     return "".join(sanitized)
+
+
+def _sanitize_graph_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return value
+    try:
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return _strip_url_query(value)
+    rejected = authentication_query_keys(query_items)
+    retained = [
+        (key, _sanitize_graph_url(item) if HTTP_URL_START.match(item) else item)
+        for key, item in query_items
+        if canonical_security_key(key) not in rejected
+    ]
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(retained, doseq=True),
+            parsed.fragment,
+        )
+    )
+
+
+def _sanitize_graph_text(value: str) -> str:
+    sanitized: list[str] = []
+    cursor = 0
+    while match := HTTP_URL_START.search(value, cursor):
+        start = match.start()
+        end = _embedded_url_end(value, start)
+        url, suffix = _split_trailing_url_punctuation(value[start:end])
+        sanitized.append(value[cursor:start])
+        sanitized.append(f"{_sanitize_graph_url(url)}{suffix}")
+        cursor = end
+    sanitized.append(value[cursor:])
+    return "".join(sanitized)
+
+
+def sanitize_graph_for_persistence(value: Any) -> Any:
+    """Redact graph credentials while retaining material URL query parameters."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                REDACTED
+                if isinstance(key, str) and _is_secret_key(key)
+                else sanitize_graph_for_persistence(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_graph_for_persistence(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_graph_for_persistence(item) for item in value)
+    if isinstance(value, str):
+        return _sanitize_graph_text(value)
+    return value
 
 
 def _quoted_diagnostic_value_end(value: str, start: int) -> int:

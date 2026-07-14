@@ -21,7 +21,12 @@ from pydantic import (
 
 from mp_comfyui_lab.config import safe_load_yaml
 from mp_comfyui_lab.discovery.models import Engagement, WorkflowCandidate, WorkflowDetail
-from mp_comfyui_lab.discovery.query import ExpandedQuery, expand_query, term_match
+from mp_comfyui_lab.discovery.query import (
+    ExpandedQuery,
+    expand_query,
+    query_tokens,
+    term_match,
+)
 
 
 POSITIVE_WEIGHT_FIELDS = (
@@ -181,7 +186,7 @@ def load_default_ranking_weights(
 
 
 def _tokens(value: str) -> tuple[str, ...]:
-    return tuple(re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE))
+    return query_tokens(value)
 
 
 def _query_units(plan: ExpandedQuery) -> tuple[tuple[str, ...], ...]:
@@ -334,17 +339,35 @@ def _recency_scores(details: Sequence[WorkflowDetail]) -> dict[str, float]:
     }
 
 
-def _output_evidence(detail: WorkflowDetail) -> float:
+def _class_tokens(value: str) -> tuple[str, ...]:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", separated)
+    return query_tokens(separated)
+
+
+def _is_output_class(value: str) -> bool:
+    tokens = set(_class_tokens(value))
+    return bool(
+        tokens & {"output", "preview"}
+        or (tokens & {"save", "saver"} and "image" in tokens)
+    )
+
+
+def _output_evidence(
+    detail: WorkflowDetail,
+    evidence: GraphEvidence | None,
+) -> float:
     output_nodes = tuple(
         node
         for node in detail.primitive_nodes + detail.custom_nodes
-        if any(term in node.casefold() for term in ("save", "preview", "output"))
+        if _is_output_class(node)
     )
+    has_output_role = evidence is not None and "output" in evidence.roles
     return min(
         1.0,
         (0.4 if detail.candidate.covers else 0.0)
         + (0.4 if detail.preview is not None else 0.0)
-        + (0.2 if output_nodes else 0.0),
+        + (0.2 if output_nodes or has_output_role else 0.0),
     )
 
 
@@ -364,7 +387,7 @@ def _experimentability(detail: WorkflowDetail, evidence: GraphEvidence | None) -
     )
 
 
-def _coarse_group(detail: WorkflowDetail) -> str | None:
+def coarse_duplicate_group(detail: WorkflowDetail) -> str | None:
     if not (detail.used_models or detail.primitive_nodes or detail.custom_nodes):
         return None
     projection = {
@@ -458,7 +481,35 @@ def _duplicate_keys(
                 continue
             keys[workflow_id] = None
             continue
-        keys[workflow_id] = _coarse_group(detail)
+        keys[workflow_id] = coarse_duplicate_group(detail)
+
+    coarse_members: dict[str, list[str]] = defaultdict(list)
+    for detail in details:
+        coarse_key = coarse_duplicate_group(detail)
+        if coarse_key is not None:
+            coarse_members[coarse_key].append(detail.candidate.workflow_id)
+    for coarse_key, workflow_ids in coarse_members.items():
+        if any(
+            graph_evidence.get(workflow_id) is not None
+            and graph_evidence[workflow_id].canonicalization_error is not None
+            for workflow_id in workflow_ids
+        ):
+            for workflow_id in workflow_ids:
+                keys[workflow_id] = None
+            continue
+        enriched_ids = [
+            workflow_id
+            for workflow_id in workflow_ids
+            if workflow_id in successful
+        ]
+        uninspected_ids = [
+            workflow_id
+            for workflow_id in workflow_ids
+            if workflow_id not in graph_evidence
+        ]
+        if len(enriched_ids) == 1 and uninspected_ids:
+            for workflow_id in workflow_ids:
+                keys[workflow_id] = coarse_key
     return keys
 
 
@@ -535,8 +586,39 @@ def rank_candidates(
         if workflow_id in details
     )
     evidence_by_id = dict(graph_evidence or {})
+    duplicate_keys = _duplicate_keys(ordered_details, evidence_by_id)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for workflow_id, key in duplicate_keys.items():
+        if key is not None:
+            groups[key].append(workflow_id)
+    representatives: dict[str, str] = {}
+    for key, workflow_ids in groups.items():
+        if len(workflow_ids) < 2:
+            duplicate_keys[workflow_ids[0]] = None
+            continue
+        representatives[key] = min(
+            workflow_ids,
+            key=lambda workflow_id: (
+                -_count(details[workflow_id].candidate.engagement, "uses"),
+                -_count(details[workflow_id].candidate.engagement, "likes"),
+                -_count(details[workflow_id].candidate.engagement, "collects"),
+                workflow_id,
+                details[workflow_id].candidate.canonical_url,
+            ),
+        )
+    representative_ids = {
+        workflow_id
+        for workflow_id, key in duplicate_keys.items()
+        if key is None
+    } | set(representatives.values())
     engagement_maxima = _engagement_maxima(ordered_details)
-    creator_scores = _creator_scores(ordered_details)
+    creator_scores = _creator_scores(
+        tuple(
+            detail
+            for detail in ordered_details
+            if detail.candidate.workflow_id in representative_ids
+        )
+    )
     recency_scores = _recency_scores(ordered_details)
 
     raw: dict[str, dict[str, float]] = {}
@@ -550,37 +632,23 @@ def rank_candidates(
         raw[candidate.workflow_id] = {
             "relevance": _relevance(plan, detail),
             "engagement": _metric_score(candidate.engagement, engagement_maxima),
-            "output_evidence": _output_evidence(detail),
+            "output_evidence": _output_evidence(
+                detail,
+                evidence_by_id.get(candidate.workflow_id),
+            ),
             "recency": recency_scores[candidate.workflow_id],
-            "creator_track_record": creator_scores[creator],
+            "creator_track_record": creator_scores.get(creator, 0.0),
             "experimentability": _experimentability(
                 detail, evidence_by_id.get(candidate.workflow_id)
             ),
             "novelty": 1.0,
         }
 
-    duplicate_keys = _duplicate_keys(ordered_details, evidence_by_id)
-    groups: dict[str, list[str]] = defaultdict(list)
-    for workflow_id, key in duplicate_keys.items():
-        if key is not None:
-            groups[key].append(workflow_id)
-
     penalties = {detail.candidate.workflow_id: 0.0 for detail in ordered_details}
     for key, workflow_ids in groups.items():
         if len(workflow_ids) < 2:
-            duplicate_keys[workflow_ids[0]] = None
             continue
-        representative = min(
-            workflow_ids,
-            key=lambda workflow_id: (
-                -_positive_score(raw[workflow_id], weights, include_novelty=False),
-                -_count(details[workflow_id].candidate.engagement, "uses"),
-                -_count(details[workflow_id].candidate.engagement, "likes"),
-                -_count(details[workflow_id].candidate.engagement, "collects"),
-                workflow_id,
-                details[workflow_id].candidate.canonical_url,
-            ),
-        )
+        representative = representatives[key]
         for workflow_id in workflow_ids:
             raw[workflow_id]["novelty"] = 0.5 if workflow_id == representative else 0.0
             penalties[workflow_id] = 0.0 if workflow_id == representative else 1.0

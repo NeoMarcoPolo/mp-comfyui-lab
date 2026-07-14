@@ -13,6 +13,7 @@ from mp_comfyui_lab.security import (
 
 
 EXPERIMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
+MAX_EXPERIMENT_ID_LENGTH = 96
 WINDOWS_MOUNT_POINT_REPARSE_TAG = 0xA0000003
 EXPERIMENT_DIRECTORIES = (
     "sources",
@@ -44,10 +45,35 @@ class ExperimentStore:
     def create(self, experiment_id: str) -> Path:
         experiment_root = self.root(experiment_id)
         experiment_root.mkdir(parents=True, exist_ok=True)
+        self._create_layout(experiment_root)
+        return experiment_root
+
+    def create_unique(self, base_id: str) -> str:
+        self._validate_experiment_id(base_id)
+        self._store_root.mkdir(parents=True, exist_ok=True)
+        attempt = 1
+        while True:
+            suffix = "" if attempt == 1 else f"-{attempt}"
+            prefix_length = MAX_EXPERIMENT_ID_LENGTH - len(suffix)
+            if prefix_length < 3:
+                raise SafetyError("experiment collision suffix exceeds safe ID bounds")
+            prefix = base_id[:prefix_length].rstrip(". ")
+            candidate = f"{prefix}{suffix}"
+            self._validate_experiment_id(candidate)
+            experiment_root = self._store_root / candidate
+            self._reject_existing_links(self._store_root, Path(candidate))
+            try:
+                experiment_root.mkdir(exist_ok=False)
+            except FileExistsError:
+                attempt += 1
+                continue
+            self._create_layout(experiment_root)
+            return candidate
+
+    def _create_layout(self, experiment_root: Path) -> None:
         for directory in EXPERIMENT_DIRECTORIES:
             self._reject_existing_links(experiment_root, Path(directory))
             (experiment_root / directory).mkdir(exist_ok=True)
-        return experiment_root
 
     def write_json(
         self,
@@ -56,8 +82,20 @@ class ExperimentStore:
         value: Any,
     ) -> Path:
         destination = self._artifact_path(experiment_id, relative_path)
+        return self._write_json_value(destination, sanitize_for_persistence(value))
+
+    def write_sanitized_json(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+        value: Any,
+    ) -> Path:
+        destination = self._artifact_path(experiment_id, relative_path)
+        return self._write_json_value(destination, value)
+
+    def _write_json_value(self, destination: Path, value: Any) -> Path:
         serialized = json.dumps(
-            sanitize_for_persistence(value),
+            value,
             ensure_ascii=False,
             indent=2,
             sort_keys=True,

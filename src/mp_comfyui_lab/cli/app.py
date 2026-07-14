@@ -12,6 +12,7 @@ from mp_comfyui_lab.config import LabConfig, LabConfigError
 from mp_comfyui_lab.discovery.query import QueryExpansionConfigError
 from mp_comfyui_lab.discovery.ranking import RankedWorkflow, RankingConfigError
 from mp_comfyui_lab.discovery.service import (
+    DiscoveryIncompleteError,
     DiscoveryNotFoundError,
     DiscoveryResult,
     DiscoveryService,
@@ -148,6 +149,10 @@ def _discovery_payload(result: DiscoveryResult) -> dict[str, object]:
         "derivations": [
             item.model_dump(mode="json") for item in result.derivations
         ],
+        "incomplete": result.incomplete,
+        "diagnostics": [
+            item.model_dump(mode="json") for item in result.diagnostics
+        ],
         "results": [_ranked_payload(item) for item in result.results],
     }
 
@@ -241,6 +246,14 @@ def main(
     ) as error:
         emit_error(parsed.command, "usage", sanitize_untrusted_diagnostic(str(error)))
         return ExitCode.USAGE
+    except DiscoveryIncompleteError as error:
+        emit_error(
+            parsed.command,
+            "incomplete",
+            sanitize_untrusted_diagnostic(str(error)),
+            [item.model_dump(mode="json") for item in error.artifacts],
+        )
+        return ExitCode.INCOMPLETE
     except DiscoveryNotFoundError as error:
         emit_error(parsed.command, "not_found", sanitize_untrusted_diagnostic(str(error)))
         return ExitCode.NOT_FOUND

@@ -24,8 +24,8 @@ from mp_comfyui_lab.graph.normalize import (
 )
 from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.security import (
-    CANONICAL_SECRET_KEYS,
     canonical_security_key,
+    has_authentication_query,
 )
 
 
@@ -57,25 +57,6 @@ _PROMPT_FIELDS = frozenset(
 _REFERENCE_FIELDS = frozenset({"filename", "image", "imagename", "path"})
 _OUTPUT_PREFIX_FIELDS = frozenset({"prefix", "saveprefix"})
 _POWER_LORA_SLOT = re.compile(r"^lora_\d+$", re.IGNORECASE)
-_SIGNED_CREDENTIAL_QUERY_KEYS = frozenset(
-    {
-        "awsaccesskeyid",
-        "xamzalgorithm",
-        "xamzcredential",
-        "xamzdate",
-        "xamzexpires",
-        "xamzsecuritytoken",
-        "xamzsignature",
-        "xamzsignedheaders",
-        "xgoogalgorithm",
-        "xgoogcredential",
-        "xgoogdate",
-        "xgoogexpires",
-        "xgoogsignature",
-        "xgoogsignedheaders",
-    }
-    | CANONICAL_SECRET_KEYS
-)
 _MAX_HASH_JSON_DEPTH = 48
 _MAX_HASH_JSON_VALUES = 100_000
 _MAX_CANONICALIZATION_STATES = 4_096
@@ -310,8 +291,7 @@ def _canonicalize_capability_url(value: str) -> str:
         query_items = parse_qsl(parsed.query, keep_blank_values=True)
     except ValueError:
         return value
-    canonical_keys = {canonical_security_key(key) for key, _ in query_items}
-    if canonical_keys & _SIGNED_CREDENTIAL_QUERY_KEYS:
+    if has_authentication_query(query_items):
         return urlunsplit(
             (parsed.scheme, parsed.netloc, parsed.path, "", parsed.fragment)
         )

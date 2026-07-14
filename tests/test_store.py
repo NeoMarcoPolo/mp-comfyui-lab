@@ -2,9 +2,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
+from mp_comfyui_lab import security as security_module
 from mp_comfyui_lab.experiments import store as store_module
 from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.security import (
@@ -62,6 +65,50 @@ def test_store_root_is_resolved(tmp_path):
     assert store.root("abc") == (tmp_path / "runs" / "abc").resolve()
 
 
+def test_create_unique_allocates_deterministic_suffixes_without_overwrite(tmp_path):
+    store = ExperimentStore(tmp_path)
+
+    allocated = [store.create_unique("collision-001") for _ in range(3)]
+
+    assert allocated == ["collision-001", "collision-001-2", "collision-001-3"]
+    assert all((tmp_path / experiment_id).is_dir() for experiment_id in allocated)
+
+
+def test_create_unique_keeps_windows_safe_length_when_base_id_is_maximum(tmp_path):
+    store = ExperimentStore(tmp_path)
+    base_id = "a" * 96
+
+    first = store.create_unique(base_id)
+    second = store.create_unique(base_id)
+
+    assert first == base_id
+    assert second.endswith("-2")
+    assert len(second) == 96
+    assert store.root(second).is_dir()
+
+
+def test_create_unique_retries_concurrent_directory_races(tmp_path):
+    store = ExperimentStore(tmp_path)
+    workers = 8
+    barrier = Barrier(workers)
+
+    def allocate() -> str:
+        barrier.wait()
+        return store.create_unique("parallel-001")
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        allocated = list(pool.map(lambda _index: allocate(), range(workers)))
+
+    assert set(allocated) == {
+        "parallel-001",
+        *(f"parallel-001-{index}" for index in range(2, workers + 1)),
+    }
+    assert all(
+        EXPECTED_LAYOUT <= {path.name for path in (tmp_path / item).iterdir()}
+        for item in allocated
+    )
+
+
 @pytest.mark.parametrize(
     "experiment_id",
     [
@@ -107,6 +154,44 @@ def test_sanitize_for_persistence_redacts_nested_secrets_without_mutation():
     assert value["Authorization"] == "Bearer secret"
     assert value["nested"][0]["refresh_TOKEN"] == "refresh-secret"
     assert value["nested"][1][0]["Cookie"] == "session-secret"
+
+
+def test_graph_persistence_sanitizer_redacts_credentials_and_keeps_material_query():
+    graph = {
+        "1": {
+            "class_type": "RemoteModel",
+            "inputs": {
+                "password": "password-secret",
+                "auth_token": "auth-secret",
+                "apiKey": "api-secret",
+                "prompt": "A secret garden with a password reset sign",
+                "aws_url": (
+                    "https://models.example/base?revision=1&format=fp16&"
+                    "X-Amz-Credential=aws-secret&X-Amz-Signature=aws-signature"
+                ),
+                "azure_url": (
+                    "https://account.blob.core.windows.net/models/base"
+                    "?revision=1&sv=2025-01-05&sp=r&se=2030-01-01&sig=azure-secret"
+                ),
+            },
+        }
+    }
+
+    sanitized = security_module.sanitize_graph_for_persistence(graph)
+
+    inputs = sanitized["1"]["inputs"]
+    assert inputs["password"] == "[REDACTED]"
+    assert inputs["auth_token"] == "[REDACTED]"
+    assert inputs["apiKey"] == "[REDACTED]"
+    assert inputs["prompt"] == "A secret garden with a password reset sign"
+    assert inputs["aws_url"] == (
+        "https://models.example/base?revision=1&format=fp16"
+    )
+    assert inputs["azure_url"] == (
+        "https://account.blob.core.windows.net/models/base?revision=1"
+    )
+    assert graph["1"]["inputs"]["password"] == "password-secret"
+    assert "aws-secret" in graph["1"]["inputs"]["aws_url"]
 
 
 def test_sanitize_for_persistence_strips_any_http_url_query():

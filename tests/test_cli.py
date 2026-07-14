@@ -22,6 +22,7 @@ from mp_comfyui_lab.discovery.service import (
     DiscoveryResult,
     InspectResult,
 )
+from mp_comfyui_lab.discovery import service as service_module
 from mp_comfyui_lab.discovery.models import Engagement, WorkflowCandidate, WorkflowDetail
 from mp_comfyui_lab.discovery.urls import UnsupportedSourceError
 from mp_comfyui_lab.executors.base import ExecutorError
@@ -256,6 +257,26 @@ def test_search_cli_emits_ranked_urls_components_expansions_and_artifacts(capsys
     assert payload["data"]["expansions"][0]["concept"] == "next_scene"
     assert payload["artifacts"] == [
         {"kind": "search", "path": "/tmp/search-results.json"}
+    ]
+
+
+def test_cli_maps_incomplete_discovery_and_preserves_artifact_paths(capsys):
+    service = FakeCliService()
+    artifact = Artifact(kind="search", path="/tmp/partial-search-results.json")
+    service.error = service_module.DiscoveryIncompleteError(
+        "no provider search succeeded",
+        experiment_id="search-fixedid",
+        artifacts=(artifact,),
+        diagnostics=(),
+    )
+
+    code = main(["search", "qwen"], service=service)
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.INCOMPLETE
+    assert payload["error"]["kind"] == "incomplete"
+    assert payload["artifacts"] == [
+        {"kind": "search", "path": "/tmp/partial-search-results.json"}
     ]
 
 

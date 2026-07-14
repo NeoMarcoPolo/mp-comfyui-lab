@@ -24,14 +24,19 @@ def emit_success(
     )
 
 
-def emit_error(command: str | None, kind: str, message: str) -> None:
+def emit_error(
+    command: str | None,
+    kind: str,
+    message: str,
+    artifacts: list[Any] | None = None,
+) -> None:
     _emit(
         {
             "schema_version": "1",
             "ok": False,
             "command": command,
             "error": {"kind": kind, "message": message},
-            "artifacts": [],
+            "artifacts": artifacts or [],
         }
     )
 

@@ -23,6 +23,7 @@ from mp_comfyui_lab.discovery.query import (
     expand_query,
     load_query_expansions,
     parse_query_expansions_yaml,
+    term_match,
 )
 from mp_comfyui_lab.discovery.ranking import (
     POSITIVE_WEIGHT_FIELDS,
@@ -33,6 +34,7 @@ from mp_comfyui_lab.discovery.ranking import (
     rank_candidates,
 )
 from mp_comfyui_lab.discovery import ranking as ranking_module
+from mp_comfyui_lab.discovery import service as service_module
 from mp_comfyui_lab.discovery.service import DiscoveryNotFoundError, DiscoveryService
 from mp_comfyui_lab.discovery.urls import UnsupportedSourceError
 from mp_comfyui_lab.executors.base import (
@@ -43,6 +45,7 @@ from mp_comfyui_lab.executors.base import (
     WorkflowRef,
 )
 from mp_comfyui_lab.experiments.store import ExperimentStore
+from mp_comfyui_lab.graph.hashing import source_graph_hash
 from mp_comfyui_lab.json_types import FrozenDict
 
 
@@ -472,6 +475,21 @@ def test_hyphenated_query_phrase_is_one_conceptual_relevance_unit() -> None:
     assert ranked[0].components.relevance == 1.0
 
 
+def test_bilingual_tokenization_splits_latin_cjk_transitions() -> None:
+    candidate = _candidate("106", name="Qwen 视频 workflow", covers=False)
+
+    ranked = rank_candidates(
+        "Qwen视频",
+        (candidate,),
+        {"106": _detail(candidate)},
+        load_default_ranking_weights(),
+    )
+
+    assert ranked[0].components.relevance == 1.0
+    assert term_match("Qwen视频", "Qwen 视频") is not None
+    assert term_match("Qwencoder视频", "Qwen 视频") is None
+
+
 def test_engagement_uses_documented_log1p_metric_mix() -> None:
     high = _candidate("201", name="alpha", uses=99, likes=24, collects=8)
     low = _candidate("202", name="beta", uses=9, likes=3, collects=0)
@@ -622,6 +640,42 @@ def test_recency_and_creator_track_record_depend_only_on_active_set() -> None:
     )
 
 
+def test_output_evidence_uses_explicit_class_tokens_and_normalized_role() -> None:
+    node_classes = {
+        "351": "SaveImage",
+        "352": "Image Save",
+        "353": "Image Saver Simple",
+        "354": "UnsavedCondition",
+        "355": "UnsavedCondition",
+    }
+    candidates = tuple(
+        _candidate(workflow_id, name="same", covers=False)
+        for workflow_id in node_classes
+    )
+    details = {
+        item.workflow_id: _detail(
+            item,
+            primitive_nodes=(node_classes[item.workflow_id],),
+        )
+        for item in candidates
+    }
+
+    ranked = rank_candidates(
+        "unmatched",
+        candidates,
+        details,
+        load_default_ranking_weights(),
+        graph_evidence={"355": GraphEvidence(roles=("output",))},
+    )
+    by_id = {item.candidate.workflow_id: item for item in ranked}
+
+    assert by_id["351"].components.output_evidence == 0.2
+    assert by_id["352"].components.output_evidence == 0.2
+    assert by_id["353"].components.output_evidence == 0.2
+    assert by_id["354"].components.output_evidence == 0.0
+    assert by_id["355"].components.output_evidence == 0.2
+
+
 def test_coarse_duplicate_uses_ordered_models_and_sorted_node_inventory() -> None:
     first = _candidate("401", name="same", uses=100)
     second = _candidate("402", name="same", uses=10)
@@ -648,6 +702,85 @@ def test_coarse_duplicate_uses_ordered_models_and_sorted_node_inventory() -> Non
     assert by_id["402"].components.penalty == 1.0
     assert by_id["402"].duplicate_group.startswith("coarse:")
     assert "duplicate penalty" in by_id["402"].explanation
+
+
+def test_creator_track_record_counts_each_duplicate_group_once() -> None:
+    representative = _candidate(
+        "4100",
+        name="duplicate",
+        author="creator-duplicate",
+        uses=10,
+        covers=False,
+    )
+    competitor = _candidate(
+        "5100",
+        name="distinct",
+        author="creator-distinct",
+        uses=20,
+        covers=False,
+    )
+    baseline_details = {
+        "4100": _detail(
+            representative,
+            used_models=("same-model",),
+            primitive_nodes=("KSampler",),
+        ),
+        "5100": _detail(
+            competitor,
+            used_models=("different-model",),
+            primitive_nodes=("KSampler",),
+        ),
+    }
+    baseline = rank_candidates(
+        "unmatched",
+        (representative, competitor),
+        baseline_details,
+        load_default_ranking_weights(),
+    )
+    baseline_by_id = {item.candidate.workflow_id: item for item in baseline}
+    duplicates = tuple(
+        _candidate(
+            str(4100 + index),
+            name="duplicate",
+            author="creator-duplicate",
+            uses=10,
+            covers=False,
+        )
+        for index in range(99)
+    )
+    candidates = (*duplicates, competitor)
+    details = {
+        item.workflow_id: _detail(
+            item,
+            used_models=("same-model",),
+            primitive_nodes=("KSampler",),
+        )
+        for item in duplicates
+    }
+    details["5100"] = baseline_details["5100"]
+
+    ranked = rank_candidates(
+        "unmatched",
+        tuple(reversed(candidates)),
+        details,
+        load_default_ranking_weights(),
+    )
+    by_id = {item.candidate.workflow_id: item for item in ranked}
+    duplicate_scores = {
+        by_id[item.workflow_id].components.creator_track_record
+        for item in duplicates
+    }
+
+    assert duplicate_scores == {
+        baseline_by_id["4100"].components.creator_track_record
+    }
+    assert by_id["5100"].components.creator_track_record == (
+        baseline_by_id["5100"].components.creator_track_record
+    )
+    assert by_id["4100"].components.creator_track_record < (
+        by_id["5100"].components.creator_track_record
+    )
+    assert by_id["4100"].components.penalty == 0.0
 
 
 @pytest.mark.parametrize(
@@ -794,16 +927,24 @@ class FakeDiscoveryExecutor:
         details: Mapping[str, WorkflowDetail],
         *,
         graph: Mapping[str, Any] | None = None,
+        search_errors: Mapping[str, Exception] | None = None,
+        detail_errors: Mapping[str, Exception] | None = None,
+        fetch_errors: Mapping[str, Exception] | None = None,
     ) -> None:
         self.candidates = candidates
         self.details = dict(details)
         self.graph = dict(graph or _graph_fixture())
+        self.search_errors = dict(search_errors or {})
+        self.detail_errors = dict(detail_errors or {})
+        self.fetch_errors = dict(fetch_errors or {})
         self.search_calls: list[SearchRequest] = []
         self.detail_calls: list[tuple[str, str | None]] = []
         self.fetch_calls: list[WorkflowRef] = []
 
     def search(self, request: SearchRequest) -> SearchPage:
         self.search_calls.append(request)
+        if error := self.search_errors.get(request.sort):
+            raise error
         records = tuple(reversed(self.candidates)) if request.sort == "NEWEST" else self.candidates
         return SearchPage(
             records=records,
@@ -820,6 +961,8 @@ class FakeDiscoveryExecutor:
         canonical_url: str | None = None,
     ) -> WorkflowDetail:
         self.detail_calls.append((workflow_id, canonical_url))
+        if error := self.detail_errors.get(workflow_id):
+            raise error
         try:
             detail = self.details[workflow_id]
         except KeyError:
@@ -836,6 +979,8 @@ class FakeDiscoveryExecutor:
 
     def fetch_workflow(self, ref: WorkflowRef) -> FetchedWorkflow:
         self.fetch_calls.append(ref)
+        if error := self.fetch_errors.get(ref.workflow_id):
+            raise error
         detail = self.detail(ref.workflow_id, canonical_url=ref.canonical_url)
         return FetchedWorkflow(ref=ref, detail=detail, graph=self.graph)
 
@@ -898,6 +1043,30 @@ def test_service_implicit_sort_fanout_and_workflow_dedup_precede_public_detail(
     assert len(result.results) == 2
 
 
+def test_discovery_repeated_factory_id_uses_distinct_roots_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    candidates, details = _golden_candidates()
+    executor = FakeDiscoveryExecutor(candidates, details)
+    service = _service(tmp_path, executor)
+
+    first = service.search("first query", sort="HOTTEST")
+    first_snapshot = next(
+        Path(item.path)
+        for item in first.artifacts
+        if Path(item.path).name == "search-results.json"
+    )
+    first_bytes = first_snapshot.read_bytes()
+    second = service.search("second query", sort="HOTTEST")
+
+    assert first.experiment_id == "search-20260203t040506z-fixedid"
+    assert second.experiment_id == "search-20260203t040506z-fixedid-2"
+    assert first_snapshot.read_bytes() == first_bytes
+    assert json.loads(first_snapshot.read_text(encoding="utf-8"))["query"] == (
+        "first query"
+    )
+
+
 def test_service_explicit_sort_and_expansion_calls_are_unique(tmp_path: Path) -> None:
     candidates, details = _golden_candidates()
     executor = FakeDiscoveryExecutor(candidates, details)
@@ -913,6 +1082,164 @@ def test_service_explicit_sort_and_expansion_calls_are_unique(tmp_path: Path) ->
     assert len(executor.search_calls) == len(set(executor.search_calls))
     assert result.query_plan.queries[0] == "qwen next scene"
     assert result.query_plan.expansions[0].concept == "next_scene"
+
+
+def test_discovery_one_sort_failure_returns_partial_with_durable_attempts(
+    tmp_path: Path,
+) -> None:
+    candidates, details = _golden_candidates()
+    executor = FakeDiscoveryExecutor(
+        candidates,
+        details,
+        search_errors={
+            "HOTTEST": RuntimeError(
+                "provider unavailable apiKey=search-secret auth_token=token-secret"
+            )
+        },
+    )
+    expected_snapshot = (
+        tmp_path
+        / "experiments"
+        / "search-20260203t040506z-fixedid"
+        / "search-results.json"
+    )
+    original_search = executor.search
+    observed_checkpoints: list[dict[str, Any]] = []
+
+    def observe_search(request: SearchRequest) -> SearchPage:
+        assert expected_snapshot.is_file()
+        observed_checkpoints.append(
+            json.loads(expected_snapshot.read_text(encoding="utf-8"))
+        )
+        return original_search(request)
+
+    executor.search = observe_search  # type: ignore[method-assign]
+
+    result = _service(tmp_path, executor).search("qwen")
+
+    assert observed_checkpoints[0]["attempts"] == []
+    assert result.incomplete is True
+    assert len(result.results) == 2
+    assert len(result.diagnostics) == 1
+    failure = result.diagnostics[0]
+    assert (failure.operation, failure.status, failure.sort) == (
+        "search",
+        "failed",
+        "HOTTEST",
+    )
+    assert failure.error_kind == "RuntimeError"
+    assert "search-secret" not in failure.message
+    assert "token-secret" not in failure.message
+    snapshot = json.loads(expected_snapshot.read_text(encoding="utf-8"))
+    assert snapshot["status"] == "partial"
+    assert snapshot["incomplete"] is True
+    assert len(snapshot["attempts"]) == 6
+    assert [item["order"] for item in snapshot["attempts"]] == list(range(1, 7))
+
+
+def test_discovery_detail_failure_skips_candidate_with_diagnostic(
+    tmp_path: Path,
+) -> None:
+    candidates, details = _golden_candidates()
+    executor = FakeDiscoveryExecutor(
+        candidates,
+        details,
+        detail_errors={
+            QWEN_ID: RuntimeError("password=detail-secret provider detail failed")
+        },
+    )
+
+    result = _service(tmp_path, executor).search(
+        "qwen",
+        sort="HOTTEST",
+    )
+
+    assert result.incomplete is True
+    assert [item.candidate.workflow_id for item in result.results] == [NEXT_SCENE_ID]
+    assert len(result.diagnostics) == 1
+    diagnostic = result.diagnostics[0]
+    assert (diagnostic.operation, diagnostic.workflow_id) == ("detail", QWEN_ID)
+    assert "detail-secret" not in diagnostic.message
+    snapshot = next(
+        Path(item.path)
+        for item in result.artifacts
+        if Path(item.path).name == "search-results.json"
+    )
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert payload["incomplete"] is True
+    assert len(payload["results"]) == 1
+
+
+def test_discovery_graph_failure_retains_coarse_candidates_without_false_duplicate(
+    tmp_path: Path,
+) -> None:
+    first = _candidate("1095", name="first", uses=10, covers=False)
+    second = _candidate("1096", name="second", uses=5, covers=False)
+    details = {
+        item.workflow_id: _detail(
+            item,
+            used_models=("shared-model",),
+            primitive_nodes=("KSampler", "SaveImage"),
+        )
+        for item in (first, second)
+    }
+    executor = FakeDiscoveryExecutor(
+        (second, first),
+        details,
+        fetch_errors={
+            "1095": RuntimeError(
+                "graph failed auth_token=graph-secret password=password-secret"
+            )
+        },
+    )
+
+    result = _service(tmp_path, executor).search(
+        "workflow",
+        sort="HOTTEST",
+        include_graphs=True,
+    )
+
+    assert result.incomplete is True
+    assert {item.candidate.workflow_id for item in result.results} == {"1095", "1096"}
+    by_id = {item.candidate.workflow_id: item for item in result.results}
+    assert by_id["1095"].canonicalization_error
+    assert "graph-secret" not in by_id["1095"].canonicalization_error
+    assert by_id["1095"].components.penalty == 0.0
+    assert by_id["1096"].components.penalty == 0.0
+    assert by_id["1095"].duplicate_group is None
+    assert by_id["1096"].duplicate_group is None
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].operation == "graph"
+
+
+def test_discovery_all_search_failures_raise_incomplete_with_artifact(
+    tmp_path: Path,
+) -> None:
+    candidates, details = _golden_candidates()
+    executor = FakeDiscoveryExecutor(
+        candidates,
+        details,
+        search_errors={
+            sort: RuntimeError(f"{sort or 'default'} failed secret=provider-secret")
+            for sort in ("", "REPUTATION", "HOTTEST", "NEWEST")
+        },
+    )
+
+    with pytest.raises(service_module.DiscoveryIncompleteError) as raised:
+        _service(tmp_path, executor).search("qwen")
+
+    error = raised.value
+    assert error.experiment_id == "search-20260203t040506z-fixedid"
+    assert len(error.artifacts) == 1
+    snapshot = Path(error.artifacts[0].path)
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["incomplete"] is True
+    assert payload["results"] == []
+    assert len(payload["attempts"]) == 4
+    assert {item["status"] for item in payload["attempts"]} == {"failed"}
+    assert "provider-secret" not in snapshot.read_text(encoding="utf-8")
+    assert executor.detail_calls == []
 
 
 def test_service_persists_sanitized_search_and_detail_without_graph(
@@ -965,6 +1292,49 @@ def test_include_graphs_enriches_once_and_persists_roles_and_hashes(
     assert {"graph.json", "normalized.json", "hashes.json"} <= names
 
 
+def test_include_graphs_enriches_one_representative_per_coarse_group(
+    tmp_path: Path,
+) -> None:
+    duplicate_a = _candidate("1071", name="duplicate a", uses=20, covers=False)
+    duplicate_b = _candidate("1072", name="duplicate b", uses=10, covers=False)
+    distinct = _candidate("1073", name="distinct", uses=5, covers=False)
+    candidates = (duplicate_b, distinct, duplicate_a)
+    details = {
+        "1071": _detail(
+            duplicate_a,
+            used_models=("shared-model",),
+            primitive_nodes=("KSampler", "SaveImage"),
+        ),
+        "1072": _detail(
+            duplicate_b,
+            used_models=("shared-model",),
+            primitive_nodes=("SaveImage", "KSampler"),
+        ),
+        "1073": _detail(
+            distinct,
+            used_models=("distinct-model",),
+            primitive_nodes=("KSampler",),
+        ),
+    }
+    executor = FakeDiscoveryExecutor(candidates, details)
+
+    result = _service(tmp_path, executor).search(
+        "workflow",
+        sort="HOTTEST",
+        size=7,
+        include_graphs=True,
+    )
+
+    assert [item.workflow_id for item in executor.fetch_calls] == ["1071", "1073"]
+    assert all(call.size == 7 for call in executor.search_calls)
+    by_id = {item.candidate.workflow_id: item for item in result.results}
+    assert by_id["1071"].source_hash is not None
+    assert by_id["1072"].source_hash is None
+    assert by_id["1071"].duplicate_group == by_id["1072"].duplicate_group
+    assert by_id["1071"].components.penalty == 0.0
+    assert by_id["1072"].components.penalty == 1.0
+
+
 def test_inspect_accepts_strict_url_fetches_once_and_uses_canonical_url(
     tmp_path: Path,
 ) -> None:
@@ -989,6 +1359,66 @@ def test_inspect_accepts_strict_url_fetches_once_and_uses_canonical_url(
         "normalized.json",
         "hashes.json",
     }
+
+
+def test_inspect_persists_secret_safe_graph_with_reproducible_hashes(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate("1081", name="safe graph", covers=False)
+    detail = _detail(candidate, primitive_nodes=("SaveImage",))
+    graph = {
+        "1": {
+            "class_type": "RemoteModel",
+            "inputs": {
+                "endpoint": (
+                    "https://models.example/base?revision=1&format=fp16&"
+                    "X-Amz-Credential=aws-secret&X-Amz-Signature=aws-signature"
+                ),
+                "password": "password-secret",
+                "auth_token": "auth-secret",
+                "apiKey": "api-secret",
+            },
+        },
+        "2": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+                "clip": ["1", 0],
+                "text": "A secret garden, preserve this ordinary prompt text",
+            },
+        },
+        "3": {
+            "class_type": "SaveImage",
+            "inputs": {"images": ["2", 0]},
+        },
+    }
+    executor = FakeDiscoveryExecutor((candidate,), {"1081": detail}, graph=graph)
+
+    result = _service(tmp_path, executor).inspect(
+        "https://www.runninghub.ai/post/1081"
+    )
+
+    paths = {Path(item.path).name: Path(item.path) for item in result.artifacts}
+    persisted_graph = json.loads(paths["graph.json"].read_text(encoding="utf-8"))
+    hashes = json.loads(paths["hashes.json"].read_text(encoding="utf-8"))
+    serialized_artifacts = "\n".join(
+        path.read_text(encoding="utf-8") for path in paths.values()
+    )
+    assert source_graph_hash(persisted_graph) == hashes["source_hash"]
+    assert hashes["source_hash"] == result.source_hash
+    assert "revision=1&format=fp16" in paths["graph.json"].read_text(
+        encoding="utf-8"
+    )
+    assert "A secret garden, preserve this ordinary prompt text" in serialized_artifacts
+    for secret in (
+        "password-secret",
+        "auth-secret",
+        "api-secret",
+        "aws-secret",
+        "aws-signature",
+        "X-Amz-Credential",
+        "X-Amz-Signature",
+    ):
+        assert secret not in serialized_artifacts
 
 
 def test_inspect_rejects_non_runninghub_source_before_executor_call(
@@ -1046,6 +1476,53 @@ def test_similar_inspects_source_and_records_bounded_derivations(
         if Path(artifact.path).name == "search-results.json"
     )
     assert json.loads(snapshot.read_text(encoding="utf-8"))["derivations"]
+
+
+def test_similar_many_evidence_items_stays_category_bounded(
+    tmp_path: Path,
+) -> None:
+    source = _candidate(
+        "1085",
+        name="source",
+        tags=tuple(f"tag{index}" for index in range(10)),
+        covers=False,
+    )
+    models = tuple(f"model{index}.safetensors" for index in range(10))
+    loras = tuple(f"style{index}_lora.safetensors" for index in range(8))
+    detail = _detail(source, used_models=(*models, *loras))
+    executor = FakeDiscoveryExecutor((source,), {"1085": detail})
+
+    result = _service(tmp_path, executor).similar(
+        "https://www.runninghub.ai/post/1085",
+        sort="HOTTEST",
+    )
+
+    assert [item.source for item in result.derivations] == [
+        "model",
+        "lora",
+        "tag",
+        "prompt_grammar",
+        "capability_role",
+        "summary",
+    ]
+    assert len(executor.search_calls) == 6
+    assert len(result.query_plan.queries) == 6
+    assert len({call.query.casefold() for call in executor.search_calls}) == 6
+    assert all(len(call.query) <= 128 for call in executor.search_calls)
+
+
+def test_similar_overlong_category_evidence_fails_before_search(tmp_path: Path) -> None:
+    source = _candidate("1086", name="source", covers=False)
+    detail = _detail(source, used_models=(f"{'x' * 140}.safetensors",))
+    executor = FakeDiscoveryExecutor((source,), {"1086": detail})
+
+    with pytest.raises(service_module.DiscoveryEvidenceError, match="model"):
+        _service(tmp_path, executor).similar(
+            "https://www.runninghub.ai/post/1086",
+            sort="HOTTEST",
+        )
+
+    assert executor.search_calls == []
 
 
 def test_similar_without_derivable_evidence_stops_before_provider_search(
@@ -1108,13 +1585,18 @@ def test_similar_include_graphs_reuses_inspected_source_graph(tmp_path: Path) ->
     assert fetched_ids.count(QWEN_ID) == 1
 
 
-def test_service_missing_detail_is_typed_not_found(tmp_path: Path) -> None:
+def test_service_missing_detail_returns_partial_diagnostic(tmp_path: Path) -> None:
     candidate = _candidate("999", name="missing")
     executor = FakeDiscoveryExecutor((candidate,), {})
     service = _service(tmp_path, executor)
 
-    with pytest.raises(DiscoveryNotFoundError, match="999"):
-        service.search("missing", sort="REPUTATION")
+    result = service.search("missing", sort="REPUTATION")
+
+    assert result.results == ()
+    assert result.incomplete is True
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].operation == "detail"
+    assert result.diagnostics[0].workflow_id == "999"
 
 
 def test_service_does_not_mutate_provider_candidates_or_details(tmp_path: Path) -> None:
