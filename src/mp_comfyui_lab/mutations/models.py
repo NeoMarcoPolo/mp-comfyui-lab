@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -44,6 +45,10 @@ MutationOp = Literal[
     "replace_subgraph",
     "set_node_input",
 ]
+BoundedNodeId = Annotated[
+    ExactNodeId,
+    StringConstraints(max_length=MAX_MUTATION_TEXT_LENGTH),
+]
 
 
 class _FrozenModel(BaseModel):
@@ -69,7 +74,27 @@ def _sorted_unique_text(values: Any) -> Any:
 
 
 def _validate_json_value(value: Any, path: str) -> Any:
-    return validate_serializable_json(value, path)
+    validate_serializable_json(value, path)
+    stack = [(value, path)]
+    while stack:
+        item, item_path = stack.pop()
+        if isinstance(item, str):
+            if len(item) > MAX_MUTATION_TEXT_LENGTH:
+                raise ValueError(
+                    f"{item_path} string exceeds maximum length "
+                    f"of {MAX_MUTATION_TEXT_LENGTH}"
+                )
+        elif isinstance(item, Mapping):
+            for key, nested in item.items():
+                if len(key) > MAX_MUTATION_TEXT_LENGTH:
+                    raise ValueError(
+                        f"{item_path} object key exceeds maximum length "
+                        f"of {MAX_MUTATION_TEXT_LENGTH}"
+                    )
+                stack.append((nested, f"{item_path}.{key}"))
+        elif isinstance(item, (list, tuple)):
+            stack.extend((nested, f"{item_path}[{index}]") for index, nested in enumerate(item))
+    return value
 
 
 class LoraSpec(_FrozenModel):
@@ -79,7 +104,7 @@ class LoraSpec(_FrozenModel):
 
 
 class DonorNode(_FrozenModel):
-    node_id: ExactNodeId
+    node_id: BoundedNodeId
     class_type: BoundedText
     inputs: FrozenJsonObject
     metadata: FrozenJsonObject = Field(default_factory=FrozenDict)
@@ -102,7 +127,7 @@ class DonorNode(_FrozenModel):
 
 
 class LoraLoaderTemplate(_FrozenModel):
-    donor_node_id: ExactNodeId
+    donor_node_id: BoundedNodeId
     class_type: BoundedText
     inputs: FrozenJsonObject
     donor_workflow_id: BoundedText
@@ -132,16 +157,16 @@ class LoraLoaderTemplate(_FrozenModel):
 
 
 class BoundaryInputMapping(_FrozenModel):
-    donor_node_id: ExactNodeId
+    donor_node_id: BoundedNodeId
     donor_field_name: BoundedText
-    source_node_id: ExactNodeId
+    source_node_id: BoundedNodeId
     source_output_index: int = Field(ge=0)
 
 
 class BoundaryOutputMapping(_FrozenModel):
-    donor_node_id: ExactNodeId
+    donor_node_id: BoundedNodeId
     donor_output_index: int = Field(ge=0)
-    consumer_node_id: ExactNodeId
+    consumer_node_id: BoundedNodeId
     consumer_field_name: BoundedText
 
 
@@ -278,7 +303,7 @@ class ReplaceSubgraph(_FrozenModel):
 
 class SetNodeInput(_FrozenModel):
     op: Literal["set_node_input"] = "set_node_input"
-    node_id: ExactNodeId
+    node_id: BoundedNodeId
     field_name: BoundedText
     value: FrozenJsonValue
 
@@ -364,6 +389,13 @@ class MutationDiff(_FrozenModel):
     evidence_ids: tuple[BoundedText, ...] = Field(default=(), max_length=128)
     confidence: ConfidenceLabel | None = None
     donor_workflow_id: BoundedText | None = None
+    loader_template_donor_node_id: BoundedNodeId | None = None
+    loader_template_donor_workflow_id: BoundedText | None = None
+    loader_template_evidence_ids: tuple[BoundedText, ...] = Field(
+        default=(),
+        max_length=128,
+    )
+    added_node_ids: tuple[BoundedNodeId, ...] = Field(default=(), max_length=MAX_DONOR_NODES)
 
 
 class CanonicalDiff(_FrozenModel):

@@ -565,3 +565,329 @@ def test_diff_is_deterministic_across_input_mapping_order() -> None:
     )
 
     assert materialize_variant(first, patch).diff == materialize_variant(second, patch).diff
+
+
+def _two_lora_model_clip_graph() -> dict:
+    return {
+        "base": _node("CheckpointLoaderSimple", ckpt_name="base.safetensors"),
+        "first": _node(
+            "LoraLoader",
+            model=["base", 0],
+            clip=["base", 1],
+            lora_name="consistency.safetensors",
+            strength_model=0.65,
+            strength_clip=0.65,
+        ),
+        "second": _node(
+            "LoraLoader",
+            model=["first", 0],
+            clip=["first", 1],
+            lora_name="multi-angle.safetensors",
+            strength_model=0.8,
+            strength_clip=0.8,
+        ),
+        "sampler": _node("KSampler", model=["second", 0], seed=7),
+        "encoder": _node("CLIPTextEncode", clip=["second", 1], text="portrait"),
+    }
+
+
+def test_lora_reorder_rewires_standard_model_and_clip_paths() -> None:
+    graph = _two_lora_model_clip_graph()
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceLoraStack(
+                loras=[
+                    LoraSpec(name="multi-angle.safetensors", strength_model=0.8, strength_clip=0.8),
+                    LoraSpec(name="consistency.safetensors", strength_model=0.65, strength_clip=0.65),
+                ],
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    result = apply_patch(graph, patch)
+
+    assert result["second"]["inputs"]["model"] == ["base", 0]
+    assert result["second"]["inputs"]["clip"] == ["base", 1]
+    assert result["first"]["inputs"]["model"] == ["second", 0]
+    assert result["first"]["inputs"]["clip"] == ["second", 1]
+    assert result["sampler"]["inputs"]["model"] == ["first", 0]
+    assert result["encoder"]["inputs"]["clip"] == ["first", 1]
+
+
+def test_lora_reorder_rejects_intermediate_clip_consumer() -> None:
+    graph = _two_lora_model_clip_graph()
+    graph["stale-encoder"] = _node("CLIPTextEncode", clip=["first", 1], text="stale")
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceLoraStack(
+                loras=[LoraSpec(name="consistency.safetensors", strength_model=0.65)],
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    with pytest.raises(PatchTopologyError, match="orphan"):
+        apply_patch(graph, patch)
+
+
+@pytest.mark.parametrize("mapping_kind", ["unknown", "unused", "incomplete"])
+def test_subgraph_boundary_input_preflight_is_total(mapping_kind: str) -> None:
+    graph = {
+        "source": _node("ModelProvider", model_name="base.safetensors"),
+        "old": _node("Old", model=["source", 0]),
+        "consumer": _node("Consumer", value=["old", 0]),
+    }
+    boundary_inputs = []
+    donor_inputs: dict[str, object] = {"model": ["source", 0]}
+    if mapping_kind == "unknown":
+        boundary_inputs = [
+            BoundaryInputMapping(
+                donor_node_id="missing",
+                donor_field_name="model",
+                source_node_id="source",
+                source_output_index=0,
+            )
+        ]
+    elif mapping_kind == "unused":
+        donor_inputs = {"model": None, "unused": "literal"}
+        boundary_inputs = [
+            BoundaryInputMapping(
+                donor_node_id="donor",
+                donor_field_name="unused",
+                source_node_id="source",
+                source_output_index=0,
+            )
+        ]
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceSubgraph(
+                target_node_ids=["old"],
+                donor_nodes=[DonorNode(node_id="donor", class_type="Donor", inputs=donor_inputs)],
+                boundary_inputs=boundary_inputs,
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="donor",
+                        donor_output_index=0,
+                        consumer_node_id="consumer",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="donor",
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="boundary input"):
+        apply_patch(graph, patch)
+
+
+def test_subgraph_rejects_disconnected_donor_component() -> None:
+    graph = {
+        "old": _node("Old"),
+        "consumer": _node("Consumer", value=["old", 0]),
+    }
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceSubgraph(
+                target_node_ids=["old"],
+                donor_nodes=[
+                    DonorNode(node_id="used", class_type="Used", inputs={}),
+                    DonorNode(node_id="dead", class_type="Dead", inputs={}),
+                ],
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="used",
+                        donor_output_index=0,
+                        consumer_node_id="consumer",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="donor",
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="path"):
+        apply_patch(graph, patch)
+
+
+def test_subgraph_rejects_unknown_donor_output_index() -> None:
+    graph = {"old": _node("Old"), "consumer": _node("Consumer", value=["old", 0])}
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceSubgraph(
+                target_node_ids=["old"],
+                donor_nodes=[DonorNode(node_id="donor", class_type="Donor", inputs={})],
+                boundary_outputs=[
+                    BoundaryOutputMapping(
+                        donor_node_id="donor",
+                        donor_output_index=1,
+                        consumer_node_id="consumer",
+                        consumer_field_name="value",
+                    )
+                ],
+                donor_workflow_id="donor",
+                evidence_ids=["evidence"],
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="output"):
+        apply_patch(graph, patch)
+
+
+def test_set_role_input_must_remain_the_selected_role_binding() -> None:
+    graph = {"reference": _node("LoadImage", image="reference.png")}
+    patch = SemanticPatch(
+        mutations=[
+            SetRoleInput(
+                role=SemanticRole.REFERENCE_IMAGE,
+                binding_index=0,
+                field_name="image",
+                value="",
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="no longer"):
+        apply_patch(graph, patch)
+
+
+def test_set_role_input_rejects_out_of_range_but_allows_explicit_multiple_binding() -> None:
+    graph = {
+        "first": _node("LoadImage", image="first.png"),
+        "second": _node("LoadImage", image="second.png"),
+    }
+    out_of_range = SemanticPatch(
+        mutations=[
+            SetRoleInput(
+                role=SemanticRole.REFERENCE_IMAGE,
+                binding_index=2,
+                field_name="image",
+                value="missing.png",
+            )
+        ]
+    )
+    selected = SemanticPatch(
+        mutations=[
+            SetRoleInput(
+                role=SemanticRole.REFERENCE_IMAGE,
+                binding_index=1,
+                field_name="image",
+                value="selected.png",
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="index"):
+        apply_patch(graph, out_of_range)
+    assert apply_patch(graph, selected)["second"]["inputs"]["image"] == "selected.png"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cross_operation_conflicts_are_rejected_symmetrically(reverse: bool) -> None:
+    graph = {
+        "old": _node("Old", value=1),
+        "consumer": _node("Consumer", value=["old", 0]),
+    }
+    set_input = SetNodeInput(node_id="old", field_name="value", value=2)
+    replacement = ReplaceSubgraph(
+        target_node_ids=["old"],
+        donor_nodes=[DonorNode(node_id="donor", class_type="Donor", inputs={})],
+        boundary_outputs=[
+            BoundaryOutputMapping(
+                donor_node_id="donor",
+                donor_output_index=0,
+                consumer_node_id="consumer",
+                consumer_field_name="value",
+            )
+        ],
+        donor_workflow_id="donor",
+        evidence_ids=["evidence"],
+    )
+    patch = SemanticPatch(mutations=[replacement, set_input] if reverse else [set_input, replacement])
+
+    with pytest.raises(PatchValidationError, match="conflict"):
+        apply_patch(graph, patch)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_lora_controlled_nodes_conflict_with_direct_writes(
+    two_lora_graph: dict,
+    reverse: bool,
+) -> None:
+    direct = SetNodeInput(
+        node_id="upstream",
+        field_name="lora_name",
+        value="direct.safetensors",
+    )
+    lora = ReplaceLoraStack(
+        loras=[LoraSpec(name="consistency.safetensors", strength_model=0.65)],
+        evidence_ids=["evidence"],
+    )
+    patch = SemanticPatch(mutations=[lora, direct] if reverse else [direct, lora])
+
+    with pytest.raises(PatchValidationError, match="conflict"):
+        apply_patch(two_lora_graph, patch)
+
+
+def test_large_changed_mapping_has_the_same_apply_and_materialize_domain() -> None:
+    graph = {"node": _node("Primitive", payload={str(index): 0 for index in range(10_100)})}
+    patch = SemanticPatch(
+        mutations=[
+            SetNodeInput(
+                node_id="node",
+                field_name="payload",
+                value={str(index): 1 for index in range(10_100)},
+            )
+        ]
+    )
+
+    assert apply_patch(graph, patch)["node"]["inputs"]["payload"]["0"] == 1
+    result = materialize_variant(graph, patch)
+    assert len(result.diff.nodes[0].fields) == 1
+
+
+def test_lora_template_provenance_is_recorded_for_added_loaders(
+    two_lora_graph: dict,
+) -> None:
+    patch = SemanticPatch(
+        mutations=[
+            ReplaceLoraStack(
+                loras=[
+                    LoraSpec(name="consistency.safetensors", strength_model=0.65),
+                    LoraSpec(name="multi-angle.safetensors", strength_model=0.8),
+                    LoraSpec(name="new.safetensors", strength_model=0.5),
+                ],
+                evidence_ids=["outer-evidence"],
+                loader_template=LoraLoaderTemplate(
+                    donor_node_id="template-node",
+                    class_type="LoraLoaderModelOnly",
+                    inputs={"model": ["unused", 0], "lora_name": "donor", "strength_model": 1.0},
+                    donor_workflow_id="template-workflow",
+                    evidence_ids=["template-b", "template-a"],
+                ),
+            )
+        ]
+    )
+
+    mutation_diff = materialize_variant(two_lora_graph, patch).diff.mutations[0]
+
+    assert mutation_diff.evidence_ids == ("outer-evidence",)
+    assert mutation_diff.loader_template_donor_node_id == "template-node"
+    assert mutation_diff.loader_template_donor_workflow_id == "template-workflow"
+    assert mutation_diff.loader_template_evidence_ids == ("template-a", "template-b")
+    assert mutation_diff.added_node_ids == ("1",)
+
+
+def test_mutation_identifiers_and_nested_json_text_are_bounded() -> None:
+    too_long = "x" * 2_049
+    with pytest.raises(ValidationError, match="at most"):
+        SetNodeInput(node_id=too_long, field_name="value", value=1)
+    with pytest.raises(ValidationError, match="string"):
+        SetNodeInput(node_id="node", field_name="value", value={"nested": too_long})
+    with pytest.raises(ValidationError, match="key"):
+        SetNodeInput(node_id="node", field_name="value", value={too_long: "value"})
