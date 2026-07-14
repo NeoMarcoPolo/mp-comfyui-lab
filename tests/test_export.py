@@ -80,6 +80,24 @@ def _snapshot_tree(root: Path) -> dict[str, str]:
     }
 
 
+def _exported_review_contract(
+    bundle: Path,
+) -> tuple[dict[str, object], Path, dict[str, object]]:
+    index = json.loads(
+        (bundle / "review-manifest.json").read_text(encoding="utf-8")
+    )
+    relative_manifest = Path(index["canonical_manifest_path"])
+    assert not relative_manifest.is_absolute()
+    assert ".." not in relative_manifest.parts
+    manifest_path = (bundle / relative_manifest).resolve(strict=True)
+    manifest_path.relative_to(bundle.resolve(strict=True))
+    manifest_bytes = manifest_path.read_bytes()
+    assert hashlib.sha256(manifest_bytes).hexdigest() == index[
+        "canonical_manifest_sha256"
+    ]
+    return index, manifest_path, json.loads(manifest_bytes)
+
+
 def _write_png(path: Path, color: tuple[int, int, int]) -> bytes:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (32, 32), color=color).save(path, format="PNG")
@@ -361,13 +379,15 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
     assert selection["finalists_artifact_sha256"] == hashlib.sha256(
         (bundle / "finalists.json").read_bytes()
     ).hexdigest()
-    review_manifest = json.loads(
-        (bundle / "review-manifest.json").read_text(encoding="utf-8")
+    review_index, canonical_manifest_path, review_manifest = (
+        _exported_review_contract(bundle)
     )
-    assert selection["review_generation_id"] == review_manifest["generation_id"]
-    assert selection["review_manifest_sha256"] == hashlib.sha256(
-        (bundle / "review-manifest.json").read_bytes()
-    ).hexdigest()
+    assert selection["review_generation_id"] == review_index[
+        "review_generation_id"
+    ]
+    assert selection["review_manifest_sha256"] == review_index[
+        "canonical_manifest_sha256"
+    ]
     assert review_manifest["finalists_sha256"] == selection[
         "finalists_artifact_sha256"
     ]
@@ -380,11 +400,35 @@ def test_export_is_self_contained_byte_stable_and_production_read_only(
     ]
     assert "judgments" in comparison
     for artifact in review_manifest["artifacts"]:
-        review_artifact = bundle / "review" / artifact["path"]
+        review_artifact = canonical_manifest_path.parent / artifact["path"]
         content = review_artifact.read_bytes()
         assert hashlib.sha256(content).hexdigest() == artifact["sha256"]
         assert len(content) == artifact["bytes"]
     assert {root: _snapshot_tree(root) for root in production_roots} == before
+
+
+def test_exported_review_contract_resolves_every_manifest_artifact(
+    tmp_path: Path,
+) -> None:
+    store, _ = _persist_selected_experiment(tmp_path)
+    bundle = BundleExporter(store).export(EXPERIMENT_ID)
+
+    index, manifest_path, manifest = _exported_review_contract(bundle)
+
+    selection = json.loads(
+        (bundle / "selection.json").read_text(encoding="utf-8")
+    )
+    assert index["review_generation_id"] == selection["review_generation_id"]
+    assert index["canonical_manifest_sha256"] == selection[
+        "review_manifest_sha256"
+    ]
+    artifact_root = manifest_path.parent.resolve(strict=True)
+    for artifact in manifest["artifacts"]:
+        artifact_path = (artifact_root / artifact["path"]).resolve(strict=True)
+        artifact_path.relative_to(artifact_root)
+        content = artifact_path.read_bytes()
+        assert hashlib.sha256(content).hexdigest() == artifact["sha256"]
+        assert len(content) == artifact["bytes"]
 
 
 def test_export_rejects_tampered_recorded_output(tmp_path: Path) -> None:
@@ -539,9 +583,7 @@ def test_later_review_generation_gets_new_export_and_preserves_old_bundle(
 
     assert second != first
     assert _snapshot_tree(first) == first_snapshot
-    second_manifest = json.loads(
-        (second / "review-manifest.json").read_text(encoding="utf-8")
-    )
+    _, _, second_manifest = _exported_review_contract(second)
     assert second_manifest["generation_id"] == (
         later_review.finalists.review_generation_id
     )

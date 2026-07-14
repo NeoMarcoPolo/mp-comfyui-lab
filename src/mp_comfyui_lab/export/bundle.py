@@ -290,11 +290,11 @@ class BundleExporter:
             },
         )
         self._write_bytes(stage / "finalists.json", review.finalists_bytes)
-        self._write_bytes(
-            stage / "review-manifest.json",
-            review.manifest_bytes,
+        self._write_review_contract(
+            stage,
+            selection=selection,
+            review=review,
         )
-        self._copy_review_artifacts(stage, review)
         self._write_bytes(stage / "selection.json", selection_bytes)
 
         description = self._brief_goal(root, plan)
@@ -564,6 +564,56 @@ class BundleExporter:
                 expected_size=artifact.bytes,
                 context="review artifact",
             )
+
+    def _write_review_contract(
+        self,
+        stage: Path,
+        *,
+        selection: HumanSelection,
+        review: CanonicalReview,
+    ) -> None:
+        canonical_sha256 = hashlib.sha256(review.manifest_bytes).hexdigest()
+        if canonical_sha256 != selection.review_manifest_sha256:
+            raise StaleSelectionError(
+                "selected review manifest hash changed during export"
+            )
+        canonical_relative = Path("review", "manifest.json")
+        self._write_bytes(
+            stage / canonical_relative,
+            review.manifest_bytes,
+        )
+        self._copy_review_artifacts(stage, review)
+        review_root = (stage / canonical_relative).parent
+        for artifact in review.manifest.artifacts:
+            exported, availability = resolve_stored_artifact(
+                review_root,
+                artifact.path,
+            )
+            if exported is None:
+                raise BundleIntegrityError(
+                    "exported review manifest path is "
+                    f"{availability}: {artifact.path}"
+                )
+            try:
+                digest, size = hash_stored_artifact(exported)
+            except OSError as error:
+                raise BundleIntegrityError(
+                    "exported review artifact cannot be verified"
+                ) from error
+            if digest != artifact.sha256 or size != artifact.bytes:
+                raise BundleIntegrityError(
+                    "exported review artifact differs from its manifest"
+                )
+        self._write_json(
+            stage / "review-manifest.json",
+            {
+                "schema_version": "1",
+                "kind": "canonical_review_manifest_index",
+                "review_generation_id": review.manifest.generation_id,
+                "canonical_manifest_path": canonical_relative.as_posix(),
+                "canonical_manifest_sha256": canonical_sha256,
+            },
+        )
 
     def _brief_goal(self, root: Path, plan: ExperimentPlan) -> str:
         payload = thaw_json(plan.approval_payload)
