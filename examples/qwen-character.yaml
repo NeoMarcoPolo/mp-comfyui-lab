@@ -1,0 +1,23 @@
+goal: Preserve a Qwen character identity while exploring next-scene composition.
+sources:
+  queries:
+    - qwen character next scene
+  urls:
+    - https://www.runninghub.ai/post/1980860923768426497
+fixtures:
+  reference_images:
+    - uri: vault://characters/hero.png
+      binding_index: 0
+  prompt_lines:
+    - Wide establishing shot; preserve the character identity and wardrobe.
+    - Medium portrait; move the character into the next scene.
+    - Close cinematic moment; preserve the character identity and lighting continuity.
+expectations:
+  output_count: auto
+  media_types:
+    - image/png
+dimensions:
+  checkpoint: approved
+  lora_stack: approved
+  prompt_grammar: approved
+  sampler: approved

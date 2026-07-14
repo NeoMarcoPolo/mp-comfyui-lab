@@ -1,8 +1,9 @@
 import argparse
+import yaml
 from pathlib import Path
 import sys
 from enum import IntEnum
-from typing import NoReturn, Sequence
+from typing import NoReturn, Protocol, Sequence
 
 from pydantic import ValidationError
 
@@ -23,7 +24,17 @@ from mp_comfyui_lab.discovery.urls import UnsupportedSourceError
 from mp_comfyui_lab.executors.base import Executor, ExecutorError
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
 from mp_comfyui_lab.experiments.store import ExperimentStore
-from mp_comfyui_lab.security import SafetyError, sanitize_untrusted_diagnostic
+from mp_comfyui_lab.experiments.models import ExperimentBrief, SourceBundle
+from mp_comfyui_lab.experiments.planning import (
+    PlanningValidationError,
+    build_plan,
+    load_experiment_brief,
+)
+from mp_comfyui_lab.security import (
+    SafetyError,
+    sanitize_for_persistence,
+    sanitize_untrusted_diagnostic,
+)
 
 
 class ExitCode(IntEnum):
@@ -44,6 +55,12 @@ class HelpRequested(Exception):
 
 class UsageError(Exception):
     pass
+
+
+class PlanningBundleLoader(Protocol):
+    """Read-only source discovery seam for the dry-run planning command."""
+
+    def load_source_bundle(self, brief: ExperimentBrief) -> SourceBundle: ...
 
 
 class StructuredArgumentParser(argparse.ArgumentParser):
@@ -81,6 +98,9 @@ def _build_parser() -> StructuredArgumentParser:
     )
     similar.add_argument("url", metavar="URL")
     _add_discovery_options(similar, include_sort=True)
+
+    plan = subparsers.add_parser("plan", usage="%(prog)s MANIFEST")
+    plan.add_argument("manifest", metavar="MANIFEST")
     return parser
 
 
@@ -177,10 +197,74 @@ def _inspect_payload(result: InspectResult) -> dict[str, object]:
     }
 
 
+def _plan_artifacts(
+    *,
+    store: ExperimentStore,
+    brief: ExperimentBrief,
+    source_bundle: SourceBundle,
+    plan,
+) -> tuple[str, tuple[dict[str, str], ...]]:
+    """Persist a completed plan last, so partial writes never claim a plan."""
+    experiment_id = store.create_unique(f"plan-{plan.plan_hash[:16]}")
+    brief_document = yaml.safe_dump(
+        sanitize_for_persistence(brief.model_dump(mode="json")),
+        allow_unicode=False,
+        default_flow_style=False,
+        sort_keys=True,
+    )
+    snapshots = {
+        "manifest_sources": brief.sources.model_dump(mode="json"),
+        "sources": [item.model_dump(mode="json") for item in source_bundle.sources],
+        "candidates": [item.model_dump(mode="json") for item in source_bundle.candidates],
+    }
+    selected_source = next(
+        item
+        for item in source_bundle.sources
+        if item.workflow_id == plan.variants[0].source_workflow_id
+        and item.source_hash == plan.variants[0].source_hash
+    )
+    written = [
+        store.write_text(experiment_id, "brief.yaml", brief_document),
+        store.write_json(experiment_id, "sources/source-bundle.json", snapshots),
+        store.write_json(
+            experiment_id,
+            "evidence/graph.json",
+            {
+                "workflow_id": selected_source.workflow_id,
+                "canonical_url": selected_source.canonical_url,
+                "source_hash": selected_source.source_hash,
+                "capability_hash": selected_source.capability_hash,
+                "raw_graph": selected_source.model_dump(mode="json")["raw_graph"],
+                "normalized_graph": selected_source.normalized_graph.model_dump(
+                    mode="json"
+                ),
+            },
+        ),
+    ]
+    for variant in plan.variants:
+        written.append(
+            store.write_json(
+                experiment_id,
+                f"variants/{variant.variant_id}.json",
+                variant.model_dump(mode="json"),
+            )
+        )
+    # This final artifact is the durable success marker for the experiment.
+    written.append(
+        store.write_json(
+            experiment_id,
+            f"plans/{plan.plan_hash}.json",
+            plan.model_dump(mode="json"),
+        )
+    )
+    return experiment_id, tuple({"kind": "plan", "path": str(path)} for path in written)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     service: DiscoveryService | None = None,
+    planning_loader: PlanningBundleLoader | None = None,
     executor: Executor | None = None,
     cwd: str | Path | None = None,
 ) -> ExitCode:
@@ -199,6 +283,52 @@ def main(
     if parsed.command == "version":
         emit_success("version", {"version": __version__})
         return ExitCode.OK
+
+    if parsed.command == "plan":
+        try:
+            root = Path.cwd() if cwd is None else Path(cwd)
+            config = LabConfig.load(root)
+            brief = load_experiment_brief(parsed.manifest)
+            if planning_loader is None:
+                raise PlanningValidationError(
+                    "plan requires a read-only planning source-bundle loader"
+                )
+            source_bundle = planning_loader.load_source_bundle(brief)
+            if not isinstance(source_bundle, SourceBundle):
+                raise PlanningValidationError(
+                    "planning source-bundle loader returned an invalid bundle"
+                )
+            plan = build_plan(brief, source_bundle, config=config)
+            experiment_id, artifacts = _plan_artifacts(
+                store=ExperimentStore(config.experiments_root),
+                brief=brief,
+                source_bundle=source_bundle,
+                plan=plan,
+            )
+            emit_success(
+                "plan",
+                {
+                    "experiment_id": experiment_id,
+                    "plan_hash": plan.plan_hash,
+                    "capability_coverage": [
+                        item.value for item in plan.capability_coverage
+                    ],
+                    "warnings": list(plan.warnings),
+                    "variant_ids": [item.variant_id for item in plan.variants],
+                    "artifact_paths": [item["path"] for item in artifacts],
+                },
+                list(artifacts),
+            )
+            return ExitCode.OK
+        except (ValidationError, LabConfigError, PlanningValidationError) as error:
+            emit_error("plan", "usage", sanitize_untrusted_diagnostic(str(error)))
+            return ExitCode.USAGE
+        except SafetyError as error:
+            emit_error("plan", "safety", sanitize_untrusted_diagnostic(str(error)))
+            return ExitCode.SAFETY
+        except Exception as error:
+            emit_error("plan", "execution", sanitize_untrusted_diagnostic(str(error)))
+            return ExitCode.EXECUTION
 
     try:
         discovery = (

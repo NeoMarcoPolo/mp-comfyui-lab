@@ -27,6 +27,8 @@ from mp_comfyui_lab.discovery import service as service_module
 from mp_comfyui_lab.discovery.models import Engagement, WorkflowCandidate, WorkflowDetail
 from mp_comfyui_lab.discovery.urls import UnsupportedSourceError
 from mp_comfyui_lab.executors.base import ExecutorError
+from mp_comfyui_lab.experiments.models import PlanningSource, SourceBundle
+from mp_comfyui_lab.graph.normalize import normalize_graph
 
 
 VERSION_DOCUMENT = (
@@ -88,7 +90,7 @@ def test_unknown_command_preserves_argparse_diagnostic(capsys):
     assert result == ExitCode.USAGE
     assert document["error"]["message"] == (
         "argument command: invalid choice: 'unknown' "
-        "(choose from version, search, inspect, similar)"
+        "(choose from version, search, inspect, similar, plan)"
     )
 
 
@@ -428,3 +430,83 @@ def test_dependency_wiring_passes_cwd_and_injected_executor(
     _single_json_document(capsys.readouterr())
     assert code == ExitCode.OK
     assert calls == [(tmp_path, executor)]
+
+
+class OfflinePlanningLoader:
+    def __init__(self, bundle):
+        self.bundle = bundle
+        self.briefs = []
+
+    def load_source_bundle(self, brief):
+        self.briefs.append(brief)
+        return self.bundle
+
+
+class NoExecutorPath:
+    def __getattr__(self, name):
+        raise AssertionError(f"plan CLI touched executor attribute {name}")
+
+
+def test_plan_cli_writes_dry_run_artifacts_and_never_touches_executor(
+    tmp_path,
+    capsys,
+):
+    graph = json.loads(
+        (Path(__file__).parent / "fixtures" / "runninghub" / "qwen_graph.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    bundle = SourceBundle(
+        sources=(
+            PlanningSource(
+                workflow_id="1980860923768426497",
+                canonical_url="https://www.runninghub.ai/post/1980860923768426497",
+                raw_graph=graph,
+                normalized_graph=normalize_graph(graph),
+                source_hash="a" * 64,
+                capability_hash="b" * 64,
+                evidence_ids=("evidence-1",),
+            ),
+        )
+    )
+    loader = OfflinePlanningLoader(bundle)
+    manifest = tmp_path / "plan.yaml"
+    manifest.write_text(
+        """goal: character variation
+sources:
+  queries: [qwen character]
+  urls: ["https://www.runninghub.ai/post/1980860923768426497?token=secret"]
+fixtures:
+  reference_images: []
+  prompt_lines: [wide shot, close portrait, night scene]
+expectations:
+  output_count: auto
+  media_types: [image/png]
+dimensions:
+  checkpoint: approved
+  lora_stack: approved
+  prompt_grammar: approved
+  sampler: approved
+""",
+        encoding="utf-8",
+    )
+
+    code = main(
+        ["plan", str(manifest)],
+        planning_loader=loader,
+        executor=NoExecutorPath(),
+        cwd=tmp_path,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.OK
+    assert payload["command"] == "plan"
+    assert payload["data"]["variant_ids"] == ["baseline"]
+    assert loader.briefs[0].sources.urls == (
+        "https://www.runninghub.ai/post/1980860923768426497",
+    )
+    artifact_paths = {item["path"] for item in payload["artifacts"]}
+    assert any(path.endswith("brief.yaml") for path in artifact_paths)
+    assert any("plans" in path for path in artifact_paths)
+    persisted = "\n".join(Path(path).read_text(encoding="utf-8") for path in artifact_paths)
+    assert "token=secret" not in persisted

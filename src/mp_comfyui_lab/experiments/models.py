@@ -3,8 +3,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC
 from enum import StrEnum
+import json
 from pathlib import Path
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -17,6 +18,8 @@ from pydantic import (
     model_validator,
 )
 
+from mp_comfyui_lab.discovery.urls import UnsupportedSourceError, parse_runninghub_url
+from mp_comfyui_lab.graph.models import FrozenJsonValue, NormalizedGraph
 from mp_comfyui_lab.json_types import (
     FrozenJsonObject,
     SanitizedJsonObject,
@@ -278,3 +281,334 @@ class RunRecord(_FrozenModel):
                 "a nonblank provider_task_id must be attached during "
                 "ambiguous reconciliation"
             )
+
+
+# Planning DTOs deliberately use tuples rather than mutable containers.  Plans are
+# evidence records, so their input shape is part of their durable contract.
+MAX_MANIFEST_BYTES = 1_048_576
+MAX_MANIFEST_DEPTH = 48
+MAX_MANIFEST_VALUES = 100_000
+MAX_MANIFEST_SCALAR_LENGTH = 8_192
+MAX_MANIFEST_SOURCES = 128
+MAX_FIXTURES = 64
+MAX_PROMPT_LINES = 512
+MAX_PLAN_VARIANTS = 512
+
+
+class DimensionName(StrEnum):
+    CHECKPOINT = "checkpoint"
+    LORA_STACK = "lora_stack"
+    LORA_STRENGTH = "lora_strength"
+    PROMPT_GRAMMAR = "prompt_grammar"
+    SAMPLER = "sampler"
+    SCHEDULER = "scheduler"
+    ENCODER = "encoder"
+    REFERENCE_STRATEGY = "reference_strategy"
+    OUTPUT_DIMENSIONS = "output_dimensions"
+    SEED_VARIANCE = "seed_variance"
+
+
+class DimensionPolicy(StrEnum):
+    APPROVED = "approved"
+    BASELINE_ONLY = "baseline_only"
+    DISABLED = "disabled"
+
+
+class PlanningConfidence(StrEnum):
+    OBSERVED = "observed"
+    STRONGLY_INFERRED = "strongly_inferred"
+    WEAKLY_INFERRED = "weakly_inferred"
+    UNEXPLORED = "unexplored"
+
+
+class SourceSpec(_FrozenModel):
+    queries: tuple[Annotated[str, StringConstraints(strict=True, min_length=1, max_length=MAX_MANIFEST_SCALAR_LENGTH)], ...] = Field(default=(), max_length=MAX_MANIFEST_SOURCES)
+    urls: tuple[Annotated[str, StringConstraints(strict=True, min_length=1, max_length=2_048)], ...] = Field(default=(), max_length=MAX_MANIFEST_SOURCES)
+
+    @field_validator("queries", "urls", mode="before")
+    @classmethod
+    def normalize_arrays(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            raise ValueError("sources queries and urls must be explicit arrays")
+        return tuple(value)
+
+    @field_validator("urls")
+    @classmethod
+    def canonicalize_urls(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        canonical: list[str] = []
+        for value in values:
+            try:
+                canonical.append(parse_runninghub_url(value).canonical_url)
+            except UnsupportedSourceError as error:
+                raise ValueError(str(error)) from error
+        return tuple(canonical)
+
+    @model_validator(mode="after")
+    def require_one_source(self) -> Self:
+        if not self.queries and not self.urls:
+            raise ValueError("sources must declare at least one query or URL")
+        return self
+
+
+class ReferenceImageFixture(_FrozenModel):
+    uri: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=2_048)]
+    binding_index: int = Field(ge=0, le=4_095)
+
+
+class FixtureSpec(_FrozenModel):
+    reference_images: tuple[ReferenceImageFixture, ...] = Field(default=(), max_length=MAX_FIXTURES)
+    prompt_lines: tuple[str, ...] = Field(min_length=1, max_length=MAX_PROMPT_LINES)
+
+    @field_validator("reference_images", "prompt_lines", mode="before")
+    @classmethod
+    def explicit_arrays(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            raise ValueError("fixtures must use explicit ordered arrays")
+        return tuple(value)
+
+    @field_validator("prompt_lines")
+    @classmethod
+    def validate_prompt_lines(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            if not isinstance(value, str) or not value:
+                raise ValueError("prompt_lines must contain nonempty strings")
+            if len(value) > MAX_MANIFEST_SCALAR_LENGTH:
+                raise ValueError("prompt line exceeds maximum length")
+        return values
+
+    @model_validator(mode="after")
+    def unique_reference_bindings(self) -> Self:
+        indexes = [item.binding_index for item in self.reference_images]
+        if len(indexes) != len(set(indexes)):
+            raise ValueError("reference fixture binding indexes must be unique")
+        return self
+
+
+class ExpectationSpec(_FrozenModel):
+    output_count: int | Literal["auto"]
+    media_types: tuple[Annotated[str, StringConstraints(strict=True, min_length=1, max_length=128)], ...] = Field(default=(), max_length=32)
+
+    @field_validator("output_count")
+    @classmethod
+    def positive_output_count(cls, value: int | str) -> int | str:
+        if value == "auto":
+            return value
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("output_count must be a positive strict integer or 'auto'")
+        return value
+
+    @field_validator("media_types", mode="before")
+    @classmethod
+    def media_type_array(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            raise ValueError("media_types must be an explicit array")
+        return tuple(value)
+
+
+class DimensionApproval(_FrozenModel):
+    name: DimensionName
+    policy: DimensionPolicy
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def parse_name(cls, value: Any) -> DimensionName:
+        return DimensionName(value)
+
+    @field_validator("policy", mode="before")
+    @classmethod
+    def parse_policy(cls, value: Any) -> DimensionPolicy:
+        return DimensionPolicy(value)
+
+
+class ExperimentBrief(_FrozenModel):
+    goal: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=MAX_MANIFEST_SCALAR_LENGTH)]
+    sources: SourceSpec
+    fixtures: FixtureSpec
+    expectations: ExpectationSpec
+    dimensions: tuple[DimensionApproval, ...] = Field(min_length=1, max_length=len(DimensionName))
+
+    @field_validator("dimensions", mode="before")
+    @classmethod
+    def validate_dimension_map(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            raise ValueError("dimensions must be a known capability map")
+        return tuple({"name": name, "policy": policy} for name, policy in value.items())
+
+    @field_validator("dimensions")
+    @classmethod
+    def canonical_dimensions(
+        cls,
+        values: tuple[DimensionApproval, ...],
+    ) -> tuple[DimensionApproval, ...]:
+        if len({item.name for item in values}) != len(values):
+            raise ValueError("dimensions must not repeat capability names")
+        return tuple(sorted(values, key=lambda item: item.name.value))
+
+    def policy_for(self, name: DimensionName) -> DimensionPolicy:
+        for item in self.dimensions:
+            if item.name is name:
+                return item.policy
+        return DimensionPolicy.DISABLED
+
+
+class CandidateClaim(_FrozenModel):
+    dimension: DimensionName
+    value: FrozenJsonValue
+    binding_index: int = Field(default=0, ge=0, le=4_095)
+
+    @field_validator("dimension", mode="before")
+    @classmethod
+    def parse_dimension(cls, value: Any) -> DimensionName:
+        return DimensionName(value)
+
+
+class Candidate(_FrozenModel):
+    candidate_id: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=256)]
+    hypothesis: DimensionName
+    capability_signature: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=8_192)]
+    confidence: PlanningConfidence
+    evidence_ids: tuple[Annotated[str, StringConstraints(strict=True, min_length=1, max_length=512)], ...] = Field(min_length=1, max_length=128)
+    semantic_patch: Any | None = None
+    claims: tuple[CandidateClaim, ...] = Field(default=(), max_length=32)
+    engagement: int = Field(default=0, ge=0)
+    provenance_rank: int = Field(default=0, ge=0)
+
+    @field_validator("hypothesis", mode="before")
+    @classmethod
+    def parse_hypothesis(cls, value: Any) -> DimensionName:
+        return DimensionName(value)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def parse_confidence(cls, value: Any) -> PlanningConfidence:
+        return PlanningConfidence(value)
+
+    @field_validator("semantic_patch", mode="before")
+    @classmethod
+    def require_typed_patch(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        if (
+            type(value).__name__ == "SemanticPatch"
+            and type(value).__module__ == "mp_comfyui_lab.mutations.models"
+        ):
+            return value
+        raise ValueError("semantic_patch must be a typed SemanticPatch")
+
+    @field_validator("evidence_ids", "claims", mode="before")
+    @classmethod
+    def candidate_arrays(cls, value: Any) -> Any:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("candidate evidence and claims must be arrays")
+        return tuple(value)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def canonical_evidence(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(sorted(set(values)))
+
+    @model_validator(mode="after")
+    def require_patch_or_claim(self) -> Self:
+        if self.semantic_patch is None and not self.claims:
+            raise ValueError("candidate requires an explicit semantic_patch or claims")
+        return self
+
+
+class PlanningSource(_FrozenModel):
+    workflow_id: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=256)]
+    canonical_url: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=2_048)]
+    raw_graph: FrozenJsonObject
+    normalized_graph: NormalizedGraph
+    source_hash: Sha256
+    capability_hash: Sha256
+    evidence_ids: tuple[Annotated[str, StringConstraints(strict=True, min_length=1, max_length=512)], ...] = Field(min_length=1, max_length=128)
+    engagement: int = Field(default=0, ge=0)
+
+    @field_validator("evidence_ids", mode="before")
+    @classmethod
+    def source_evidence_array(cls, value: Any) -> Any:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("source evidence_ids must be an array")
+        return tuple(value)
+
+    @field_validator("canonical_url")
+    @classmethod
+    def canonical_source_url(cls, value: str) -> str:
+        try:
+            return parse_runninghub_url(value).canonical_url
+        except UnsupportedSourceError as error:
+            raise ValueError(str(error)) from error
+
+    @model_validator(mode="after")
+    def source_id_matches_url(self) -> Self:
+        if parse_runninghub_url(self.canonical_url).workflow_id != self.workflow_id:
+            raise ValueError("workflow_id does not match canonical_url")
+        return self
+
+
+class SourceBundle(_FrozenModel):
+    sources: tuple[PlanningSource, ...] = Field(min_length=1, max_length=MAX_MANIFEST_SOURCES)
+    candidates: tuple[Candidate, ...] = Field(default=(), max_length=MAX_PLAN_VARIANTS)
+
+    @field_validator("sources", "candidates", mode="before")
+    @classmethod
+    def bundle_arrays(cls, value: Any) -> Any:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("source bundle values must be arrays")
+        return tuple(value)
+
+    @field_validator("sources")
+    @classmethod
+    def canonical_sources(
+        cls,
+        values: tuple[PlanningSource, ...],
+    ) -> tuple[PlanningSource, ...]:
+        keys = [(item.workflow_id, item.source_hash) for item in values]
+        if len(keys) != len(set(keys)):
+            raise ValueError("source bundle contains duplicate source identity")
+        return tuple(sorted(values, key=lambda item: (item.workflow_id, item.source_hash)))
+
+
+class FixtureFingerprint(_FrozenModel):
+    uri: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=2_048)]
+    binding_index: int = Field(ge=0, le=4_095)
+    size: int = Field(ge=0, le=64 * 1024 * 1024)
+    media_type: str | None = None
+    sha256: Sha256
+
+
+class PlannedVariant(_FrozenModel):
+    variant_id: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=256)]
+    source_workflow_id: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=256)]
+    source_hash: Sha256
+    semantic_patch: FrozenJsonObject | None = None
+    diff: FrozenJsonObject | None = None
+    materialized_graph: FrozenJsonObject
+    hypothesis: DimensionName | None = None
+    evidence_ids: tuple[str, ...] = Field(default=(), max_length=128)
+    confidence: PlanningConfidence | None = None
+    warnings: tuple[str, ...] = Field(default=(), max_length=128)
+    exact_run_hash: Sha256
+    capability_hash: Sha256
+    expected_output_count: int = Field(gt=0)
+    output_node_ids: tuple[str, ...] = Field(min_length=1, max_length=128)
+    expected_media_types: tuple[str, ...] = Field(default=(), max_length=32)
+    execution_parameters: FrozenJsonObject
+    fixture_fingerprints: tuple[FixtureFingerprint, ...] = Field(default=(), max_length=MAX_FIXTURES)
+
+
+class ExperimentPlan(_FrozenModel):
+    plan_hash: Sha256
+    source_hashes: tuple[Sha256, ...] = Field(min_length=1, max_length=MAX_MANIFEST_SOURCES)
+    variants: tuple[PlannedVariant, ...] = Field(min_length=1, max_length=MAX_PLAN_VARIANTS)
+    capability_coverage: tuple[DimensionName, ...] = Field(default=(), max_length=len(DimensionName))
+    warnings: tuple[str, ...] = Field(default=(), max_length=512)
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
