@@ -38,6 +38,7 @@ from mp_comfyui_lab.executors.base import (
 )
 from mp_comfyui_lab.experiments.models import (
     MaterializedVariant,
+    RecoveryDisposition,
     ResolvedFixture,
     ResolvedFixtures,
     RunRecord,
@@ -721,6 +722,85 @@ def _run_for_transition(state: RunState, **updates) -> RunRecord:
         values["actual_output_count"] = 1
     values.update(updates)
     return RunRecord(**values)
+
+
+@pytest.mark.parametrize(
+    ("error", "disposition"),
+    [
+        (
+            {"kind": "poll_error"},
+            RecoveryDisposition.RESUME_PROVIDER_TASK,
+        ),
+        (
+            {"kind": "partial_outputs"},
+            RecoveryDisposition.TERMINAL,
+        ),
+    ],
+)
+def test_incomplete_recovery_disposition_accepts_canonical_explicit_value(
+    error,
+    disposition,
+):
+    record = _run_for_transition(
+        RunState.INCOMPLETE,
+        provider_task_id="fake-task-1",
+        error=error,
+        recovery_disposition=disposition,
+    )
+
+    assert record.recovery_disposition is disposition
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            {"kind": "poll_error"},
+            RecoveryDisposition.RESUME_PROVIDER_TASK,
+        ),
+        (
+            {"kind": "partial_outputs"},
+            RecoveryDisposition.TERMINAL,
+        ),
+    ],
+)
+def test_incomplete_recovery_disposition_derives_for_legacy_record(
+    error,
+    expected,
+):
+    record = _run_for_transition(
+        RunState.INCOMPLETE,
+        provider_task_id="fake-task-1",
+        error=error,
+    )
+
+    assert record.recovery_disposition is expected
+
+
+@pytest.mark.parametrize(
+    ("error", "contradictory"),
+    [
+        (
+            {"kind": "poll_error"},
+            RecoveryDisposition.TERMINAL,
+        ),
+        (
+            {"kind": "partial_outputs"},
+            RecoveryDisposition.RESUME_PROVIDER_TASK,
+        ),
+    ],
+)
+def test_incomplete_recovery_disposition_rejects_contradictory_explicit_value(
+    error,
+    contradictory,
+):
+    with pytest.raises(ValidationError, match="recovery_disposition"):
+        _run_for_transition(
+            RunState.INCOMPLETE,
+            provider_task_id="fake-task-1",
+            error=error,
+            recovery_disposition=contradictory,
+        )
 
 
 @pytest.mark.parametrize(

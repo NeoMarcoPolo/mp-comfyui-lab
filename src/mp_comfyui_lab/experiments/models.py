@@ -316,18 +316,22 @@ class RunRecord(_FrozenModel):
 
     @model_validator(mode="after")
     def validate_provider_task_id(self) -> RunRecord:
-        if (
-            self.state is RunState.INCOMPLETE
-            and self.recovery_disposition is None
-        ):
-            object.__setattr__(
-                self,
-                "recovery_disposition",
-                _incomplete_recovery_disposition(
-                    self.error,
-                    has_provider_task_id=self.provider_task_id is not None,
-                ),
+        if self.state is RunState.INCOMPLETE:
+            canonical_disposition = _incomplete_recovery_disposition(
+                self.error,
+                has_provider_task_id=self.provider_task_id is not None,
             )
+            if self.recovery_disposition is None:
+                object.__setattr__(
+                    self,
+                    "recovery_disposition",
+                    canonical_disposition,
+                )
+            elif self.recovery_disposition is not canonical_disposition:
+                raise ValueError(
+                    "recovery_disposition does not match canonical "
+                    "state/error/provider-task evidence"
+                )
         _validate_output_expectations(
             self.expected_output_count,
             self.expected_output_node_ids,

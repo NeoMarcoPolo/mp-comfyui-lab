@@ -2891,6 +2891,40 @@ def _persist_incomplete_wave_run(
     return record
 
 
+def _persist_tampered_incomplete_wave_run(
+    config: LabConfig,
+    plan: ExperimentPlan,
+    *,
+    error: dict[str, object],
+    recovery_disposition: str,
+    actual_output_count: int = 0,
+    expected_output_count: int = 1,
+) -> RunRecord:
+    variant = plan.variants[0]
+    record = RunRecord(
+        run_id="run-wave-tampered",
+        experiment_id="wave-approved",
+        variant_id=variant.variant_id,
+        state=RunState.INCOMPLETE,
+        plan_hash=plan.plan_hash,
+        exact_run_hash=variant.exact_run_hash,
+        provider_task_id="provider-wave-tampered",
+        expected_output_count=expected_output_count,
+        expected_output_node_ids=variant.output_node_ids,
+        expected_media_types=variant.expected_media_types,
+        actual_output_count=actual_output_count,
+        error=error,
+    )
+    payload = record.model_dump(mode="json")
+    payload["recovery_disposition"] = recovery_disposition
+    ExperimentStore(config.experiments_root).write_json_new(
+        "wave-approved",
+        f"runs/{record.run_id}.json",
+        payload,
+    )
+    return record
+
+
 def test_wave_artifact_write_never_clobbers_conflicting_ordinal(
     tmp_path: Path,
 ) -> None:
@@ -3441,6 +3475,84 @@ def test_conclusive_partial_incomplete_run_remains_terminal(
         "no_approved_non_dominated_novel_capability_signature_remains"
     )
     assert constructions == []
+
+
+def test_poll_error_explicitly_marked_terminal_cannot_saturate(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("active", "d" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    _persist_tampered_incomplete_wave_run(
+        config,
+        plan,
+        error={"kind": "poll_error", "diagnostic": "status unavailable"},
+        recovery_disposition="terminal",
+    )
+    constructions: list[str] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: constructions.append("executor"),
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(SafetyError, match="run artifact is missing or invalid"):
+        engine.run_wave(
+            "wave-approved",
+            approved_plan_hash=plan.plan_hash,
+        )
+
+    assert constructions == []
+    assert not (
+        config.experiments_root / "wave-approved" / "plans" / "waves"
+    ).exists()
+
+
+def test_partial_outputs_marked_resumable_cannot_be_polled_as_active(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_wave_plan(
+        tmp_path,
+        variants=(
+            ("partial", "d" * 64, PlanningConfidence.OBSERVED, 1, 1),
+        ),
+    )
+    _persist_tampered_incomplete_wave_run(
+        config,
+        plan,
+        error={
+            "kind": "partial_outputs",
+            "expected_output_count": 2,
+            "actual_output_count": 1,
+        },
+        recovery_disposition="resume_provider_task",
+        actual_output_count=1,
+        expected_output_count=2,
+    )
+    constructions: list[str] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: constructions.append("executor"),
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(SafetyError, match="run artifact is missing or invalid"):
+        engine.run_wave(
+            "wave-approved",
+            approved_plan_hash=plan.plan_hash,
+        )
+
+    assert constructions == []
+    assert not (
+        config.experiments_root / "wave-approved" / "plans" / "waves"
+    ).exists()
 
 
 def test_wave_recovers_crash_after_submission_without_double_charge(
