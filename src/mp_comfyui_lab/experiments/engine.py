@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -41,15 +42,20 @@ from .models import (
     RecoveryDisposition,
     ResolvedFixture,
     ResolvedFixtures,
+    RunHistoryDisposition,
     RunRecord,
     RunState,
 )
 from .planning import recompute_exact_run_hash
 from .saturation import (
+    EvidenceStrength,
     ExperimentHistory,
     RerunRequest,
     WaveArtifact,
+    candidate_evidence_index,
+    candidate_evidence_strength,
     has_unapproved_correction_dimensions,
+    has_unapproved_history_correction_dimensions,
     next_wave,
     request_rerun,
 )
@@ -146,6 +152,12 @@ class ExperimentEngine:
             variant_id,
             approved_plan_hash,
         )
+        recovered = self._recover_exact_runs(
+            experiment_id,
+            variant.exact_run_hash,
+        )
+        if recovered:
+            return recovered[0]
         history = self._load_history(experiment_id, plan)
         original_run_ids = history.original_run_ids(variant.exact_run_hash)
         if rerun_request is None and original_run_ids:
@@ -182,9 +194,13 @@ class ExperimentEngine:
             state=RunState.PLANNED,
             plan_hash=plan.plan_hash,
             exact_run_hash=variant.exact_run_hash,
+            variant_snapshot=variant.model_dump(mode="json"),
             expected_output_count=variant.expected_output_count,
             expected_output_node_ids=variant.output_node_ids,
             expected_media_types=variant.expected_media_types,
+            output_namespace=(
+                Path("outputs", variant.variant_id, run_id).as_posix()
+            ),
             rerun_reason=(
                 None if rerun_request is None else rerun_request.reason
             ),
@@ -350,7 +366,6 @@ class ExperimentEngine:
                 return completed_waves[-1]
 
             history = self._load_history(experiment_id, plan)
-            self._load_equivalent_groups(experiment_id, history)
             decision = next_wave(plan, history)
             records = tuple(
                 self._run_locked(
@@ -371,7 +386,6 @@ class ExperimentEngine:
                 raise SafetyError("pending wave runs do not match pending variants")
             ordinal = completed_waves[-1].ordinal + 1 if completed_waves else 1
             refreshed_history = self._load_history(experiment_id, plan)
-            self._load_equivalent_groups(experiment_id, refreshed_history)
             artifact = WaveArtifact(
                 ordinal=ordinal,
                 plan_hash=plan.plan_hash,
@@ -492,15 +506,11 @@ class ExperimentEngine:
         recovered: list[RunRecord] = []
         for record in self._load_run_records(experiment_id):
             if (
-                (
-                    record.state in {RunState.SUBMITTED, RunState.RUNNING}
-                    or (
-                        record.state is RunState.INCOMPLETE
-                        and record.recovery_disposition
-                        is RecoveryDisposition.RESUME_PROVIDER_TASK
-                    )
-                )
-                and record.provider_task_id is not None
+                record.history_disposition()
+                in {
+                    RunHistoryDisposition.PENDING_PROVIDER_TASK,
+                    RunHistoryDisposition.RECONCILIATION_REQUIRED,
+                }
                 and record.exact_run_hash in exact_run_hashes
             ):
                 recovered.append(
@@ -511,6 +521,26 @@ class ExperimentEngine:
                     )
                 )
         return tuple(recovered)
+
+    def _recover_exact_runs(
+        self,
+        experiment_id: str,
+        exact_run_hash: str,
+    ) -> tuple[RunRecord, ...]:
+        recoverable = {
+            RunHistoryDisposition.PENDING_PROVIDER_TASK,
+            RunHistoryDisposition.RECONCILIATION_REQUIRED,
+        }
+        return tuple(
+            self._resume(
+                experiment_id,
+                record.run_id,
+                return_when_active=True,
+            )
+            for record in self._load_run_records(experiment_id)
+            if record.exact_run_hash == exact_run_hash
+            and record.history_disposition() in recoverable
+        )
 
     def reconcile(
         self,
@@ -576,8 +606,7 @@ class ExperimentEngine:
             raise ApprovalError("selected variant artifact is missing or invalid") from error
         if variant_artifact != selected_variant:
             raise ApprovalError("selected variant artifact does not match approved plan")
-        if recompute_exact_run_hash(selected_variant) != selected_variant.exact_run_hash:
-            raise ApprovalError("selected variant exact run hash does not match")
+        self._validate_variant_fingerprints(selected_variant)
         return plan, selected_variant
 
     def _load_approved_plan_document(
@@ -603,18 +632,7 @@ class ExperimentEngine:
         if plan.plan_hash != approved_plan_hash:
             raise ApprovalError("approved plan hash does not match its artifact filename")
         for variant in plan.variants:
-            try:
-                canonical_capability_hash = capability_hash(
-                    thaw_json(variant.materialized_graph)
-                )
-            except ValueError as error:
-                raise ApprovalError(
-                    "plan variant capability preimage is invalid"
-                ) from error
-            if canonical_capability_hash != variant.capability_hash:
-                raise ApprovalError(
-                    "plan variant capability hash does not match canonical graph"
-                )
+            self._validate_variant_fingerprints(variant)
         if any(
             variant.hypothesis is not None
             and variant.hypothesis not in plan.capability_coverage
@@ -630,6 +648,31 @@ class ExperimentEngine:
                 "create and approve the revised plan hash"
             )
         return plan
+
+    @staticmethod
+    def _validate_variant_fingerprints(variant: PlannedVariant) -> None:
+        try:
+            canonical_exact_run_hash = recompute_exact_run_hash(variant)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ApprovalError(
+                "plan variant exact run hash preimage is invalid"
+            ) from error
+        if canonical_exact_run_hash != variant.exact_run_hash:
+            raise ApprovalError(
+                "plan variant exact run hash does not match canonical preimage"
+            )
+        try:
+            canonical_capability_hash = capability_hash(
+                thaw_json(variant.materialized_graph)
+            )
+        except ValueError as error:
+            raise ApprovalError(
+                "plan variant capability preimage is invalid"
+            ) from error
+        if canonical_capability_hash != variant.capability_hash:
+            raise ApprovalError(
+                "plan variant capability hash does not match canonical graph"
+            )
 
     def _load_completed_waves(
         self,
@@ -669,59 +712,199 @@ class ExperimentEngine:
             range(1, len(ordered) + 1)
         ):
             raise SafetyError("wave artifact ordinals must be contiguous")
+        self._validate_completed_waves(experiment_id, ordered)
         return ordered
+
+    def _validate_completed_waves(
+        self,
+        experiment_id: str,
+        waves: tuple[WaveArtifact, ...],
+    ) -> None:
+        if not waves:
+            return
+        records = {
+            record.run_id: record
+            for record in self._load_run_records(experiment_id)
+        }
+        plans: dict[str, ExperimentPlan] = {}
+        claimed_selected_run_ids: set[str] = set()
+        try:
+            for wave in waves:
+                plan = plans.get(wave.plan_hash)
+                if plan is None:
+                    plan = self._load_approved_plan_document(
+                        experiment_id,
+                        wave.plan_hash,
+                    )
+                    plans[wave.plan_hash] = plan
+                variants = {item.variant_id: item for item in plan.variants}
+                if wave.considered_variant_ids != tuple(variants):
+                    raise SafetyError(
+                        "wave artifact considered variants conflict with approved plan"
+                    )
+                selected_run_ids = set(wave.run_ids)
+                if claimed_selected_run_ids & selected_run_ids:
+                    raise SafetyError(
+                        "wave artifact run IDs conflict across durable waves"
+                    )
+                claimed_selected_run_ids.update(selected_run_ids)
+                for variant_id, run_id in zip(
+                    wave.selected_variant_ids,
+                    wave.run_ids,
+                    strict=True,
+                ):
+                    variant = variants.get(variant_id)
+                    record = records.get(run_id)
+                    if (
+                        variant is None
+                        or record is None
+                        or record.plan_hash != wave.plan_hash
+                        or record.variant_id != variant_id
+                        or record.exact_run_hash != variant.exact_run_hash
+                    ):
+                        raise SafetyError(
+                            "wave artifact selection conflicts with durable run identity"
+                        )
+                pending_hashes = {
+                    variants[variant_id].exact_run_hash
+                    for variant_id in wave.pending_variant_ids
+                    if variant_id in variants
+                }
+                if len(pending_hashes) != len(wave.pending_variant_ids):
+                    raise SafetyError(
+                        "wave artifact pending variants conflict with approved plan"
+                    )
+                pending_records = [
+                    records.get(run_id) for run_id in wave.pending_run_ids
+                ]
+                if (
+                    any(record is None for record in pending_records)
+                    or {
+                        record.exact_run_hash
+                        for record in pending_records
+                        if record is not None
+                    }
+                    != pending_hashes
+                ):
+                    raise SafetyError(
+                        "wave artifact pending runs conflict with durable history"
+                    )
+
+            latest = waves[-1]
+            plan = plans[latest.plan_hash]
+            history = self._load_history(
+                experiment_id,
+                plan,
+                excluded_run_ids=frozenset(latest.run_ids),
+            )
+            decision = next_wave(plan, history)
+            pending_run_ids = tuple(
+                run_id
+                for variant_id in decision.pending_variant_ids
+                for variant in plan.variants
+                if variant.variant_id == variant_id
+                for run_id in history.pending_run_ids(variant.exact_run_hash)
+            )
+            canonical_evidence = {
+                variant_id: dict(evidence)
+                for variant_id, evidence in decision.evidence.items()
+            }
+            if (
+                latest.considered_variant_ids != decision.considered_variant_ids
+                or latest.selected_variant_ids
+                != tuple(item.variant_id for item in decision.variants)
+                or latest.pending_variant_ids != decision.pending_variant_ids
+                or thaw_json(latest.skips) != dict(decision.reasons)
+                or thaw_json(latest.candidate_evidence) != canonical_evidence
+                or latest.pending_run_ids != pending_run_ids
+                or latest.saturation_reason != decision.saturation_reason
+            ):
+                raise SafetyError(
+                    "wave artifact decision conflicts with approved plan and durable history"
+                )
+        except ApprovalError as error:
+            raise SafetyError(
+                "wave artifact references a missing or invalid approved plan"
+            ) from error
 
     def _load_history(
         self,
         experiment_id: str,
         plan: ExperimentPlan,
+        *,
+        excluded_run_ids: frozenset[str] = frozenset(),
     ) -> ExperimentHistory:
         history = ExperimentHistory()
-        variants = {
-            (variant.variant_id, variant.exact_run_hash): variant
-            for variant in plan.variants
-        }
-        variants_by_exact_hash: dict[str, list[PlannedVariant]] = {}
+        plan_cache = {plan.plan_hash: plan}
+        evidence_cache: dict[str, dict[str, Mapping[str, Any]]] = {}
+        current_variants_by_exact: dict[str, list[PlannedVariant]] = {}
         for variant in plan.variants:
-            variants_by_exact_hash.setdefault(
+            current_variants_by_exact.setdefault(
                 variant.exact_run_hash,
                 [],
             ).append(variant)
         output_groups: dict[tuple[tuple[object, ...], ...], set[str]] = {}
 
         for record in self._load_run_records(experiment_id):
-            variant = variants.get((record.variant_id, record.exact_run_hash))
-            if (
-                (
-                    record.state in {RunState.SUBMITTED, RunState.RUNNING}
-                    or (
-                        record.state is RunState.INCOMPLETE
-                        and record.recovery_disposition
-                        is RecoveryDisposition.RESUME_PROVIDER_TASK
-                    )
-                )
-                and record.provider_task_id is not None
-            ):
+            if record.run_id in excluded_run_ids:
+                continue
+            disposition = record.history_disposition()
+            if disposition is RunHistoryDisposition.UNSUBMITTED:
+                continue
+            if disposition in {
+                RunHistoryDisposition.PENDING_PROVIDER_TASK,
+                RunHistoryDisposition.RECONCILIATION_REQUIRED,
+            }:
                 if record.exact_run_hash is not None:
                     history.record_pending_exact(
                         record.exact_run_hash,
                         run_id=record.run_id,
                     )
-                    for current_variant in variants_by_exact_hash.get(
+                    current_matches = current_variants_by_exact.get(
                         record.exact_run_hash,
                         [],
-                    ):
-                        history.record_pending_capability(current_variant)
+                    )
+                    for variant in current_matches:
+                        history.record_pending_capability(
+                            variant,
+                        )
+                    if not current_matches:
+                        resolved_pending = self._resolve_historical_variant(
+                            experiment_id,
+                            record,
+                            plan,
+                            plan_cache=plan_cache,
+                            evidence_cache=evidence_cache,
+                        )
+                        if resolved_pending is not None:
+                            variant, history_id, _evidence = resolved_pending
+                            history.record_pending_capability(
+                                variant,
+                                history_id=history_id,
+                            )
                 continue
+            resolved = self._resolve_historical_variant(
+                experiment_id,
+                record,
+                plan,
+                plan_cache=plan_cache,
+                evidence_cache=evidence_cache,
+            )
             if record.exact_run_hash is not None:
                 history.record_exact_run(
                     record.exact_run_hash,
                     run_id=record.run_id,
                 )
-            if variant is None:
+            if resolved is None:
                 continue
+            variant, history_id, evidence = resolved
             if record.state is RunState.SUCCESS:
-                history.record_success(variant, run_id=record.run_id)
+                history.record_success(
+                    variant,
+                    run_id=record.run_id,
+                    evidence=evidence,
+                    history_id=history_id,
+                )
                 output_signature = tuple(
                     (
                         output.ordinal,
@@ -735,7 +918,7 @@ class ExperimentEngine:
                 )
                 if output_signature:
                     output_groups.setdefault(output_signature, set()).add(
-                        variant.variant_id
+                        history_id
                     )
             elif record.state is RunState.FAILED:
                 for signature in self._failure_signatures(record):
@@ -748,7 +931,104 @@ class ExperimentEngine:
         for variant_ids in output_groups.values():
             if len(variant_ids) >= 2:
                 history.add_equivalent_group(variant_ids)
+        if has_unapproved_history_correction_dimensions(plan, history):
+            raise ApprovalError(
+                "plan contains a correction outside approved dimensions; "
+                "create and approve the revised plan hash"
+            )
         return history
+
+    def _resolve_historical_variant(
+        self,
+        experiment_id: str,
+        record: RunRecord,
+        current_plan: ExperimentPlan,
+        *,
+        plan_cache: dict[str, ExperimentPlan],
+        evidence_cache: dict[str, dict[str, Mapping[str, Any]]],
+    ) -> tuple[PlannedVariant, str, EvidenceStrength] | None:
+        if record.exact_run_hash is None:
+            return None
+
+        historical_plan = current_plan
+        if record.plan_hash is not None:
+            cached_plan = plan_cache.get(record.plan_hash)
+            if cached_plan is None:
+                try:
+                    historical_plan = self._load_approved_plan_document(
+                        experiment_id,
+                        record.plan_hash,
+                    )
+                except ApprovalError as error:
+                    raise SafetyError(
+                        "durable run references a missing or invalid approved plan"
+                    ) from error
+                plan_cache[record.plan_hash] = historical_plan
+            else:
+                historical_plan = cached_plan
+
+        matches = tuple(
+            variant
+            for variant in historical_plan.variants
+            if variant.variant_id == record.variant_id
+            and variant.exact_run_hash == record.exact_run_hash
+        )
+        if len(matches) != 1:
+            if record.plan_hash is None:
+                return None
+            raise SafetyError(
+                "durable run identity conflicts with its referenced approved plan"
+            )
+        variant = matches[0]
+        if record.variant_snapshot is not None:
+            try:
+                snapshot = PlannedVariant.model_validate_json(
+                    json.dumps(
+                        thaw_json(record.variant_snapshot),
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    strict=True,
+                )
+                self._validate_variant_fingerprints(snapshot)
+            except (ApprovalError, TypeError, ValueError, ValidationError) as error:
+                raise SafetyError(
+                    "durable run variant snapshot is invalid"
+                ) from error
+            if snapshot != variant:
+                raise SafetyError(
+                    "durable run variant snapshot conflicts with its approved plan"
+                )
+            variant = snapshot
+
+        if record.variant_snapshot is not None and (
+            record.expected_output_count != variant.expected_output_count
+            or record.expected_output_node_ids != variant.output_node_ids
+            or record.expected_media_types != variant.expected_media_types
+        ):
+            raise SafetyError(
+                "durable run output contract conflicts with its approved variant"
+            )
+
+        metadata = evidence_cache.get(historical_plan.plan_hash)
+        if metadata is None:
+            metadata = candidate_evidence_index(historical_plan)
+            evidence_cache[historical_plan.plan_hash] = metadata
+        evidence = candidate_evidence_strength(
+            variant,
+            metadata.get(variant.variant_id, {}),
+        )
+        history_id = (
+            variant.variant_id
+            if historical_plan.plan_hash == current_plan.plan_hash
+            else (
+                f"{historical_plan.plan_hash}:"
+                f"{variant.variant_id}:{variant.exact_run_hash}"
+            )
+        )
+        return variant, history_id, evidence
 
     def _load_run_records(
         self,
@@ -1463,10 +1743,17 @@ class ExperimentEngine:
                     "provider output node/media pair exceeds approved cardinality"
                 )
         extension = _OUTPUT_EXTENSIONS[media_type]
-        relative_path = Path(
-            "outputs",
-            record.variant_id,
-            f"{ordinal:04d}-{node_id}.{extension}",
+        relative_path = (
+            Path(
+                "outputs",
+                record.variant_id,
+                f"{ordinal:04d}-{node_id}.{extension}",
+            )
+            if record.output_namespace is None
+            else Path(
+                record.output_namespace,
+                f"{output.provider_order:04d}.{extension}",
+            )
         )
         with tempfile.TemporaryDirectory(prefix="mp-comfyui-lab-output-") as directory:
             temporary_target = Path(directory) / f"output.{extension}"

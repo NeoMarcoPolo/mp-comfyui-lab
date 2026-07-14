@@ -70,6 +70,13 @@ class RecoveryDisposition(StrEnum):
     TERMINAL = "terminal"
 
 
+class RunHistoryDisposition(StrEnum):
+    UNSUBMITTED = "unsubmitted"
+    PENDING_PROVIDER_TASK = "pending_provider_task"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
+    COMPLETED = "completed"
+
+
 _NORMAL_RUN_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
     RunState.PLANNED: frozenset(
         {RunState.SUBMITTED, RunState.FAILED, RunState.INCOMPLETE}
@@ -107,9 +114,11 @@ _IMMUTABLE_TRANSITION_FIELDS = (
     "variant_id",
     "plan_hash",
     "exact_run_hash",
+    "variant_snapshot",
     "expected_output_count",
     "expected_output_node_ids",
     "expected_media_types",
+    "output_namespace",
     "created_at",
     "submission_intent_at",
     "rerun_reason",
@@ -274,10 +283,12 @@ class RunRecord(_FrozenModel):
     recovery_disposition: RecoveryDisposition | None = None
     plan_hash: Sha256 | None = None
     exact_run_hash: Sha256 | None = None
+    variant_snapshot: FrozenJsonObject | None = None
     provider_task_id: NonBlankStr | None = None
     expected_output_count: int = Field(gt=0)
     expected_output_node_ids: tuple[str, ...] = ()
     expected_media_types: tuple[str, ...] = ()
+    output_namespace: NonBlankStr | None = None
     actual_output_count: int = Field(default=0, ge=0)
     outputs: tuple[OutputRecord, ...] = ()
     error: SanitizedJsonObject | None = None
@@ -313,6 +324,16 @@ class RunRecord(_FrozenModel):
     def sanitize_diagnostic_history(cls, value: Any) -> Any:
         items = tuple(value) if isinstance(value, list) else value
         return tuple(_sanitize_diagnostic_json(item) for item in items)
+
+    @field_validator("output_namespace")
+    @classmethod
+    def require_safe_relative_output_namespace(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("output_namespace must be a safe relative path")
+        return path.as_posix()
 
     @model_validator(mode="after")
     def validate_provider_task_id(self) -> RunRecord:
@@ -382,6 +403,17 @@ class RunRecord(_FrozenModel):
             raise ValueError(
                 "actual_output_count must equal expected_output_count for SUCCESS"
             )
+        if self.variant_snapshot is not None:
+            snapshot = thaw_json(self.variant_snapshot)
+            if self.plan_hash is None:
+                raise ValueError("variant snapshot requires a plan hash")
+            if (
+                snapshot.get("variant_id") != self.variant_id
+                or snapshot.get("exact_run_hash") != self.exact_run_hash
+            ):
+                raise ValueError(
+                    "variant snapshot identity must match the durable run"
+                )
 
         rerun_fields_present = (
             self.rerun_reason is not None,
@@ -420,6 +452,22 @@ class RunRecord(_FrozenModel):
         if any(later < earlier for earlier, later in zip(timestamps, timestamps[1:])):
             raise ValueError("run timestamps must be chronologically nondecreasing")
         return self
+
+    def history_disposition(self) -> RunHistoryDisposition:
+        if self.state in {RunState.SUBMITTED, RunState.RUNNING}:
+            return RunHistoryDisposition.PENDING_PROVIDER_TASK
+        if self.state is RunState.PLANNED:
+            return (
+                RunHistoryDisposition.RECONCILIATION_REQUIRED
+                if self.submission_intent_at is not None
+                else RunHistoryDisposition.UNSUBMITTED
+            )
+        if self.state is RunState.INCOMPLETE:
+            if self.recovery_disposition is RecoveryDisposition.RESUME_PROVIDER_TASK:
+                return RunHistoryDisposition.PENDING_PROVIDER_TASK
+            if self.recovery_disposition is RecoveryDisposition.RECONCILE_SUBMISSION:
+                return RunHistoryDisposition.RECONCILIATION_REQUIRED
+        return RunHistoryDisposition.COMPLETED
 
     def transition(self, new_state: RunState, **updates: Any) -> Self:
         """Revalidate a state change; never use model_copy(update=...) for transitions."""

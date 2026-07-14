@@ -9,6 +9,7 @@ import hashlib
 import json
 from typing import TYPE_CHECKING
 
+from mp_comfyui_lab.graph.hashing import capability_hash
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import GraphNormalizationError, normalize_graph
 from mp_comfyui_lab.json_types import thaw_json
@@ -280,7 +281,7 @@ def _compile_one_node_topology_candidate(
         donor_workflow_id=donor.workflow_id,
         evidence_ids=(donor.workflow_id,),
     )
-    if _mutation_dimensions(mutation, baseline) != {dimension.value}:
+    if mutation_dimensions(mutation, baseline) != {dimension.value}:
         return None, warning_prefix + "compiled one-node topology affects multiple dimensions"
     signature_payload = {
         "dimension": dimension.value,
@@ -411,7 +412,7 @@ def _compile_lora_candidate(brief, baseline, donor):
         return None, f"candidate lora-{donor.workflow_id} omitted: exact donor loader template unavailable"
     mutation = ReplaceLoraStack(loras=after, evidence_ids=(donor.workflow_id,), loader_template=template)
     candidate = Candidate(candidate_id=f"{dimension.value}-{donor.workflow_id}"[:96], hypothesis=dimension, capability_signature=f"{dimension.value}:{_lora_signature(after)}", confidence="observed", evidence_ids=(donor.workflow_id,), semantic_patch=SemanticPatch(mutations=(mutation,)), engagement=donor.engagement, provenance_rank=1)
-    if _mutation_dimensions(mutation, baseline) != {dimension.value}:
+    if mutation_dimensions(mutation, baseline) != {dimension.value}:
         return None, f"candidate lora-{donor.workflow_id} omitted: compiled patch affects multiple dimensions"
     return candidate, None
 
@@ -550,7 +551,7 @@ def validate_candidate_patch(
     """Classify every candidate mutation from graph bindings; never guess."""
     dimensions: set[str] = set()
     for mutation in patch.mutations:
-        affected = _mutation_dimensions(mutation, source)
+        affected = mutation_dimensions(mutation, source)
         if affected is None:
             return "affected dimension cannot be proven"
         dimensions.update(affected)
@@ -565,7 +566,7 @@ def validate_candidate_patch(
     return None
 
 
-def _mutation_dimensions(mutation, source: PlanningSource) -> set[str] | None:
+def mutation_dimensions(mutation, source: PlanningSource) -> set[str] | None:
     if isinstance(mutation, SetRoleInput):
         dimension = _ROLE_DIMENSIONS.get(mutation.role)
         return None if dimension is None else {dimension}
@@ -623,10 +624,90 @@ def _mutation_dimensions(mutation, source: PlanningSource) -> set[str] | None:
     return None
 
 
+def classify_graph_dimension_changes(
+    before_graph: Mapping[str, object],
+    after_graph: Mapping[str, object],
+) -> frozenset[DimensionName] | None:
+    """Return canonical semantic dimensions changed by two approved graphs."""
+    try:
+        before = normalize_graph(before_graph)
+        after = normalize_graph(after_graph)
+        if capability_hash(before_graph) == capability_hash(after_graph):
+            return frozenset()
+    except (GraphNormalizationError, ValueError):
+        return None
+
+    dimensions: set[DimensionName] = set()
+    role_dimensions = {
+        DimensionName.CHECKPOINT: (
+            SemanticRole.CHECKPOINT,
+            SemanticRole.MODEL,
+            SemanticRole.UNET,
+        ),
+        DimensionName.PROMPT_GRAMMAR: (
+            SemanticRole.PROMPT_SOURCE,
+            SemanticRole.PROMPT_FANOUT,
+        ),
+        DimensionName.SAMPLER: (SemanticRole.SAMPLER,),
+        DimensionName.SCHEDULER: (SemanticRole.SCHEDULER,),
+        DimensionName.ENCODER: (SemanticRole.ENCODER,),
+        DimensionName.REFERENCE_STRATEGY: (SemanticRole.REFERENCE_IMAGE,),
+        DimensionName.OUTPUT_DIMENSIONS: (
+            SemanticRole.DIMENSIONS,
+            SemanticRole.OUTPUT,
+        ),
+        DimensionName.SEED_VARIANCE: (SemanticRole.SEED,),
+    }
+    for dimension, roles in role_dimensions.items():
+        if _role_dimension_signature(before, roles) != _role_dimension_signature(
+            after,
+            roles,
+        ):
+            dimensions.add(dimension)
+
+    lora_dimensions = _lora_delta_dimensions(
+        _normalized_lora_effective_values(before),
+        _normalized_lora_effective_values(after),
+    )
+    if lora_dimensions is None:
+        return None
+    dimensions.update(DimensionName(item) for item in lora_dimensions)
+    return frozenset(dimensions) if dimensions else None
+
+
+def _role_dimension_signature(
+    graph,
+    roles: tuple[SemanticRole, ...],
+) -> tuple[str, ...]:
+    nodes = {node.node_id: node for node in graph.nodes}
+    values = {
+        json.dumps(
+            {
+                "class_type": nodes[binding.node_id].class_type,
+                "field_name": binding.field_name,
+                "value": thaw_json(binding.value),
+            },
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        for role in roles
+        for binding in graph.bindings(role)
+    }
+    return tuple(sorted(values))
+
+
 def _lora_effective_values(source: PlanningSource) -> tuple[tuple[str, float | None, float | None], ...]:
-    nodes = {node.node_id: node for node in source.normalized_graph.nodes}
+    return _normalized_lora_effective_values(source.normalized_graph)
+
+
+def _normalized_lora_effective_values(
+    graph,
+) -> tuple[tuple[str, float | None, float | None], ...]:
+    nodes = {node.node_id: node for node in graph.nodes}
     values = []
-    for binding in source.normalized_graph.bindings(SemanticRole.LORA):
+    for binding in graph.bindings(SemanticRole.LORA):
         raw = thaw_json(binding.value)
         name = str(raw.get("name", raw)) if isinstance(raw, Mapping) else str(raw)
         node = nodes[binding.node_id]

@@ -18,6 +18,7 @@ from pydantic import (
 
 from mp_comfyui_lab.graph.hashing import capability_hash
 from mp_comfyui_lab.json_types import SanitizedJsonObject, thaw_json
+from mp_comfyui_lab.mutations.planner import classify_graph_dimension_changes
 
 from .models import (
     DimensionName,
@@ -222,15 +223,17 @@ class ExperimentHistory:
         *,
         run_id: str,
         evidence: EvidenceStrength | None = None,
+        history_id: str | None = None,
     ) -> None:
+        durable_id = history_id or variant.variant_id
         self.record_exact_run(variant.exact_run_hash, run_id=run_id)
-        self.successful_variant_ids.add(variant.variant_id)
+        self.successful_variant_ids.add(durable_id)
         self.successful_capability_hashes.setdefault(
             variant.capability_hash,
             set(),
-        ).add(variant.variant_id)
+        ).add(durable_id)
         if evidence is not None:
-            self.evidence_by_variant_id[variant.variant_id] = evidence
+            self.evidence_by_variant_id[durable_id] = evidence
 
     def record_exact_run(self, exact_run_hash: str, *, run_id: str) -> None:
         self.exact_run_hashes.add(exact_run_hash)
@@ -247,11 +250,16 @@ class ExperimentHistory:
             set(),
         ).add(run_id)
 
-    def record_pending_capability(self, variant: PlannedVariant) -> None:
+    def record_pending_capability(
+        self,
+        variant: PlannedVariant,
+        *,
+        history_id: str | None = None,
+    ) -> None:
         self.pending_capability_hashes.setdefault(
             variant.capability_hash,
             set(),
-        ).add(variant.variant_id)
+        ).add(history_id or variant.variant_id)
 
     def pending_run_ids(self, exact_run_hash: str) -> tuple[str, ...]:
         return tuple(
@@ -316,10 +324,18 @@ def next_wave(plan: ExperimentPlan, history: ExperimentHistory) -> WaveDecision:
     if not isinstance(history, ExperimentHistory):
         raise TypeError("next_wave requires ExperimentHistory")
 
+    candidate_metadata = candidate_evidence_index(plan)
     scores = {
-        variant.variant_id: _evidence_strength(plan, variant)
+        variant.variant_id: candidate_evidence_strength(
+            variant,
+            candidate_metadata.get(variant.variant_id, {}),
+        )
         for variant in plan.variants
     }
+    capability_scores, equivalent_scores = _history_score_indexes(
+        scores,
+        history,
+    )
     reasons: dict[str, str] = {}
     eligible: list[PlannedVariant] = []
     pending: list[PlannedVariant] = []
@@ -358,14 +374,14 @@ def next_wave(plan: ExperimentPlan, history: ExperimentHistory) -> WaveDecision:
             continue
         if _dominated_by_equivalent_tested_variant(
             variant,
-            history,
+            equivalent_scores,
             scores,
         ):
             reasons[variant.variant_id] = (
                 "dominated_by_equivalent_tested_capability"
             )
             continue
-        if _dominated_by_tested_capability(variant, history, scores):
+        if _dominated_by_tested_capability(variant, capability_scores, scores):
             reasons[variant.variant_id] = "dominated_by_tested_capability"
             continue
         eligible.append(variant)
@@ -419,10 +435,68 @@ def next_wave(plan: ExperimentPlan, history: ExperimentHistory) -> WaveDecision:
 
 def has_unapproved_correction_dimensions(plan: ExperimentPlan) -> bool:
     approved = set(plan.capability_coverage)
-    return any(
-        _has_unapproved_correction_dimensions(variant, approved)
+    variants = {
+        (
+            variant.variant_id,
+            variant.exact_run_hash,
+            variant.capability_hash,
+        ): variant
         for variant in plan.variants
-    )
+    }
+    for variant in plan.variants:
+        if _has_unapproved_correction_dimensions(variant, approved):
+            return True
+        correction = _correction_record(
+            thaw_json(variant.execution_parameters).get("correction")
+        )
+        if correction is None:
+            continue
+        failed_variant = variants.get(
+            (
+                correction.failed_variant_id,
+                correction.failed_exact_run_hash,
+                correction.failed_capability_hash,
+            )
+        )
+        if failed_variant is not None and _correction_dimension_conflict(
+            variant,
+            failed_variant,
+            correction,
+            approved=approved,
+        ):
+            return True
+    return False
+
+
+def has_unapproved_history_correction_dimensions(
+    plan: ExperimentPlan,
+    history: ExperimentHistory,
+) -> bool:
+    approved = set(plan.capability_coverage)
+    for variant in plan.variants:
+        correction = _correction_record(
+            thaw_json(variant.execution_parameters).get("correction")
+        )
+        if correction is None:
+            continue
+        failed_variant = history.failed_variants.get(
+            correction.failure_signature,
+            {},
+        ).get(
+            (
+                correction.failed_variant_id,
+                correction.failed_exact_run_hash,
+                correction.failed_capability_hash,
+            )
+        )
+        if failed_variant is not None and _correction_dimension_conflict(
+            variant,
+            failed_variant,
+            correction,
+            approved=approved,
+        ):
+            return True
+    return False
 
 
 def _has_unapproved_correction_dimensions(
@@ -446,11 +520,10 @@ def _has_unapproved_correction_dimensions(
     return False
 
 
-def _evidence_strength(
-    plan: ExperimentPlan,
+def candidate_evidence_strength(
     variant: PlannedVariant,
+    candidate: Mapping[str, Any],
 ) -> EvidenceStrength:
-    candidate = _candidate_metadata(plan).get(variant.variant_id, {})
     raw_confidence = candidate.get("confidence")
     try:
         confidence = PlanningConfidence(raw_confidence)
@@ -469,6 +542,12 @@ def _evidence_strength(
         engagement=_nonnegative_int(candidate.get("engagement")),
         structural_cleanliness=-len(variant.warnings),
     )
+
+
+def candidate_evidence_index(
+    plan: ExperimentPlan,
+) -> dict[str, Mapping[str, Any]]:
+    return _candidate_metadata(plan)
 
 
 def _candidate_metadata(plan: ExperimentPlan) -> dict[str, Mapping[str, Any]]:
@@ -508,42 +587,67 @@ def _score_for_history(
     return scores.get(variant_id) or history.evidence_by_variant_id.get(variant_id)
 
 
+def _history_score_indexes(
+    scores: Mapping[str, EvidenceStrength],
+    history: ExperimentHistory,
+) -> tuple[
+    dict[str, EvidenceStrength],
+    dict[tuple[str, str], EvidenceStrength],
+]:
+    capability_scores: dict[str, EvidenceStrength] = {}
+    capabilities_by_history_id: dict[str, set[str]] = {}
+    for capability, history_ids in history.successful_capability_hashes.items():
+        for history_id in history_ids:
+            score = _score_for_history(history_id, scores, history)
+            if score is None:
+                continue
+            capabilities_by_history_id.setdefault(history_id, set()).add(capability)
+            prior = capability_scores.get(capability)
+            if prior is None or score > prior:
+                capability_scores[capability] = score
+
+    equivalent_scores: dict[tuple[str, str], EvidenceStrength] = {}
+    for group in history.equivalent_groups:
+        best_by_capability: dict[str, EvidenceStrength] = {}
+        for history_id in group:
+            score = _score_for_history(history_id, scores, history)
+            if score is None:
+                continue
+            for capability in capabilities_by_history_id.get(history_id, set()):
+                prior = best_by_capability.get(capability)
+                if prior is None or score > prior:
+                    best_by_capability[capability] = score
+        for member in group:
+            for capability, score in best_by_capability.items():
+                key = (member, capability)
+                prior = equivalent_scores.get(key)
+                if prior is None or score > prior:
+                    equivalent_scores[key] = score
+    return capability_scores, equivalent_scores
+
+
 def _dominated_by_tested_capability(
     variant: PlannedVariant,
-    history: ExperimentHistory,
+    capability_scores: Mapping[str, EvidenceStrength],
     scores: Mapping[str, EvidenceStrength],
 ) -> bool:
-    tested = history.successful_capability_hashes.get(
-        variant.capability_hash,
-        set(),
-    )
     candidate_score = scores[variant.variant_id]
-    return any(
-        tested_score is not None and tested_score >= candidate_score
-        for tested_id in tested
-        if (tested_score := _score_for_history(tested_id, scores, history))
-        is not None
-    )
+    tested_score = capability_scores.get(variant.capability_hash)
+    return tested_score is not None and tested_score >= candidate_score
 
 
 def _dominated_by_equivalent_tested_variant(
     variant: PlannedVariant,
-    history: ExperimentHistory,
+    equivalent_scores: Mapping[tuple[str, str], EvidenceStrength],
     scores: Mapping[str, EvidenceStrength],
 ) -> bool:
-    candidate_score = scores[variant.variant_id]
-    tested_capability = history.successful_capability_hashes.get(
-        variant.capability_hash,
-        set(),
+    tested_score = equivalent_scores.get(
+        (variant.variant_id, variant.capability_hash)
     )
-    for group in history.equivalent_groups:
-        if variant.variant_id not in group:
-            continue
-        for tested_id in group & tested_capability:
-            tested_score = _score_for_history(tested_id, scores, history)
-            if tested_score is not None and tested_score >= candidate_score:
-                return True
-    return False
+    return (
+        tested_score is not None
+        and tested_score >= scores[variant.variant_id]
+    )
 
 
 def _uncorrected_repeated_failure(
@@ -648,6 +752,12 @@ def _correction_addresses_failure(
         or candidate_capability_hash == failed_capability_hash
     ):
         return False
+    if _correction_dimension_conflict(
+        variant,
+        failed_variant,
+        correction,
+    ):
+        return False
     if correction.failure_signature.startswith("missing-node:"):
         missing_node = correction.failure_signature.partition(":")[2]
         required_nodes = {
@@ -659,3 +769,21 @@ def _correction_addresses_failure(
         if missing_node in required_nodes:
             return False
     return True
+
+
+def _correction_dimension_conflict(
+    variant: PlannedVariant,
+    failed_variant: PlannedVariant,
+    correction: CorrectionRecord,
+    *,
+    approved: set[DimensionName] | None = None,
+) -> bool:
+    actual = classify_graph_dimension_changes(
+        thaw_json(failed_variant.materialized_graph),
+        thaw_json(variant.materialized_graph),
+    )
+    if actual is None or not actual:
+        return True
+    if set(correction.changed_dimensions) != set(actual):
+        return True
+    return approved is not None and not actual <= approved

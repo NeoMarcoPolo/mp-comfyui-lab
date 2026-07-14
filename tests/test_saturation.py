@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+import mp_comfyui_lab.experiments.saturation as saturation_module
 from mp_comfyui_lab.graph.hashing import capability_hash as graph_capability_hash
 from mp_comfyui_lab.experiments.models import (
     DimensionName,
@@ -43,15 +44,17 @@ def _variant(
     corrective_hypotheses: dict[str, str] | None = None,
     correction: dict[str, object] | None = None,
     warnings: tuple[str, ...] = (),
+    graph: dict[str, object] | None = None,
 ) -> PlannedVariant:
-    graph = {
+    graph = graph or {
         str(index): {"class_type": class_type, "inputs": {}}
         for index, class_type in enumerate(required_nodes, start=1)
     }
+    output_node_id = next(reversed(graph))
     execution_parameters: dict[str, object] = {
         "prompt_lines": ["one"],
         "expected_output_count": 1,
-        "output_node_ids": [str(len(graph))],
+        "output_node_ids": [output_node_id],
     }
     if corrective_hypotheses is not None:
         execution_parameters["corrective_hypotheses"] = corrective_hypotheses
@@ -69,7 +72,7 @@ def _variant(
         exact_run_hash=exact_run_hash,
         capability_hash=capability_hash,
         expected_output_count=1,
-        output_node_ids=(str(len(graph)),),
+        output_node_ids=(output_node_id,),
         expected_media_types=("image/png",),
         execution_parameters=execution_parameters,
     )
@@ -446,6 +449,135 @@ def test_machine_verified_correction_selects_changed_candidate_and_affects_hashe
     assert _plan(uncorrected).plan_hash != _plan(corrected).plan_hash
 
 
+def _checkpoint_sampler_lora_graph(
+    *,
+    checkpoint: str = "base.safetensors",
+    sampler: str = "euler",
+    lora: str | None = None,
+) -> dict[str, object]:
+    graph: dict[str, object] = {
+        "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": checkpoint},
+        }
+    }
+    model_node_id = "1"
+    if lora is not None:
+        graph["2"] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "model": ["1", 0],
+                "clip": ["1", 1],
+                "lora_name": lora,
+                "strength_model": 1.0,
+                "strength_clip": 1.0,
+            },
+        }
+        model_node_id = "2"
+    graph["8"] = {
+        "class_type": "KSampler",
+        "inputs": {
+            "model": [model_node_id, 0],
+            "sampler_name": sampler,
+            "scheduler": "normal",
+            "seed": 1,
+        },
+    }
+    graph["9"] = {
+        "class_type": "SaveImage",
+        "inputs": {"images": ["8", 0]},
+    }
+    return graph
+
+
+def test_sampler_only_correction_cannot_claim_checkpoint_dimension() -> None:
+    signature = "provider-failed:unsupported sampler"
+    failed_graph = _checkpoint_sampler_lora_graph(sampler="euler")
+    failed = _variant(
+        "failed",
+        capability_hash=graph_capability_hash(failed_graph),
+        exact_run_hash="1" * 64,
+        graph=failed_graph,
+    )
+    candidate_graph = _checkpoint_sampler_lora_graph(sampler="dpmpp_2m")
+    correction = {
+        "schema_version": 1,
+        "failure_signature": signature,
+        "failed_variant_id": failed.variant_id,
+        "failed_exact_run_hash": failed.exact_run_hash,
+        "failed_capability_hash": failed.capability_hash,
+        "candidate_variant_id": "candidate",
+        "changed_dimensions": [DimensionName.CHECKPOINT.value],
+    }
+    candidate = _variant(
+        "candidate",
+        capability_hash=graph_capability_hash(candidate_graph),
+        exact_run_hash="2" * 64,
+        graph=candidate_graph,
+        correction=correction,
+    )
+    history = ExperimentHistory()
+    history.record_failure(failed, signature=signature, run_id="run-a")
+    history.record_failure(failed, signature=signature, run_id="run-b")
+
+    decision = next_wave(_plan(candidate), history)
+
+    assert decision.variants == ()
+    assert decision.reasons[candidate.variant_id] == (
+        "repeated_failure_requires_new_corrective_hypothesis"
+    )
+
+
+def test_checkpoint_and_lora_correction_uses_actual_changed_dimensions() -> None:
+    signature = "provider-failed:model combination"
+    failed_graph = _checkpoint_sampler_lora_graph(
+        checkpoint="base.safetensors",
+        lora="old.safetensors",
+    )
+    failed = _variant(
+        "failed",
+        capability_hash=graph_capability_hash(failed_graph),
+        exact_run_hash="3" * 64,
+        graph=failed_graph,
+    )
+    candidate_graph = _checkpoint_sampler_lora_graph(
+        checkpoint="revised.safetensors",
+        lora="new.safetensors",
+    )
+    correction = {
+        "schema_version": 1,
+        "failure_signature": signature,
+        "failed_variant_id": failed.variant_id,
+        "failed_exact_run_hash": failed.exact_run_hash,
+        "failed_capability_hash": failed.capability_hash,
+        "candidate_variant_id": "candidate",
+        "changed_dimensions": [
+            DimensionName.CHECKPOINT.value,
+            DimensionName.LORA_STACK.value,
+        ],
+    }
+    candidate = _variant(
+        "candidate",
+        capability_hash=graph_capability_hash(candidate_graph),
+        exact_run_hash="4" * 64,
+        graph=candidate_graph,
+        correction=correction,
+    )
+    history = ExperimentHistory()
+    history.record_failure(failed, signature=signature, run_id="run-a")
+    history.record_failure(failed, signature=signature, run_id="run-b")
+
+    decision = next_wave(
+        _plan(
+            candidate,
+            coverage=(DimensionName.CHECKPOINT, DimensionName.LORA_STACK),
+        ),
+        history,
+    )
+
+    assert decision.variants == (candidate,)
+
+
 def test_same_graph_correction_cannot_fabricate_changed_capability_hash() -> None:
     signature = "provider-failed:unsupported configuration"
     failed_draft = _variant(
@@ -684,3 +816,35 @@ def test_unapproved_dimension_is_not_submitted_from_an_old_plan() -> None:
     assert decision.saturation_reason == (
         "no_approved_non_dominated_novel_capability_signature_remains"
     )
+
+
+def test_next_wave_indexes_approval_evidence_once_for_512_variants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variants = tuple(
+        _variant(
+            f"variant-{index:03d}",
+            capability_hash=_hash({"capability": index}),
+            exact_run_hash=_hash({"exact": index}),
+        )
+        for index in range(512)
+    )
+    plan = _plan(*variants)
+    calls = 0
+    original = saturation_module._candidate_metadata
+
+    def counted_metadata(candidate_plan: ExperimentPlan):
+        nonlocal calls
+        calls += 1
+        return original(candidate_plan)
+
+    monkeypatch.setattr(
+        saturation_module,
+        "_candidate_metadata",
+        counted_metadata,
+    )
+
+    decision = next_wave(plan, ExperimentHistory())
+
+    assert len(decision.variants) == 512
+    assert calls == 1
