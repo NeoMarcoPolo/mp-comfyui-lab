@@ -1,11 +1,19 @@
 from collections.abc import Iterator
+from contextlib import contextmanager
+import errno
 import json
 import os
 from pathlib import Path
 import re
 import tempfile
 import threading
+import time
 from typing import Any
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from mp_comfyui_lab.security import (
     SafetyError,
@@ -19,6 +27,8 @@ EXPERIMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
 MAX_EXPERIMENT_ID_LENGTH = 96
 MAX_JSONL_RECORD_BYTES = 131_072
 WINDOWS_MOUNT_POINT_REPARSE_TAG = 0xA0000003
+_JSONL_PATH_LOCKS: dict[str, threading.Lock] = {}
+_JSONL_PATH_LOCKS_GUARD = threading.Lock()
 EXPERIMENT_DIRECTORIES = (
     "sources",
     "evidence",
@@ -34,8 +44,6 @@ EXPERIMENT_DIRECTORIES = (
 class ExperimentStore:
     def __init__(self, root: Path) -> None:
         self._store_root = Path(root).resolve()
-        self._append_locks: dict[Path, threading.Lock] = {}
-        self._append_locks_guard = threading.Lock()
 
     def root(self, experiment_id: str) -> Path:
         self._validate_experiment_id(experiment_id)
@@ -123,7 +131,7 @@ class ExperimentStore:
             )
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination = self._artifact_path(experiment_id, relative_path)
-        with self._append_lock(destination):
+        with self._jsonl_lock(experiment_id, relative_path, destination):
             flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
             flags |= getattr(os, "O_BINARY", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -147,7 +155,9 @@ class ExperimentStore:
         relative_path: str | Path,
     ) -> tuple[dict[str, Any], ...]:
         source = self._artifact_path(experiment_id, relative_path)
-        with self._append_lock(source):
+        if not source.parent.is_dir():
+            return ()
+        with self._jsonl_lock(experiment_id, relative_path, source):
             flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             try:
@@ -275,9 +285,90 @@ class ExperimentStore:
     def _reject_json_constant(value: str) -> None:
         raise ValueError(f"non-finite JSON constant is not allowed: {value}")
 
-    def _append_lock(self, destination: Path) -> threading.Lock:
-        with self._append_locks_guard:
-            return self._append_locks.setdefault(destination, threading.Lock())
+    @contextmanager
+    def _jsonl_lock(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+        artifact_path: Path,
+    ) -> Iterator[None]:
+        lock_relative_path = self._jsonl_lock_relative_path(relative_path)
+        lock_path = self._artifact_path(experiment_id, lock_relative_path)
+        process_lock = self._process_jsonl_lock(artifact_path)
+        with process_lock:
+            lock_path = self._artifact_path(experiment_id, lock_relative_path)
+            with self._os_advisory_lock(lock_path):
+                self._artifact_path(experiment_id, relative_path)
+                yield
+
+    @staticmethod
+    def _jsonl_lock_relative_path(relative_path: str | Path) -> Path:
+        path = Path(relative_path)
+        return path.with_name(f"{path.name}.lock")
+
+    @staticmethod
+    def _process_jsonl_lock(artifact_path: Path) -> threading.Lock:
+        key = os.path.normcase(str(artifact_path))
+        with _JSONL_PATH_LOCKS_GUARD:
+            return _JSONL_PATH_LOCKS.setdefault(key, threading.Lock())
+
+    @contextmanager
+    def _os_advisory_lock(self, lock_path: Path) -> Iterator[None]:
+        flags = os.O_CREAT | os.O_RDWR
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOINHERIT", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        locked = False
+        try:
+            self._verify_open_lock_file(lock_path, descriptor)
+            if os.fstat(descriptor).st_size == 0:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                written = os.write(descriptor, b"\0")
+                if written != 1:
+                    raise OSError("journal lock initialization made no progress")
+                os.fsync(descriptor)
+            self._acquire_os_lock(descriptor)
+            locked = True
+            self._verify_open_lock_file(lock_path, descriptor)
+            yield
+        finally:
+            if locked:
+                self._release_os_lock(descriptor)
+            os.close(descriptor)
+
+    @classmethod
+    def _verify_open_lock_file(cls, lock_path: Path, descriptor: int) -> None:
+        cls._reject_existing_links(lock_path.parent, Path(lock_path.name))
+        path_stat = os.stat(lock_path, follow_symlinks=False)
+        if not os.path.samestat(path_stat, os.fstat(descriptor)):
+            raise SafetyError("journal lock file changed while opening")
+
+    @staticmethod
+    def _acquire_os_lock(descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name != "nt":
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            return
+
+        retry_errors = {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+        while True:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as error:
+                if error.errno not in retry_errors:
+                    raise
+                time.sleep(0.01)
+
+    @staticmethod
+    def _release_os_lock(descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
 
     @classmethod
     def _sanitize_jsonl_value(cls, value: Any) -> Any:

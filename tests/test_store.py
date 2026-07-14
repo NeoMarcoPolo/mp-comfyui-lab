@@ -2,9 +2,10 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
-from time import perf_counter
+from threading import Barrier, Event
+from time import perf_counter, sleep
 
 import pytest
 
@@ -258,6 +259,7 @@ def test_graph_persistence_sanitizer_removes_url_authority_and_fragment_secrets(
         "authorization:Basic secret",
         "Bearer secret",
         "section%3Dweights%3BAccessToken%3Dencoded-secret",
+        "section%3Dweights%26access%5Ftoken%3Dencoded-underscore-secret",
     ],
 )
 def test_graph_fragment_drops_entire_value_for_any_secret_marker(fragment):
@@ -285,6 +287,35 @@ def test_graph_fragment_preserves_clean_material_value_byte_for_byte(fragment):
 
     assert sanitized == url
     assert security_module.sanitize_graph_for_persistence(sanitized) == sanitized
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "access_token%253Ddouble-secret",
+        "access_token%25253Dtriple-secret",
+        "access%255Ftoken%253Dencoded-key-secret",
+        "section%253Dweights%2526access_token%253Dmixed-secret",
+        "section%3Dweights%26access%255Ftoken%253Dmixed-layers",
+        "clean%252Danchor",
+    ],
+)
+def test_graph_fragment_drops_nested_percent_encoding(fragment):
+    url = f"https://models.example/base?revision=1#{fragment}"
+
+    sanitized = security_module.sanitize_graph_for_persistence(url)
+
+    assert sanitized == "https://models.example/base?revision=1"
+    assert security_module.sanitize_graph_for_persistence(sanitized) == sanitized
+
+
+def test_graph_fragment_decoding_is_bounded_fail_closed():
+    fragment = "clean-" + ("a" * 70_000)
+    url = f"https://models.example/base?revision=1#{fragment}"
+
+    assert security_module.sanitize_graph_for_persistence(url) == (
+        "https://models.example/base?revision=1"
+    )
 
 
 def test_sanitize_for_persistence_strips_any_http_url_query():
@@ -825,6 +856,175 @@ def test_append_jsonl_loops_on_short_writes_without_concatenation(
     assert destination.read_bytes().count(b"\n") == 2
 
 
+def test_two_store_instances_serialize_overlapping_short_writes(
+    tmp_path,
+    monkeypatch,
+):
+    first_store = ExperimentStore(tmp_path)
+    second_store = ExperimentStore(tmp_path)
+    first_store.create("journal-shared-001")
+    destination = first_store.append_jsonl(
+        "journal-shared-001",
+        "attempts.jsonl",
+        {"order": 0, "payload": "warm"},
+    )
+    original_write = store_module.os.write
+    first_chunk = Event()
+
+    def slow_short_write(descriptor, value):
+        first_chunk.set()
+        sleep(0.0005)
+        return original_write(descriptor, value[:3])
+
+    monkeypatch.setattr(store_module.os, "write", slow_short_write)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            first_store.append_jsonl,
+            "journal-shared-001",
+            "attempts.jsonl",
+            {"order": 1, "payload": "a" * 256},
+        )
+        assert first_chunk.wait(timeout=5)
+        second = pool.submit(
+            second_store.append_jsonl,
+            "journal-shared-001",
+            "attempts.jsonl",
+            {"order": 2, "payload": "b" * 256},
+        )
+        first.result(timeout=15)
+        second.result(timeout=15)
+
+    records = ExperimentStore(tmp_path).read_jsonl(
+        "journal-shared-001",
+        "attempts.jsonl",
+    )
+    assert [record["order"] for record in records] == [0, 1, 2]
+    assert records[1]["payload"] == "a" * 256
+    assert records[2]["payload"] == "b" * 256
+    assert destination.read_bytes().count(b"\n") == 3
+
+
+def test_many_store_instances_coordinate_read_repair_and_append(tmp_path):
+    stores = [ExperimentStore(tmp_path) for _ in range(24)]
+    stores[0].create("journal-shared-002")
+    destination = stores[0].append_jsonl(
+        "journal-shared-002",
+        "attempts.jsonl",
+        {"order": 0},
+    )
+    with destination.open("ab", buffering=0) as journal:
+        journal.write(b'{"order":999,"status":"in-flight"')
+        os.fsync(journal.fileno())
+
+    barrier = Barrier(len(stores))
+
+    def access(index):
+        barrier.wait()
+        if index < 8:
+            return stores[index].read_jsonl(
+                "journal-shared-002",
+                "attempts.jsonl",
+            )
+        stores[index].append_jsonl(
+            "journal-shared-002",
+            "attempts.jsonl",
+            {"order": index},
+        )
+        return ()
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+        futures = [pool.submit(access, index) for index in range(len(stores))]
+        for future in futures:
+            future.result(timeout=20)
+
+    records = ExperimentStore(tmp_path).read_jsonl(
+        "journal-shared-002",
+        "attempts.jsonl",
+    )
+    assert records[0] == {"order": 0}
+    assert len(records) == 17
+    assert {record["order"] for record in records} == {0, *range(8, 24)}
+
+
+def test_subprocess_jsonl_writers_share_advisory_lock(tmp_path):
+    store = ExperimentStore(tmp_path)
+    store.create("journal-process-001")
+    store.append_jsonl(
+        "journal-process-001",
+        "attempts.jsonl",
+        {"writer": -1, "sequence": -1},
+    )
+    start_marker = tmp_path / "start-process-writers"
+    child_script = r"""
+import os
+from pathlib import Path
+import sys
+import time
+
+from mp_comfyui_lab.experiments import store as store_module
+from mp_comfyui_lab.experiments.store import ExperimentStore
+
+root, marker, writer = sys.argv[1:]
+while not Path(marker).exists():
+    time.sleep(0.005)
+
+original_write = store_module.os.write
+def slow_short_write(descriptor, value):
+    time.sleep(0.0005)
+    return original_write(descriptor, value[:5])
+
+store_module.os.write = slow_short_write
+store = ExperimentStore(Path(root))
+for sequence in range(4):
+    store.append_jsonl(
+        "journal-process-001",
+        "attempts.jsonl",
+        {"writer": int(writer), "sequence": sequence, "payload": "x" * 96},
+    )
+"""
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                child_script,
+                str(tmp_path),
+                str(start_marker),
+                str(writer),
+            ],
+            cwd=Path.cwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for writer in range(4)
+    ]
+    start_marker.write_text("start\n", encoding="utf-8")
+
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+
+    records = ExperimentStore(tmp_path).read_jsonl(
+        "journal-process-001",
+        "attempts.jsonl",
+    )
+    assert records[0] == {"sequence": -1, "writer": -1}
+    process_records = records[1:]
+    assert len(process_records) == 16
+    assert {
+        (record["writer"], record["sequence"])
+        for record in process_records
+    } == {(writer, sequence) for writer in range(4) for sequence in range(4)}
+    for writer in range(4):
+        assert [
+            record["sequence"]
+            for record in process_records
+            if record["writer"] == writer
+        ] == list(range(4))
+
+
 def test_read_jsonl_repairs_hard_crash_tail_then_append_is_prefix_safe(tmp_path):
     store = ExperimentStore(tmp_path)
     store.create("journal-003")
@@ -955,6 +1155,24 @@ def test_jsonl_append_and_read_reject_symlink_leaf(tmp_path):
     with pytest.raises(SafetyError, match="symlink or junction"):
         store.append_jsonl("journal-008", "attempts.jsonl", {"order": 2})
     assert target.read_text(encoding="utf-8") == '{"order":1}\n'
+
+
+def test_jsonl_lock_file_rejects_symlink_leaf(tmp_path):
+    store = ExperimentStore(tmp_path / "experiments")
+    root = store.create("journal-lock-001")
+    target = tmp_path / "outside-lock-target"
+    target.write_bytes(b"outside")
+    lock_path = root / "attempts.jsonl.lock"
+    try:
+        lock_path.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("file symlinks are not supported")
+
+    with pytest.raises(SafetyError, match="symlink or junction"):
+        store.append_jsonl("journal-lock-001", "attempts.jsonl", {"order": 1})
+    with pytest.raises(SafetyError, match="symlink or junction"):
+        store.read_jsonl("journal-lock-001", "attempts.jsonl")
+    assert target.read_bytes() == b"outside"
 
 
 def test_jsonl_append_and_recovery_are_linear_at_scale(tmp_path):

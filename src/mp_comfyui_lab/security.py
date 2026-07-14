@@ -79,6 +79,8 @@ CANONICAL_AZURE_SAS_QUERY_KEYS = frozenset(
 )
 REDACTED = "[REDACTED]"
 MAX_DIAGNOSTIC_JSON_LENGTH = 65_536
+MAX_GRAPH_FRAGMENT_LENGTH = 65_536
+MAX_GRAPH_FRAGMENT_DECODE_LAYERS = 4
 MAX_URL_DESCRIPTOR_GAP = 256
 WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
 WINDOWS_RESERVED_BASENAMES = frozenset(
@@ -127,6 +129,7 @@ FRAGMENT_URL_USERINFO = re.compile(
     r"https?://[^/?#\s]*@",
     re.IGNORECASE,
 )
+VALID_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 
 
 class SafetyError(ValueError):
@@ -344,17 +347,37 @@ def _unparseable_graph_url_has_secret(value: str) -> bool:
 def _sanitize_graph_fragment(value: str) -> str:
     if not value:
         return value
-    inspected = unquote(value, encoding="utf-8", errors="replace")
+    if len(value) > MAX_GRAPH_FRAGMENT_LENGTH:
+        return ""
+
+    inspected = value
+    for decode_layer in range(MAX_GRAPH_FRAGMENT_DECODE_LAYERS + 1):
+        if _graph_fragment_has_secret(inspected):
+            return ""
+        if not VALID_PERCENT_ESCAPE.search(inspected):
+            return value
+        if decode_layer == MAX_GRAPH_FRAGMENT_DECODE_LAYERS:
+            return ""
+
+        inspected = unquote(inspected, encoding="utf-8", errors="replace")
+        if len(inspected) > MAX_GRAPH_FRAGMENT_LENGTH:
+            return ""
+        if decode_layer == 0 and VALID_PERCENT_ESCAPE.search(inspected):
+            return ""
+    return ""
+
+
+def _graph_fragment_has_secret(inspected: str) -> bool:
     if FRAGMENT_AUTHORIZATION_CREDENTIAL.search(inspected):
-        return ""
+        return True
     if FRAGMENT_URL_USERINFO.search(inspected):
-        return ""
+        return True
     for match in FRAGMENT_KEY_TOKEN.finditer(inspected):
         if not _is_secret_key(match.group("key")):
             continue
         if FRAGMENT_ASSIGNMENT_SEPARATOR.match(inspected[match.end() :]):
-            return ""
-    return value
+            return True
+    return False
 
 
 def _sanitize_graph_text(value: str) -> str:

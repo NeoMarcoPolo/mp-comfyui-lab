@@ -1543,6 +1543,10 @@ def test_inspect_persists_secret_safe_graph_with_reproducible_hashes(
                 "documentation": (
                     "https://models.example/docs#section=weights;revision=1"
                 ),
+                "nested_endpoint": (
+                    "https://models.example/base?revision=1"
+                    "#section%253Dweights%2526access_token%253Dnested-secret"
+                ),
                 "password": "password-secret",
                 "auth_token": "auth-secret",
                 "apiKey": "api-secret",
@@ -1584,6 +1588,9 @@ def test_inspect_persists_secret_safe_graph_with_reproducible_hashes(
     assert persisted_graph["1"]["inputs"]["documentation"] == (
         "https://models.example/docs#section=weights;revision=1"
     )
+    assert persisted_graph["1"]["inputs"]["nested_endpoint"] == (
+        "https://models.example/base?revision=1"
+    )
     assert "section=weights;revision=1" in paths["normalized.json"].read_text(
         encoding="utf-8"
     )
@@ -1596,6 +1603,7 @@ def test_inspect_persists_secret_safe_graph_with_reproducible_hashes(
         "aws-signature",
         "authority-secret",
         "fragment-secret",
+        "nested-secret",
         "alice",
         "X-Amz-Credential",
         "X-Amz-Signature",
