@@ -5,7 +5,9 @@ from datetime import UTC
 from enum import StrEnum
 import json
 from pathlib import Path
+import re
 from typing import Annotated, Any, Literal, Self
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -20,6 +22,8 @@ from pydantic import (
 
 from mp_comfyui_lab.discovery.urls import UnsupportedSourceError, parse_runninghub_url
 from mp_comfyui_lab.graph.models import FrozenJsonValue, NormalizedGraph
+from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
+from mp_comfyui_lab.graph.normalize import GraphNormalizationError, normalize_graph
 from mp_comfyui_lab.json_types import (
     FrozenJsonObject,
     SanitizedJsonObject,
@@ -293,6 +297,8 @@ MAX_MANIFEST_SOURCES = 128
 MAX_FIXTURES = 64
 MAX_PROMPT_LINES = 512
 MAX_PLAN_VARIANTS = 512
+_ARTIFACT_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
+_VAULT_ALIAS = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
 
 class DimensionName(StrEnum):
@@ -353,6 +359,31 @@ class SourceSpec(_FrozenModel):
 class ReferenceImageFixture(_FrozenModel):
     uri: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=2_048)]
     binding_index: int = Field(ge=0, le=4_095)
+
+    @field_validator("uri")
+    @classmethod
+    def canonical_logical_uri(cls, value: str) -> str:
+        if any(ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise ValueError("fixture URI contains control or surrogate text")
+        if "\\" in value or "?" in value or "#" in value:
+            raise ValueError("fixture URI must not contain a query, fragment, or backslash")
+        parsed = urlsplit(value)
+        if value.startswith("vault://"):
+            alias, slash, relative = value.removeprefix("vault://").partition("/")
+            if not slash or not _VAULT_ALIAS.fullmatch(alias):
+                raise ValueError("vault fixture URI requires a safe alias and relative path")
+            prefix = f"vault://{alias}/"
+        else:
+            if parsed.scheme or parsed.netloc or value.startswith(("/", "//")) or ":" in value:
+                raise ValueError("fixture URI must be a safe relative logical path")
+            relative = value
+            prefix = ""
+        parts = relative.split("/")
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            raise ValueError("fixture URI contains an unsafe path component")
+        if any(any(ord(character) < 32 for character in part) for part in parts):
+            raise ValueError("fixture URI contains an unsafe path component")
+        return prefix + "/".join(parts)
 
 
 class FixtureSpec(_FrozenModel):
@@ -473,6 +504,13 @@ class Candidate(_FrozenModel):
     engagement: int = Field(default=0, ge=0)
     provenance_rank: int = Field(default=0, ge=0)
 
+    @field_validator("candidate_id")
+    @classmethod
+    def safe_candidate_id(cls, value: str) -> str:
+        if value == "baseline" or not _ARTIFACT_ID.fullmatch(value):
+            raise ValueError("candidate_id must be a safe non-baseline artifact ID")
+        return value
+
     @field_validator("hypothesis", mode="before")
     @classmethod
     def parse_hypothesis(cls, value: Any) -> DimensionName:
@@ -543,12 +581,25 @@ class PlanningSource(_FrozenModel):
     def source_id_matches_url(self) -> Self:
         if parse_runninghub_url(self.canonical_url).workflow_id != self.workflow_id:
             raise ValueError("workflow_id does not match canonical_url")
+        try:
+            normalized = normalize_graph(self.raw_graph)
+            actual_source_hash = source_graph_hash(self.raw_graph)
+            actual_capability_hash = capability_hash(self.raw_graph)
+        except (GraphNormalizationError, ValueError) as error:
+            raise ValueError(f"raw_graph is not a valid normalized graph: {error}") from error
+        if normalized != self.normalized_graph:
+            raise ValueError("normalized_graph must exactly match raw_graph normalization")
+        if actual_source_hash != self.source_hash:
+            raise ValueError("source_hash must match raw_graph")
+        if actual_capability_hash != self.capability_hash:
+            raise ValueError("capability_hash must match raw_graph")
         return self
 
 
 class SourceBundle(_FrozenModel):
     sources: tuple[PlanningSource, ...] = Field(min_length=1, max_length=MAX_MANIFEST_SOURCES)
     candidates: tuple[Candidate, ...] = Field(default=(), max_length=MAX_PLAN_VARIANTS)
+    baseline_workflow_id: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=256)] | None = None
 
     @field_validator("sources", "candidates", mode="before")
     @classmethod
@@ -567,6 +618,48 @@ class SourceBundle(_FrozenModel):
         if len(keys) != len(set(keys)):
             raise ValueError("source bundle contains duplicate source identity")
         return tuple(sorted(values, key=lambda item: (item.workflow_id, item.source_hash)))
+
+    @field_validator("candidates")
+    @classmethod
+    def canonical_candidates(
+        cls,
+        values: tuple[Candidate, ...],
+    ) -> tuple[Candidate, ...]:
+        ids = [item.candidate_id for item in values]
+        if len(ids) != len(set(ids)):
+            raise ValueError("source bundle candidate IDs must be unique")
+        return tuple(
+            sorted(
+                values,
+                key=lambda item: json.dumps(
+                    item.model_dump(mode="json"),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+        )
+
+    @model_validator(mode="after")
+    def validate_evidence_and_baseline(self) -> Self:
+        workflow_ids = {item.workflow_id for item in self.sources}
+        evidence_ids = {
+            evidence_id
+            for source in self.sources
+            for evidence_id in (*source.evidence_ids, source.workflow_id)
+        }
+        if self.baseline_workflow_id is not None and self.baseline_workflow_id not in workflow_ids:
+            raise ValueError("baseline_workflow_id must identify a bundle source")
+        missing = sorted(
+            evidence_id
+            for candidate in self.candidates
+            for evidence_id in candidate.evidence_ids
+            if evidence_id not in evidence_ids
+        )
+        if missing:
+            raise ValueError(f"candidates reference missing evidence IDs: {missing}")
+        return self
 
 
 class FixtureFingerprint(_FrozenModel):

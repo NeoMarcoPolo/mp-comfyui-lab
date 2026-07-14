@@ -18,7 +18,12 @@ from mp_comfyui_lab.mutations.models import (
     ValidationIssue,
     ValidationReport,
 )
-from mp_comfyui_lab.mutations.planner import CandidateSelection, propose_patch, select_candidates
+from mp_comfyui_lab.mutations.planner import (
+    CandidateSelection,
+    propose_patch,
+    select_candidates,
+    validate_candidate_patch,
+)
 
 
 __all__ = [
@@ -43,4 +48,5 @@ __all__ = [
     "CandidateSelection",
     "propose_patch",
     "select_candidates",
+    "validate_candidate_patch",
 ]

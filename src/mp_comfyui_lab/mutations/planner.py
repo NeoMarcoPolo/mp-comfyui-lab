@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 from typing import TYPE_CHECKING
 
 from mp_comfyui_lab.graph.models import SemanticRole
-from mp_comfyui_lab.mutations.models import SemanticPatch, SetRoleInput
+from mp_comfyui_lab.mutations.models import (
+    ReplaceLoraStack,
+    ReplaceSubgraph,
+    SemanticPatch,
+    SetNodeInput,
+    SetRoleInput,
+)
 
 if TYPE_CHECKING:
     from mp_comfyui_lab.experiments.models import (
@@ -29,6 +37,20 @@ _CLAIM_ROLES = {
     "sampler": SemanticRole.SAMPLER,
     "scheduler": SemanticRole.SCHEDULER,
     "encoder": SemanticRole.ENCODER,
+}
+_ROLE_DIMENSIONS = {
+    SemanticRole.CHECKPOINT: "checkpoint",
+    SemanticRole.MODEL: "checkpoint",
+    SemanticRole.UNET: "checkpoint",
+    SemanticRole.LORA: "lora_stack",
+    SemanticRole.PROMPT_SOURCE: "prompt_grammar",
+    SemanticRole.PROMPT_FANOUT: "prompt_grammar",
+    SemanticRole.SAMPLER: "sampler",
+    SemanticRole.SCHEDULER: "scheduler",
+    SemanticRole.ENCODER: "encoder",
+    SemanticRole.REFERENCE_IMAGE: "reference_strategy",
+    SemanticRole.DIMENSIONS: "output_dimensions",
+    SemanticRole.SEED: "seed_variance",
 }
 
 
@@ -60,8 +82,16 @@ def select_candidates(
             grouped[signature],
             key=lambda item: (
                 _CONFIDENCE_ORDER[item.confidence.value],
-                -item.engagement,
                 -item.provenance_rank,
+                -len(item.evidence_ids),
+                -item.engagement,
+                json.dumps(
+                    item.model_dump(mode="json"),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
                 item.candidate_id,
             ),
         )
@@ -72,7 +102,21 @@ def select_candidates(
             )
 
     return CandidateSelection(
-        candidates=tuple(sorted(selected, key=lambda item: item.candidate_id)),
+        candidates=tuple(
+            sorted(
+                selected,
+                key=lambda item: (
+                    item.capability_signature,
+                    json.dumps(
+                        item.model_dump(mode="json"),
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        ),
         warnings=tuple(sorted(warnings)),
     )
 
@@ -108,3 +152,54 @@ def propose_patch(candidate: Candidate, source: PlanningSource) -> SemanticPatch
             ),
         )
     )
+
+
+def validate_candidate_patch(
+    candidate: Candidate,
+    patch: SemanticPatch,
+    source: PlanningSource,
+    brief: ExperimentBrief,
+) -> str | None:
+    """Classify every candidate mutation from graph bindings; never guess."""
+    dimensions: set[str] = set()
+    for mutation in patch.mutations:
+        dimension = _mutation_dimension(mutation, source)
+        if dimension is None:
+            return "affected dimension cannot be proven"
+        dimensions.add(dimension)
+    if "seed_variance" in dimensions and brief.policy_for(
+        type(candidate.hypothesis).SEED_VARIANCE
+    ).value != "approved":
+        return "seed_variance is not approved"
+    if len(dimensions) != 1 or candidate.hypothesis.value not in dimensions:
+        return "candidate patch changes a dimension other than its hypothesis"
+    if brief.policy_for(candidate.hypothesis).value != "approved":
+        return f"{candidate.hypothesis.value} is not approved"
+    return None
+
+
+def _mutation_dimension(mutation, source: PlanningSource) -> str | None:
+    if isinstance(mutation, SetRoleInput):
+        return _ROLE_DIMENSIONS.get(mutation.role)
+    if isinstance(mutation, SetNodeInput):
+        matches = {
+            _ROLE_DIMENSIONS[role]
+            for role in SemanticRole
+            for binding in source.normalized_graph.bindings(role)
+            if binding.node_id == mutation.node_id
+            and binding.field_name == mutation.field_name
+            and role in _ROLE_DIMENSIONS
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+    if isinstance(mutation, ReplaceLoraStack):
+        existing = tuple(
+            str(binding.value.get("name", binding.value))
+            if isinstance(binding.value, Mapping)
+            else str(binding.value)
+            for binding in source.normalized_graph.bindings(SemanticRole.LORA)
+        )
+        requested = tuple(item.name for item in mutation.loras)
+        return "lora_strength" if requested == existing else "lora_stack"
+    if isinstance(mutation, ReplaceSubgraph):
+        return None
+    return None

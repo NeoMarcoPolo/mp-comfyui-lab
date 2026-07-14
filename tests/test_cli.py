@@ -9,7 +9,7 @@ import mp_comfyui_lab
 import pytest
 
 from mp_comfyui_lab.cli import app
-from mp_comfyui_lab.cli.app import ExitCode, main
+from mp_comfyui_lab.cli.app import ExitCode, ReadOnlyPlanningBundleLoader, main
 from mp_comfyui_lab.discovery.query import expand_query
 from mp_comfyui_lab.discovery.ranking import (
     Artifact,
@@ -26,8 +26,15 @@ from mp_comfyui_lab.discovery.service import (
 from mp_comfyui_lab.discovery import service as service_module
 from mp_comfyui_lab.discovery.models import Engagement, WorkflowCandidate, WorkflowDetail
 from mp_comfyui_lab.discovery.urls import UnsupportedSourceError
-from mp_comfyui_lab.executors.base import ExecutorError
+from mp_comfyui_lab.executors.base import (
+    ExecutorError,
+    FetchedWorkflow,
+    SearchPage,
+    WorkflowRef,
+)
+from mp_comfyui_lab.evidence.models import EvidenceGraph
 from mp_comfyui_lab.experiments.models import PlanningSource, SourceBundle
+from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
 
 
@@ -463,8 +470,8 @@ def test_plan_cli_writes_dry_run_artifacts_and_never_touches_executor(
                 canonical_url="https://www.runninghub.ai/post/1980860923768426497",
                 raw_graph=graph,
                 normalized_graph=normalize_graph(graph),
-                source_hash="a" * 64,
-                capability_hash="b" * 64,
+                source_hash=source_graph_hash(graph),
+                capability_hash=capability_hash(graph),
                 evidence_ids=("evidence-1",),
             ),
         )
@@ -510,3 +517,51 @@ dimensions:
     assert any("plans" in path for path in artifact_paths)
     persisted = "\n".join(Path(path).read_text(encoding="utf-8") for path in artifact_paths)
     assert "token=secret" not in persisted
+    evidence_path = next(
+        Path(path)
+        for path in artifact_paths
+        if path.replace("\\", "/").endswith("evidence/graph.json")
+    )
+    assert EvidenceGraph.model_validate_json(evidence_path.read_text(encoding="utf-8")).schema_version == "1"
+
+
+class ReadOnlyExecutor:
+    name = "runninghub"
+
+    def __init__(self, graph):
+        self.graph = graph
+        self.calls = []
+
+    def search(self, request):
+        self.calls.append(("search", request.query))
+        return SearchPage(records=(_workflow_candidate(),), total=1, page=1, size=30, has_next=False)
+
+    def fetch_workflow(self, ref):
+        self.calls.append(("fetch_workflow", ref.workflow_id))
+        return FetchedWorkflow(ref=ref, detail=WorkflowDetail(candidate=_workflow_candidate()), graph=self.graph)
+
+    def inspect_capabilities(self, workflow):
+        self.calls.append(("inspect_capabilities", workflow.ref.workflow_id))
+        return None
+
+    def __getattr__(self, name):
+        raise AssertionError(f"read-only planning touched forbidden executor method {name}")
+
+
+def test_default_read_only_planning_loader_uses_only_public_discovery_methods():
+    graph = json.loads(
+        (Path(__file__).parent / "fixtures" / "runninghub" / "qwen_graph.json").read_text(encoding="utf-8")
+    )
+    executor = ReadOnlyExecutor(graph)
+    brief = app.ExperimentBrief.model_validate({
+        "goal": "x",
+        "sources": {"queries": ["next scene"], "urls": ["https://www.runninghub.ai/post/1980860923768426497"]},
+        "fixtures": {"reference_images": [], "prompt_lines": ["one"]},
+        "expectations": {"output_count": 1, "media_types": ["image/png"]},
+        "dimensions": {"checkpoint": "approved"},
+    })
+    bundle = ReadOnlyPlanningBundleLoader(executor).load_source_bundle(brief)
+    assert bundle.baseline_workflow_id == "1980860923768426497"
+    call_names = [call[0] for call in executor.calls]
+    assert set(call_names) == {"search", "fetch_workflow", "inspect_capabilities"}
+    assert call_names[-2:] == ["fetch_workflow", "inspect_capabilities"]

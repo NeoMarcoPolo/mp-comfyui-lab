@@ -25,6 +25,7 @@ from mp_comfyui_lab.experiments.models import (
 from mp_comfyui_lab.mutations import SemanticPatch, SetRoleInput
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph
+from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 
 
 def _graph(*, reference_count: int = 1, prompt_fanout: bool = True) -> dict:
@@ -46,7 +47,7 @@ def _graph(*, reference_count: int = 1, prompt_fanout: bool = True) -> dict:
         "6": {
             "class_type": "KSampler",
             "inputs": {
-                "model": ["4", 0], "positive": ["2", 0], "negative": ["2", 0],
+                "model": ["4", 0], "positive": ["8", 0] if prompt_fanout else ["2", 0], "negative": ["2", 0],
                 "latent_image": ["7", 0], "seed": 1, "sampler_name": "euler", "scheduler": "normal", "steps": 10, "cfg": 7.0,
             },
         },
@@ -91,9 +92,9 @@ def _source(graph: dict | None = None, *, workflow_id: str = "123") -> PlanningS
         canonical_url=f"https://www.runninghub.ai/post/{workflow_id}",
         raw_graph=raw_graph,
         normalized_graph=normalize_graph(raw_graph),
-        source_hash="a" * 64,
-        capability_hash="b" * 64,
-        evidence_ids=("evidence-1",),
+        source_hash=source_graph_hash(raw_graph),
+        capability_hash=capability_hash(raw_graph),
+        evidence_ids=(workflow_id,),
         engagement=42,
     )
 
@@ -210,8 +211,8 @@ def test_candidate_selection_prefers_confidence_and_one_capability_representativ
     (tmp_path / "portrait.png").write_bytes(b"fixture")
     patch = SemanticPatch(mutations=(SetRoleInput(role=SemanticRole.CHECKPOINT, binding_index=0, field_name="ckpt_name", value="new.safetensors"),))
     candidates = (
-        Candidate(candidate_id="weak", hypothesis="checkpoint", capability_signature="checkpoint:new", confidence=ConfidenceLabel.WEAKLY_INFERRED, evidence_ids=("e2",), semantic_patch=patch, engagement=999),
-        Candidate(candidate_id="observed", hypothesis="checkpoint", capability_signature="checkpoint:new", confidence=ConfidenceLabel.OBSERVED, evidence_ids=("e1",), semantic_patch=patch, engagement=1),
+        Candidate(candidate_id="weak", hypothesis="checkpoint", capability_signature="checkpoint:new", confidence=ConfidenceLabel.WEAKLY_INFERRED, evidence_ids=("123",), semantic_patch=patch, engagement=999),
+        Candidate(candidate_id="observed", hypothesis="checkpoint", capability_signature="checkpoint:new", confidence=ConfidenceLabel.OBSERVED, evidence_ids=("123",), semantic_patch=patch, engagement=1),
     )
     plan = build_plan(_brief(), _bundle(candidates=candidates), config=_config(tmp_path))
     assert [item.variant_id for item in plan.variants] == ["baseline", "observed"]
@@ -219,8 +220,8 @@ def test_candidate_selection_prefers_confidence_and_one_capability_representativ
 
 def test_unexplored_candidate_is_retained_and_seed_candidate_requires_approval(tmp_path: Path) -> None:
     (tmp_path / "portrait.png").write_bytes(b"fixture")
-    unexplored = Candidate(candidate_id="unknown", hypothesis="sampler", capability_signature="sampler:new", confidence=ConfidenceLabel.UNEXPLORED, evidence_ids=("e1",), semantic_patch=SemanticPatch(mutations=(SetRoleInput(role=SemanticRole.SAMPLER, binding_index=0, field_name="sampler_name", value="dpmpp_2m"),)))
-    seed = Candidate(candidate_id="seed", hypothesis="seed_variance", capability_signature="seed:2", confidence=ConfidenceLabel.OBSERVED, evidence_ids=("e1",), semantic_patch=SemanticPatch(mutations=(SetRoleInput(role=SemanticRole.SEED, binding_index=0, field_name="seed", value=2),)))
+    unexplored = Candidate(candidate_id="unknown", hypothesis="sampler", capability_signature="sampler:new", confidence=ConfidenceLabel.UNEXPLORED, evidence_ids=("123",), semantic_patch=SemanticPatch(mutations=(SetRoleInput(role=SemanticRole.SAMPLER, binding_index=0, field_name="sampler_name", value="dpmpp_2m"),)))
+    seed = Candidate(candidate_id="seed", hypothesis="seed_variance", capability_signature="seed:2", confidence=ConfidenceLabel.OBSERVED, evidence_ids=("123",), semantic_patch=SemanticPatch(mutations=(SetRoleInput(role=SemanticRole.SEED, binding_index=0, field_name="seed", value=2),)))
     plan = build_plan(_brief(), _bundle(candidates=(seed, unexplored)), config=_config(tmp_path))
     assert [item.variant_id for item in plan.variants] == ["baseline", "unknown"]
     assert "unexplored" in " ".join(plan.variants[-1].warnings)
@@ -280,3 +281,111 @@ def test_fixture_fingerprint_detects_a_change_during_descriptor_read(
 def test_candidate_claims_are_strict_and_explicit_when_no_safe_synthesis_exists() -> None:
     with pytest.raises(ValidationError):
         CandidateClaim.model_validate({"dimension": "checkpoint", "value": "x", "extra": "no"})
+
+
+def test_planning_source_recomputes_graph_normalization_and_hashes() -> None:
+    graph = _graph()
+    with pytest.raises(ValidationError, match="source_hash"):
+        PlanningSource(
+            workflow_id="123",
+            canonical_url="https://www.runninghub.ai/post/123",
+            raw_graph=graph,
+            normalized_graph=normalize_graph(graph),
+            source_hash="a" * 64,
+            capability_hash=capability_hash(graph),
+            evidence_ids=("123",),
+        )
+    with pytest.raises(ValidationError, match="normalized_graph"):
+        PlanningSource(
+            workflow_id="123",
+            canonical_url="https://www.runninghub.ai/post/123",
+            raw_graph=graph,
+            normalized_graph=normalize_graph({**graph, "99": {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}}}),
+            source_hash=source_graph_hash(graph),
+            capability_hash=capability_hash(graph),
+            evidence_ids=("123",),
+        )
+
+
+def test_auto_counts_reachable_multi_outputs_but_rejects_disconnected_fanout(tmp_path: Path) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    graph = _graph()
+    graph["9"] = {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}}
+    plan = build_plan(_brief(), _bundle(graph=graph), config=_config(tmp_path))
+    assert plan.variants[0].expected_output_count == 6
+    disconnected = _graph()
+    disconnected["6"]["inputs"]["positive"] = ["2", 0]
+    with pytest.raises(PlanningValidationError, match="reachable"):
+        build_plan(_brief(), _bundle(graph=disconnected), config=_config(tmp_path))
+
+
+def test_explicit_count_keeps_all_valid_output_nodes_and_infers_media(tmp_path: Path) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    graph = _graph()
+    graph["9"] = {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}}
+    brief = _brief(expectations={"output_count": 7, "media_types": []})
+    variant = build_plan(brief, _bundle(graph=graph), config=_config(tmp_path)).variants[0]
+    assert variant.expected_output_count == 7
+    assert variant.output_node_ids == ("3", "9")
+    assert variant.expected_media_types == ("image/png", "image/png")
+
+
+def test_candidate_patch_roles_must_match_approved_hypothesis_and_seed_policy(tmp_path: Path) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    seed_patch = SemanticPatch(mutations=(
+        SetRoleInput(role=SemanticRole.SEED, binding_index=0, field_name="seed", value=2),
+    ))
+    mislabeled = Candidate(
+        candidate_id="sampler-seed",
+        hypothesis="sampler",
+        capability_signature="sampler-seed",
+        confidence=ConfidenceLabel.OBSERVED,
+        evidence_ids=("123",),
+        semantic_patch=seed_patch,
+    )
+    plan = build_plan(_brief(), _bundle(candidates=(mislabeled,)), config=_config(tmp_path))
+    assert [item.variant_id for item in plan.variants] == ["baseline"]
+    assert "seed_variance" in " ".join(plan.warnings)
+    approved = _brief(dimensions={"checkpoint": "approved", "prompt_grammar": "approved", "sampler": "approved", "seed_variance": "approved"})
+    seed = Candidate(
+        candidate_id="seed",
+        hypothesis="seed_variance",
+        capability_signature="seed-variance",
+        confidence=ConfidenceLabel.OBSERVED,
+        evidence_ids=("123",),
+        semantic_patch=seed_patch,
+    )
+    assert [item.variant_id for item in build_plan(approved, _bundle(candidates=(seed,)), config=_config(tmp_path)).variants] == ["baseline", "seed"]
+
+
+def test_candidate_ids_and_fixture_uris_are_safe_and_canonical() -> None:
+    patch = SemanticPatch(mutations=(SetRoleInput(role=SemanticRole.CHECKPOINT, binding_index=0, field_name="ckpt_name", value="x"),))
+    with pytest.raises(ValidationError):
+        Candidate(candidate_id="baseline", hypothesis="checkpoint", capability_signature="x", confidence="observed", evidence_ids=("123",), semantic_patch=patch)
+    with pytest.raises(ValidationError):
+        _brief(fixtures={"reference_images": [{"uri": "../secret.png", "binding_index": 0}], "prompt_lines": ["x"]})
+    with pytest.raises(ValidationError):
+        _brief(fixtures={"reference_images": [{"uri": "C:/secret.png", "binding_index": 0}], "prompt_lines": ["x"]})
+    brief = _brief(fixtures={"reference_images": [{"uri": "vault://characters/nested/hero.png", "binding_index": 0}], "prompt_lines": ["x"]})
+    assert brief.fixtures.reference_images[0].uri == "vault://characters/nested/hero.png"
+
+
+def test_candidate_tie_prefers_provenance_before_engagement(tmp_path: Path) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    patch = SemanticPatch(mutations=(SetRoleInput(role=SemanticRole.CHECKPOINT, binding_index=0, field_name="ckpt_name", value="new"),))
+    weak = Candidate(candidate_id="engagement", hypothesis="checkpoint", capability_signature="same", confidence="observed", evidence_ids=("123",), semantic_patch=patch, engagement=999, provenance_rank=1)
+    strong = Candidate(candidate_id="provenance", hypothesis="checkpoint", capability_signature="same", confidence="observed", evidence_ids=("123",), semantic_patch=patch, engagement=1, provenance_rank=2)
+    plan = build_plan(_brief(), _bundle(candidates=(weak, strong)), config=_config(tmp_path))
+    assert [item.variant_id for item in plan.variants] == ["baseline", "provenance"]
+
+
+def test_exact_hash_binds_media_and_every_output_field(tmp_path: Path) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    first = build_plan(_brief(), _bundle(), config=_config(tmp_path)).variants[0]
+    assert first.expected_media_types == ("image/png",)
+    with pytest.raises(PlanningValidationError, match="media types"):
+        build_plan(
+            _brief(expectations={"output_count": "auto", "media_types": ["image/jpeg"]}),
+            _bundle(),
+            config=_config(tmp_path),
+        )

@@ -13,8 +13,10 @@ from typing import Any
 from pydantic import ValidationError
 
 from mp_comfyui_lab.config import LabConfig, safe_load_yaml
+from mp_comfyui_lab.evidence.models import EvidenceGraph, EvidenceSource, EvidenceSourceKind
 from mp_comfyui_lab.graph.hashing import capability_hash
 from mp_comfyui_lab.graph.models import SemanticRole
+from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.graph.patch import (
     PatchTopologyError,
     PatchValidationError,
@@ -22,7 +24,11 @@ from mp_comfyui_lab.graph.patch import (
 )
 from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.mutations import SemanticPatch, SetNodeInput, SetRoleInput
-from mp_comfyui_lab.mutations.planner import propose_patch, select_candidates
+from mp_comfyui_lab.mutations.planner import (
+    propose_patch,
+    select_candidates,
+    validate_candidate_patch,
+)
 from mp_comfyui_lab.security import SafetyError
 
 from .models import (
@@ -46,6 +52,25 @@ MAX_FIXTURE_BYTES = 64 * 1024 * 1024
 
 class PlanningValidationError(ValueError):
     """Raised when a manifest or graph cannot produce a safe deterministic plan."""
+
+
+def evidence_graph_for_bundle(source_bundle: SourceBundle) -> EvidenceGraph:
+    """Build the Task 7 evidence artifact from the strict planning source DTOs."""
+    try:
+        return EvidenceGraph(
+            sources=tuple(
+                EvidenceSource(
+                    source_id=source.workflow_id,
+                    kind=EvidenceSourceKind.CURRENT_NORMALIZED_GRAPH,
+                    canonical_url=source.canonical_url,
+                    source_hash=source.source_hash,
+                    capability_hash=source.capability_hash,
+                )
+                for source in source_bundle.sources
+            )
+        )
+    except ValidationError as error:
+        raise PlanningValidationError(f"invalid planning evidence graph: {error}") from error
 
 
 def _canonical_json(value: Any) -> str:
@@ -133,32 +158,21 @@ def load_experiment_brief(path: str | Path) -> ExperimentBrief:
         raise PlanningValidationError(str(error)) from error
 
 
-def _fixture_candidate_path(config: LabConfig, uri: str) -> Path:
-    # Resolve through LabConfig first; the raw path is checked separately so a
-    # symlink cannot disappear from the evidence trail when resolve() follows it.
-    resolved = config.resolve_fixture(uri)
+def _fixture_root_and_parts(config: LabConfig, uri: str) -> tuple[Path, tuple[str, ...]]:
+    """Return logical fixture containment without resolving the target pathname."""
+    # Keep LabConfig as the authority for configured aliases and fixture roots.
+    # Its resolved return value is intentionally not used for opening: resolving
+    # a pathname before opening would reintroduce a symlink race.
+    config.resolve_fixture(uri)
     if uri.startswith("vault://"):
         alias, separator, relative = uri.removeprefix("vault://").partition("/")
         if not separator or alias not in config.vaults:
             raise SafetyError("invalid vault fixture URI")
-        candidate = config.vaults[alias] / relative
         containment = config.vaults[alias]
     else:
-        candidate = Path(uri).expanduser()
-        if not candidate.is_absolute():
-            candidate = config._fixture_base / candidate
         containment = config._fixture_base
-    try:
-        resolved.relative_to(containment.resolve())
-    except ValueError as error:
-        raise SafetyError("fixture escapes configured containment") from error
-    current = containment
-    relative_parts = candidate.relative_to(containment).parts
-    for part in relative_parts:
-        current /= part
-        if current.is_symlink() or _is_reparse_point(current):
-            raise SafetyError("fixture path contains a symlink or reparse point")
-    return resolved
+        relative = uri
+    return containment, tuple(relative.split("/"))
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -166,6 +180,66 @@ def _is_reparse_point(path: Path) -> bool:
         return bool(getattr(path.lstat(), "st_reparse_tag", 0))
     except OSError:
         return False
+
+
+def _safe_open_fixture(config: LabConfig, uri: str) -> int:
+    """Open a regular fixture through containment-relative descriptors.
+
+    POSIX walks each component under an already-open directory descriptor.  This
+    prevents a parent rename or symlink replacement from redirecting the final
+    open.  Windows lacks a portable ``openat`` equivalent in Python, so it uses
+    non-following/non-blocking open plus pre/post reparse checks as a best effort.
+    """
+    root, parts = _fixture_root_and_parts(config, uri)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    binary = getattr(os, "O_BINARY", 0)
+    if os.name != "nt" and hasattr(os, "O_DIRECTORY"):
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow | nonblock | binary
+        try:
+            current = os.open(root, directory_flags)
+        except OSError as error:
+            raise SafetyError(f"cannot open fixture containment safely: {error}") from error
+        try:
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise SafetyError("fixture containment must be a directory")
+            for part in parts[:-1]:
+                try:
+                    child = os.open(part, directory_flags, dir_fd=current)
+                except OSError as error:
+                    raise SafetyError(f"cannot open fixture parent safely: {error}") from error
+                os.close(current)
+                current = child
+                if not stat.S_ISDIR(os.fstat(current).st_mode):
+                    raise SafetyError("fixture parent must be a directory")
+            try:
+                descriptor = os.open(
+                    parts[-1],
+                    os.O_RDONLY | nofollow | nonblock | binary,
+                    dir_fd=current,
+                )
+            except OSError as error:
+                raise SafetyError(f"cannot open fixture safely: {error}") from error
+            return descriptor
+        finally:
+            os.close(current)
+
+    # The Windows fallback remains nonblocking and validates reparse points both
+    # before and after open.  It never opens a special file for blocking I/O.
+    candidate = root.joinpath(*parts)
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink() or _is_reparse_point(current):
+            raise SafetyError("fixture path contains a symlink or reparse point")
+    try:
+        descriptor = os.open(candidate, os.O_RDONLY | nofollow | nonblock | binary)
+    except OSError as error:
+        raise SafetyError(f"cannot open fixture safely: {error}") from error
+    if candidate.is_symlink() or _is_reparse_point(candidate):
+        os.close(descriptor)
+        raise SafetyError("fixture path changed to a symlink or reparse point")
+    return descriptor
 
 
 def _media_type(initial: bytes) -> str | None:
@@ -181,12 +255,7 @@ def _media_type(initial: bytes) -> str | None:
 
 
 def _fingerprint_fixture(config: LabConfig, uri: str, binding_index: int) -> FixtureFingerprint:
-    resolved = _fixture_candidate_path(config, uri)
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(resolved, flags)
-    except OSError as error:
-        raise SafetyError(f"cannot open fixture safely: {error}") from error
+    descriptor = _safe_open_fixture(config, uri)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
@@ -235,7 +304,7 @@ def _fixture_fingerprints(
 def _common_fixture_patch(
     brief: ExperimentBrief,
     source: PlanningSource,
-) -> SemanticPatch:
+) -> tuple[SemanticPatch, str]:
     mutations: list[Any] = []
     references = source.normalized_graph.bindings(SemanticRole.REFERENCE_IMAGE)
     for fixture in brief.fixtures.reference_images:
@@ -257,7 +326,8 @@ def _common_fixture_patch(
     fanout = _prompt_fanout_binding(source)
     if fanout is None or fanout.field_name == "$class_type":
         raise PlanningValidationError(
-            "prompt_lines require one unambiguous prompt/fanout binding"
+            "prompt_lines require one unambiguous prompt/fanout binding; "
+            "specify an explicit integer"
         )
     mutations.append(
         SetNodeInput(
@@ -266,7 +336,7 @@ def _common_fixture_patch(
             value=list(brief.fixtures.prompt_lines),
         )
     )
-    return SemanticPatch(mutations=tuple(mutations))
+    return SemanticPatch(mutations=tuple(mutations)), fanout.node_id
 
 
 def _prompt_fanout_binding(source: PlanningSource):
@@ -291,42 +361,92 @@ def _combine_patches(common: SemanticPatch, candidate: SemanticPatch | None) -> 
         raise PlanningValidationError(f"candidate conflicts with fixture patch: {error}") from error
 
 
+def _output_media_type(class_type: str) -> str | None:
+    compact = "".join(character for character in class_type.casefold() if character.isalnum())
+    if "jpeg" in compact or "jpg" in compact:
+        return "image/jpeg"
+    if "webp" in compact:
+        return "image/webp"
+    if "gif" in compact:
+        return "image/gif"
+    if "video" in compact:
+        return "video/mp4"
+    if compact.startswith(("save", "preview")) or compact.endswith("output"):
+        return "image/png"
+    return None
+
+
 def _output_details(
     brief: ExperimentBrief,
-    source: PlanningSource,
+    graph: dict[str, Any],
+    prompt_fanout_node_id: str,
 ) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
-    outputs = source.normalized_graph.bindings(SemanticRole.OUTPUT)
-    if len(outputs) != 1:
+    normalized = normalize_graph(graph)
+    outputs = normalized.bindings(SemanticRole.OUTPUT)
+    if not outputs:
         raise PlanningValidationError(
-            "auto output_count requires one unambiguous normalized output node; use an explicit integer"
+            "output graph must contain at least one normalized output node"
         )
-    output_node_ids = tuple(binding.node_id for binding in outputs)
-    media_types = brief.expectations.media_types
+    node_by_id = {node.node_id: node for node in normalized.nodes}
+    output_node_ids = tuple(sorted({binding.node_id for binding in outputs}))
+    inferred = tuple(
+        _output_media_type(node_by_id[node_id].class_type)
+        for node_id in output_node_ids
+    )
+    if any(item is None for item in inferred):
+        raise PlanningValidationError("output media type cannot be inferred")
+    inferred_media = tuple(item for item in inferred if item is not None)
+    declared = brief.expectations.media_types
+    if declared:
+        if len(declared) not in {1, len(inferred_media)}:
+            raise PlanningValidationError("declared media types do not match output semantics")
+        expected_media = (
+            declared * len(inferred_media)
+            if len(declared) == 1
+            else declared
+        )
+        if expected_media != inferred_media:
+            raise PlanningValidationError("declared media types do not match output semantics")
+    else:
+        expected_media = inferred_media
     if brief.expectations.output_count != "auto":
-        return brief.expectations.output_count, output_node_ids, media_types
-    if _prompt_fanout_binding(source) is None:
+        return brief.expectations.output_count, output_node_ids, expected_media
+
+    children: dict[str, set[str]] = {node.node_id: set() for node in normalized.nodes}
+    for node in normalized.nodes:
+        for parent_id, _ in node.input_links.values():
+            children.setdefault(parent_id, set()).add(node.node_id)
+    reachable = {prompt_fanout_node_id}
+    pending = [prompt_fanout_node_id]
+    while pending:
+        node_id = pending.pop()
+        for child_id in sorted(children.get(node_id, ())):
+            if child_id not in reachable:
+                reachable.add(child_id)
+                pending.append(child_id)
+    if not set(output_node_ids).issubset(reachable):
         raise PlanningValidationError(
-            "auto output_count is unresolved; specify an explicit integer"
+            "auto output_count requires the changed prompt fanout to be reachable to every output; specify an explicit integer"
         )
-    batch_values = [
-        node.inputs.get("batch_size")
-        for node in source.normalized_graph.nodes
-        if "batch_size" in node.inputs
+    batches = [
+        (node.node_id, node.inputs["batch_size"])
+        for node in normalized.nodes
+        if node.node_id in reachable and "batch_size" in node.inputs
     ]
-    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in batch_values):
-        raise PlanningValidationError(
-            "auto output_count has malformed batch size; specify an explicit integer"
-        )
-    batch = batch_values[0] if len(batch_values) == 1 else 1
-    if batch != 1:
-        raise PlanningValidationError(
-            "auto output_count cannot prove independent batch fanout; specify an explicit integer"
-        )
-    return len(brief.fixtures.prompt_lines), output_node_ids, media_types
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for _, value in batches
+    ):
+        raise PlanningValidationError("auto output_count has malformed batch size; specify an explicit integer")
+    if len(batches) > 1:
+        raise PlanningValidationError("auto output_count has ambiguous multiple batch branches; specify an explicit integer")
+    batch = batches[0][1] if batches else 1
+    return len(brief.fixtures.prompt_lines) * batch * len(output_node_ids), output_node_ids, expected_media
 
 
 def _variant(
     *,
+    brief: ExperimentBrief,
     variant_id: str,
     source: PlanningSource,
     patch: SemanticPatch,
@@ -337,12 +457,18 @@ def _variant(
     output_node_ids: tuple[str, ...],
     expected_media_types: tuple[str, ...],
     prompt_lines: tuple[str, ...],
+    prompt_fanout_node_id: str,
 ) -> PlannedVariant:
     try:
         materialized = materialize_variant(thaw_json(source.raw_graph), patch)
     except (PatchValidationError, PatchTopologyError, ValidationError, ValueError) as error:
         raise PlanningValidationError(f"structural materialization failed: {error}") from error
     graph = thaw_json(materialized.graph)
+    expected_output_count, output_node_ids, expected_media_types = _output_details(
+        brief=brief,
+        graph=graph,
+        prompt_fanout_node_id=prompt_fanout_node_id,
+    )
     execution_parameters = {
         "prompt_lines": list(prompt_lines),
         "expected_output_count": expected_output_count,
@@ -356,6 +482,8 @@ def _variant(
             "prompt_lines": list(prompt_lines),
             "execution_parameters": execution_parameters,
             "expected_output_count": expected_output_count,
+            "output_node_ids": list(output_node_ids),
+            "expected_media_types": list(expected_media_types),
         }
     )
     warnings = list(item.message for item in materialized.validation.warnings)
@@ -391,25 +519,34 @@ def build_plan(
     """Build a pure plan; the only I/O is bounded fixture fingerprinting."""
     if not isinstance(brief, ExperimentBrief) or not isinstance(source_bundle, SourceBundle):
         raise TypeError("build_plan requires validated ExperimentBrief and SourceBundle")
-    source = min(
-        source_bundle.sources,
-        key=lambda item: (item.capability_hash, -item.engagement, item.workflow_id),
+    source = (
+        next(
+            item
+            for item in source_bundle.sources
+            if item.workflow_id == source_bundle.baseline_workflow_id
+        )
+        if source_bundle.baseline_workflow_id is not None
+        else min(
+            source_bundle.sources,
+            key=lambda item: (-item.engagement, item.capability_hash, item.source_hash, item.workflow_id),
+        )
     )
-    expected_count, output_node_ids, media_types = _output_details(brief, source)
-    common_patch = _common_fixture_patch(brief, source)
+    common_patch, prompt_fanout_node_id = _common_fixture_patch(brief, source)
     fixture_fingerprints = _fixture_fingerprints(brief, config)
     variants = [
         _variant(
+            brief=brief,
             variant_id="baseline",
             source=source,
             patch=common_patch,
             hypothesis=None,
             candidate=None,
             fixture_fingerprints=fixture_fingerprints,
-            expected_output_count=expected_count,
-            output_node_ids=output_node_ids,
-            expected_media_types=media_types,
+            expected_output_count=0,
+            output_node_ids=(),
+            expected_media_types=(),
             prompt_lines=brief.fixtures.prompt_lines,
+            prompt_fanout_node_id=prompt_fanout_node_id,
         )
     ]
     selection = select_candidates(brief, source_bundle.candidates)
@@ -422,18 +559,24 @@ def build_plan(
                 f"candidate {candidate.candidate_id} omitted: insufficient exact binding or donor evidence"
             )
             continue
+        reason = validate_candidate_patch(candidate, patch, source, brief)
+        if reason is not None:
+            warnings.append(f"candidate {candidate.candidate_id} omitted: {reason}")
+            continue
         variants.append(
             _variant(
+                brief=brief,
                 variant_id=candidate.candidate_id,
                 source=source,
                 patch=_combine_patches(common_patch, patch),
                 hypothesis=candidate.hypothesis,
                 candidate=candidate,
                 fixture_fingerprints=fixture_fingerprints,
-                expected_output_count=expected_count,
-                output_node_ids=output_node_ids,
-                expected_media_types=media_types,
+                expected_output_count=0,
+                output_node_ids=(),
+                expected_media_types=(),
                 prompt_lines=brief.fixtures.prompt_lines,
+                prompt_fanout_node_id=prompt_fanout_node_id,
             )
         )
         coverage.add(candidate.hypothesis)

@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from mp_comfyui_lab import __version__
 from mp_comfyui_lab.cli.output import emit_error, emit_success
 from mp_comfyui_lab.config import LabConfig, LabConfigError
-from mp_comfyui_lab.discovery.query import QueryExpansionConfigError
+from mp_comfyui_lab.discovery.query import QueryExpansionConfigError, expand_query
 from mp_comfyui_lab.discovery.ranking import RankedWorkflow, RankingConfigError
 from mp_comfyui_lab.discovery.service import (
     DiscoveryExecutionError,
@@ -20,16 +20,19 @@ from mp_comfyui_lab.discovery.service import (
     DiscoveryService,
     InspectResult,
 )
-from mp_comfyui_lab.discovery.urls import UnsupportedSourceError
-from mp_comfyui_lab.executors.base import Executor, ExecutorError
+from mp_comfyui_lab.discovery.urls import UnsupportedSourceError, parse_runninghub_url
+from mp_comfyui_lab.executors.base import Executor, ExecutorError, SearchRequest, WorkflowRef
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
 from mp_comfyui_lab.experiments.store import ExperimentStore
-from mp_comfyui_lab.experiments.models import ExperimentBrief, SourceBundle
+from mp_comfyui_lab.experiments.models import ExperimentBrief, PlanningSource, SourceBundle
 from mp_comfyui_lab.experiments.planning import (
     PlanningValidationError,
     build_plan,
+    evidence_graph_for_bundle,
     load_experiment_brief,
 )
+from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
+from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.security import (
     SafetyError,
     sanitize_for_persistence,
@@ -61,6 +64,72 @@ class PlanningBundleLoader(Protocol):
     """Read-only source discovery seam for the dry-run planning command."""
 
     def load_source_bundle(self, brief: ExperimentBrief) -> SourceBundle: ...
+
+
+class ReadOnlyPlanningBundleLoader:
+    """Public discovery adapter for `plan`; it cannot submit or poll work."""
+
+    def __init__(self, executor: Executor) -> None:
+        self._executor = executor
+
+    @staticmethod
+    def _engagement(candidate) -> int:
+        return sum(
+            value or 0
+            for value in candidate.engagement.model_dump(mode="json").values()
+        )
+
+    def _source_for_ref(self, ref: WorkflowRef) -> PlanningSource:
+        fetched = self._executor.fetch_workflow(ref)
+        # Inspection is intentional evidence collection, not provider validation.
+        self._executor.inspect_capabilities(fetched)
+        graph = fetched.graph
+        return PlanningSource(
+            workflow_id=fetched.detail.candidate.workflow_id,
+            canonical_url=fetched.detail.candidate.canonical_url,
+            raw_graph=graph,
+            normalized_graph=normalize_graph(graph),
+            source_hash=source_graph_hash(graph),
+            capability_hash=capability_hash(graph),
+            evidence_ids=(fetched.detail.candidate.workflow_id,),
+            engagement=self._engagement(fetched.detail.candidate),
+        )
+
+    def load_source_bundle(self, brief: ExperimentBrief) -> SourceBundle:
+        refs: dict[str, WorkflowRef] = {}
+        first_url_id: str | None = None
+        for url in brief.sources.urls:
+            parsed = parse_runninghub_url(url)
+            first_url_id = first_url_id or parsed.workflow_id
+            refs[parsed.workflow_id] = WorkflowRef(
+                executor=self._executor.name,
+                workflow_id=parsed.workflow_id,
+                canonical_url=parsed.canonical_url,
+            )
+        for query in brief.sources.queries:
+            for expanded in expand_query(query).queries:
+                page = self._executor.search(SearchRequest(query=expanded))
+                for candidate in page.records:
+                    if candidate.executor != self._executor.name:
+                        continue
+                    refs.setdefault(
+                        candidate.workflow_id,
+                        WorkflowRef(
+                            executor=candidate.executor,
+                            workflow_id=candidate.workflow_id,
+                            canonical_url=candidate.canonical_url,
+                        ),
+                    )
+        sources = tuple(
+            self._source_for_ref(ref)
+            for _, ref in sorted(refs.items())
+        )
+        if not sources:
+            raise PlanningValidationError("public discovery returned no workflows")
+        return SourceBundle(
+            sources=sources,
+            baseline_workflow_id=first_url_id,
+        )
 
 
 class StructuredArgumentParser(argparse.ArgumentParser):
@@ -217,28 +286,23 @@ def _plan_artifacts(
         "sources": [item.model_dump(mode="json") for item in source_bundle.sources],
         "candidates": [item.model_dump(mode="json") for item in source_bundle.candidates],
     }
-    selected_source = next(
-        item
-        for item in source_bundle.sources
-        if item.workflow_id == plan.variants[0].source_workflow_id
-        and item.source_hash == plan.variants[0].source_hash
-    )
+    evidence_graph = evidence_graph_for_bundle(source_bundle)
+    paths = [
+        "brief.yaml",
+        "sources/search-results.json",
+        "evidence/graph.json",
+        *(f"variants/{variant.variant_id}.json" for variant in plan.variants),
+        f"plans/{plan.plan_hash}.json",
+    ]
+    if len(paths) != len(set(paths)):
+        raise PlanningValidationError("planned artifact paths must be unique")
     written = [
         store.write_text(experiment_id, "brief.yaml", brief_document),
-        store.write_json(experiment_id, "sources/source-bundle.json", snapshots),
+        store.write_json(experiment_id, "sources/search-results.json", snapshots),
         store.write_json(
             experiment_id,
             "evidence/graph.json",
-            {
-                "workflow_id": selected_source.workflow_id,
-                "canonical_url": selected_source.canonical_url,
-                "source_hash": selected_source.source_hash,
-                "capability_hash": selected_source.capability_hash,
-                "raw_graph": selected_source.model_dump(mode="json")["raw_graph"],
-                "normalized_graph": selected_source.normalized_graph.model_dump(
-                    mode="json"
-                ),
-            },
+            evidence_graph.model_dump(mode="json"),
         ),
     ]
     for variant in plan.variants:
@@ -289,11 +353,10 @@ def main(
             root = Path.cwd() if cwd is None else Path(cwd)
             config = LabConfig.load(root)
             brief = load_experiment_brief(parsed.manifest)
-            if planning_loader is None:
-                raise PlanningValidationError(
-                    "plan requires a read-only planning source-bundle loader"
-                )
-            source_bundle = planning_loader.load_source_bundle(brief)
+            loader = planning_loader or ReadOnlyPlanningBundleLoader(
+                executor if executor is not None else RunningHubExecutor()
+            )
+            source_bundle = loader.load_source_bundle(brief)
             if not isinstance(source_bundle, SourceBundle):
                 raise PlanningValidationError(
                     "planning source-bundle loader returned an invalid bundle"
