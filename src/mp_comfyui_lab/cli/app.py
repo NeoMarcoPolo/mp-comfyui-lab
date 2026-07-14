@@ -2,9 +2,11 @@ import argparse
 import yaml
 from pathlib import Path
 import sys
+import time
 from enum import IntEnum
-from typing import NoReturn, Protocol, Sequence
+from typing import Any, NoReturn, Protocol, Sequence
 
+from mp_runninghub_api.download import download_file
 from pydantic import ValidationError
 
 from mp_comfyui_lab import __version__
@@ -26,7 +28,16 @@ from mp_comfyui_lab.evidence.models import CurrentEvidenceInput
 from mp_comfyui_lab.executors.base import Executor, ExecutorError, SearchRequest, WorkflowRef
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
 from mp_comfyui_lab.experiments.store import ExperimentStore
-from mp_comfyui_lab.experiments.models import Candidate, DimensionName, ExperimentBrief, PlanningSource, SourceBundle
+from mp_comfyui_lab.experiments.engine import ApprovalError, ExperimentEngine
+from mp_comfyui_lab.experiments.models import (
+    Candidate,
+    DimensionName,
+    ExperimentBrief,
+    PlanningSource,
+    RunRecord,
+    RunState,
+    SourceBundle,
+)
 from mp_comfyui_lab.experiments.planning import (
     PlanningValidationError,
     build_plan,
@@ -243,6 +254,43 @@ def _build_parser() -> StructuredArgumentParser:
 
     plan = subparsers.add_parser("plan", usage="%(prog)s MANIFEST")
     plan.add_argument("manifest", metavar="MANIFEST")
+
+    run = subparsers.add_parser(
+        "run",
+        usage=(
+            "%(prog)s EXPERIMENT_ID VARIANT_ID "
+            "--approve-plan-hash HASH"
+        ),
+    )
+    run.add_argument("experiment_id", metavar="EXPERIMENT_ID")
+    run.add_argument("variant_id", metavar="VARIANT_ID")
+    run.add_argument(
+        "--approve-plan-hash",
+        metavar="HASH",
+        required=True,
+    )
+
+    resume = subparsers.add_parser(
+        "resume",
+        usage="%(prog)s EXPERIMENT_ID RUN_ID",
+    )
+    resume.add_argument("experiment_id", metavar="EXPERIMENT_ID")
+    resume.add_argument("run_id", metavar="RUN_ID")
+
+    status = subparsers.add_parser(
+        "status",
+        usage="%(prog)s EXPERIMENT_ID RUN_ID",
+    )
+    status.add_argument("experiment_id", metavar="EXPERIMENT_ID")
+    status.add_argument("run_id", metavar="RUN_ID")
+
+    reconcile = subparsers.add_parser(
+        "reconcile",
+        usage="%(prog)s EXPERIMENT_ID RUN_ID --task-id ID",
+    )
+    reconcile.add_argument("experiment_id", metavar="EXPERIMENT_ID")
+    reconcile.add_argument("run_id", metavar="RUN_ID")
+    reconcile.add_argument("--task-id", metavar="ID", required=True)
     return parser
 
 
@@ -284,6 +332,49 @@ def _make_service(
         config=config,
         store=ExperimentStore(config.experiments_root),
     )
+
+
+def _make_experiment_engine(
+    repository_root: Path,
+    *,
+    executor: Executor | None = None,
+) -> ExperimentEngine:
+    config = LabConfig.load(repository_root)
+    return ExperimentEngine(
+        config=config,
+        executor_factory=(
+            (lambda: executor)
+            if executor is not None
+            else (lambda: RunningHubExecutor())
+        ),
+        downloader=download_file,
+        sleep=time.sleep,
+    )
+
+
+def _run_payload(record: RunRecord) -> dict[str, Any]:
+    return {
+        "experiment_id": record.experiment_id,
+        "run_id": record.run_id,
+        "variant_id": record.variant_id,
+        "state": record.state.value,
+        "provider_task_id": record.provider_task_id,
+        "expected_output_count": record.expected_output_count,
+        "actual_output_count": record.actual_output_count,
+        "error": (
+            thaw_json(record.error) if record.error is not None else None
+        ),
+        "diagnostics": [thaw_json(item) for item in record.diagnostics],
+        "outputs": [item.model_dump(mode="json") for item in record.outputs],
+    }
+
+
+def _execution_exit(record: RunRecord) -> ExitCode:
+    if record.state is RunState.SUCCESS:
+        return ExitCode.OK
+    if record.state in {RunState.FAILED, RunState.CANCELLED}:
+        return ExitCode.EXECUTION
+    return ExitCode.INCOMPLETE
 
 
 def _ranked_payload(item: RankedWorkflow) -> dict[str, object]:
@@ -423,6 +514,7 @@ def main(
     service: DiscoveryService | None = None,
     planning_loader: PlanningBundleLoader | None = None,
     executor: Executor | None = None,
+    experiment_engine: ExperimentEngine | None = None,
     cwd: str | Path | None = None,
 ) -> ExitCode:
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -440,6 +532,63 @@ def main(
     if parsed.command == "version":
         emit_success("version", {"version": __version__})
         return ExitCode.OK
+
+    if parsed.command in {"run", "resume", "status", "reconcile"}:
+        try:
+            root = Path.cwd() if cwd is None else Path(cwd)
+            engine = experiment_engine or _make_experiment_engine(
+                root,
+                executor=executor,
+            )
+            if parsed.command == "run":
+                record = engine.run(
+                    parsed.experiment_id,
+                    parsed.variant_id,
+                    approved_plan_hash=parsed.approve_plan_hash,
+                )
+            elif parsed.command == "resume":
+                record = engine.resume(parsed.experiment_id, parsed.run_id)
+            elif parsed.command == "reconcile":
+                record = engine.reconcile(
+                    parsed.experiment_id,
+                    parsed.run_id,
+                    parsed.task_id,
+                )
+            else:
+                record = engine.status(parsed.experiment_id, parsed.run_id)
+            artifacts = [
+                {
+                    "kind": "run",
+                    "path": f"runs/{record.run_id}.json",
+                }
+            ]
+            emit_success(parsed.command, _run_payload(record), artifacts)
+            return (
+                ExitCode.OK
+                if parsed.command == "status"
+                else _execution_exit(record)
+            )
+        except ApprovalError as error:
+            emit_error(
+                parsed.command,
+                "approval",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.APPROVAL
+        except SafetyError as error:
+            emit_error(
+                parsed.command,
+                "safety",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.SAFETY
+        except Exception as error:
+            emit_error(
+                parsed.command,
+                "execution",
+                sanitize_untrusted_diagnostic(str(error)),
+            )
+            return ExitCode.EXECUTION
 
     if parsed.command == "plan":
         try:

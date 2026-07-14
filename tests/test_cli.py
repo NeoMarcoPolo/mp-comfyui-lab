@@ -39,8 +39,15 @@ from mp_comfyui_lab.evidence.models import (
     EvidenceSourceKind,
 )
 from mp_comfyui_lab.evidence.build import build_evidence_graph
-from mp_comfyui_lab.experiments.models import ExperimentPlan, PlanningSource, SourceBundle
+from mp_comfyui_lab.experiments.models import (
+    ExperimentPlan,
+    PlanningSource,
+    RunRecord,
+    RunState,
+    SourceBundle,
+)
 from mp_comfyui_lab.experiments.planning import recompute_exact_run_hash
+from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.security import sanitize_for_persistence
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
@@ -105,8 +112,162 @@ def test_unknown_command_preserves_argparse_diagnostic(capsys):
     assert result == ExitCode.USAGE
     assert document["error"]["message"] == (
         "argument command: invalid choice: 'unknown' "
-        "(choose from version, search, inspect, similar, plan)"
+        "(choose from version, search, inspect, similar, plan, run, resume, "
+        "status, reconcile)"
     )
+
+
+class FakeExperimentEngine:
+    def __init__(self, record: RunRecord) -> None:
+        self.record = record
+        self.calls: list[tuple] = []
+
+    def run(self, experiment_id, variant_id, *, approved_plan_hash):
+        self.calls.append(
+            ("run", experiment_id, variant_id, approved_plan_hash)
+        )
+        return self.record
+
+    def resume(self, experiment_id, run_id):
+        self.calls.append(("resume", experiment_id, run_id))
+        return self.record
+
+    def status(self, experiment_id, run_id):
+        self.calls.append(("status", experiment_id, run_id))
+        return self.record
+
+    def reconcile(self, experiment_id, run_id, task_id):
+        self.calls.append(("reconcile", experiment_id, run_id, task_id))
+        return self.record
+
+
+def test_run_cli_requires_and_passes_exact_plan_approval(capsys):
+    record = RunRecord(
+        run_id="run-cli",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.SUCCESS,
+        provider_task_id="provider-task-1",
+        expected_output_count=1,
+        actual_output_count=1,
+    )
+    engine = FakeExperimentEngine(record)
+
+    code = main(
+        [
+            "run",
+            "plan-approved",
+            "baseline",
+            "--approve-plan-hash",
+            "a" * 64,
+        ],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.OK
+    assert engine.calls == [
+        ("run", "plan-approved", "baseline", "a" * 64)
+    ]
+    assert payload["command"] == "run"
+    assert payload["data"]["run_id"] == "run-cli"
+    assert payload["data"]["state"] == "SUCCESS"
+    assert payload["data"]["provider_task_id"] == "provider-task-1"
+
+
+def test_run_cli_rejects_missing_explicit_approval_hash(capsys):
+    code = main(["run", "plan-approved", "baseline"])
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.USAGE
+    assert payload["command"] == "run"
+    assert payload["error"]["kind"] == "usage"
+    assert "--approve-plan-hash" in payload["error"]["message"]
+
+
+def test_status_cli_is_store_only_without_runninghub_construction(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    store = ExperimentStore(tmp_path / "experiments")
+    store.create("plan-approved")
+    record = RunRecord(
+        run_id="run-status",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.RUNNING,
+        provider_task_id="provider-task-1",
+        expected_output_count=2,
+        actual_output_count=1,
+        error={"kind": "prior_error"},
+    )
+    store.write_json_new(
+        "plan-approved",
+        "runs/run-status.json",
+        record.model_dump(mode="json"),
+    )
+
+    def forbidden_executor():
+        raise AssertionError("status constructed RunningHubExecutor")
+
+    monkeypatch.setattr(app, "RunningHubExecutor", forbidden_executor)
+
+    code = main(
+        ["status", "plan-approved", "run-status"],
+        cwd=tmp_path,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.OK
+    assert payload["data"]["state"] == "RUNNING"
+    assert payload["data"]["expected_output_count"] == 2
+    assert payload["data"]["actual_output_count"] == 1
+    assert payload["data"]["error"] == {"kind": "prior_error"}
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_code"),
+    [
+        (RunState.INCOMPLETE, ExitCode.INCOMPLETE),
+        (RunState.FAILED, ExitCode.EXECUTION),
+        (RunState.CANCELLED, ExitCode.EXECUTION),
+    ],
+)
+def test_execution_cli_maps_durable_state_to_exit_code(
+    state,
+    expected_code,
+    capsys,
+):
+    record = RunRecord(
+        run_id="run-cli-state",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=state,
+        provider_task_id=(
+            "provider-task-1"
+            if state in {RunState.CANCELLED}
+            else None
+        ),
+        expected_output_count=1,
+        error={"kind": "state_result"},
+    )
+    engine = FakeExperimentEngine(record)
+
+    code = main(
+        [
+            "run",
+            "plan-approved",
+            "baseline",
+            "--approve-plan-hash",
+            "a" * 64,
+        ],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == expected_code
+    assert payload["data"]["state"] == state.value
 
 
 def test_root_unknown_option_does_not_become_command(capsys):

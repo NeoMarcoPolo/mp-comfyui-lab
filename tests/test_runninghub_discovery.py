@@ -24,7 +24,6 @@ from mp_comfyui_lab.executors.base import (
     ProviderResponseError,
     ProviderSchemaError,
     SearchRequest,
-    UnsupportedCapabilityError,
     WorkflowRef,
 )
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
@@ -1282,23 +1281,15 @@ def test_graph_fetch_errors_do_not_expose_provider_credentials() -> None:
     assert "session-secret" not in message
 
 
-def test_runninghub_executor_is_instantiable_and_paid_methods_are_structured() -> None:
+def test_runninghub_executor_is_instantiable_and_cancel_is_structured() -> None:
     executor = _executor()
-    message = "runninghub paid execution is not enabled"
 
     assert isinstance(executor, Executor)
     assert executor.name == "runninghub"
 
-    with pytest.raises(UnsupportedCapabilityError, match=message):
-        executor.validate_variant(object(), object())
-    with pytest.raises(UnsupportedCapabilityError, match=message):
-        executor.submit(object(), object())
-    with pytest.raises(UnsupportedCapabilityError, match=message):
-        executor.poll("task-1")
-    with pytest.raises(UnsupportedCapabilityError, match=message):
-        executor.collect_outputs("task-1")
-
     cancelled = executor.cancel("task-1")
     assert cancelled.supported is False
     assert cancelled.cancelled is False
-    assert cancelled.diagnostic == message
+    assert cancelled.diagnostic == (
+        "RunningHub API does not expose a supported cancellation operation"
+    )

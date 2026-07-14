@@ -148,6 +148,10 @@ class ExecutorError(RuntimeError):
     pass
 
 
+class TransientExecutorError(ExecutorError):
+    pass
+
+
 class ProviderSchemaError(ExecutorError):
     pass
 

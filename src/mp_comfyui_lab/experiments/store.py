@@ -209,6 +209,26 @@ class ExperimentStore:
     ) -> Iterator[dict[str, Any]]:
         return iter(self.read_jsonl(experiment_id, relative_path))
 
+    @contextmanager
+    def run_lock(self, experiment_id: str, run_id: str) -> Iterator[None]:
+        """Serialize all stateful work for one durable run across processes."""
+        try:
+            safe_filename(run_id)
+        except SafetyError as error:
+            raise SafetyError("invalid run ID for locking") from error
+        lock_path = self._artifact_path(
+            experiment_id,
+            f"runs/{run_id}.lock",
+        )
+        process_lock = self._process_jsonl_lock(lock_path)
+        with process_lock:
+            lock_path = self._artifact_path(
+                experiment_id,
+                f"runs/{run_id}.lock",
+            )
+            with self._os_advisory_lock(lock_path):
+                yield
+
     @classmethod
     def _repair_jsonl_tail(cls, descriptor: int) -> None:
         """Keep the durable prefix; a crash may lose only its in-flight record."""
@@ -435,9 +455,27 @@ class ExperimentStore:
         self._atomic_write_new(destination, value)
         return destination
 
+    def write_bytes_new(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+        value: bytes,
+    ) -> Path:
+        destination = self._artifact_path(experiment_id, relative_path)
+        self._atomic_write_bytes_new(destination, value)
+        return destination
+
     def read_json(self, experiment_id: str, relative_path: str | Path) -> Any:
         source = self._artifact_path(experiment_id, relative_path)
         return json.loads(source.read_text(encoding="utf-8"))
+
+    def read_text(self, experiment_id: str, relative_path: str | Path) -> str:
+        source = self._artifact_path(experiment_id, relative_path)
+        return source.read_text(encoding="utf-8")
+
+    def read_bytes(self, experiment_id: str, relative_path: str | Path) -> bytes:
+        source = self._artifact_path(experiment_id, relative_path)
+        return source.read_bytes()
 
     @staticmethod
     def _validate_experiment_id(experiment_id: str) -> None:
@@ -561,6 +599,43 @@ class ExperimentStore:
                 raise SafetyError("safe no-clobber artifact publish is unavailable") from error
             if os.name != "nt":
                 directory_fd = os.open(destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    @staticmethod
+    def _atomic_write_bytes_new(destination: Path, value: bytes) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            file_descriptor, temporary_name = tempfile.mkstemp(
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(file_descriptor, "wb") as temporary_file:
+                temporary_file.write(value)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            try:
+                os.link(temporary_path, destination)
+            except FileExistsError as error:
+                raise SafetyError("artifact already exists; refusing to overwrite") from error
+            except (AttributeError, NotImplementedError, OSError) as error:
+                raise SafetyError("safe no-clobber artifact publish is unavailable") from error
+            if os.name != "nt":
+                directory_fd = os.open(
+                    destination.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
                 try:
                     os.fsync(directory_fd)
                 finally:

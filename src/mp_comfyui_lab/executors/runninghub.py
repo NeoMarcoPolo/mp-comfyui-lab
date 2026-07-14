@@ -1,16 +1,26 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from ipaddress import ip_address
 import json
+from pathlib import Path
 import re
 from typing import Annotated, Any, NoReturn, TypeVar
 import unicodedata
 from urllib.parse import urlsplit
 
-from mp_runninghub_api.runninghub import get_workflow_json
+from mp_runninghub_api.config import load_default_config
+from mp_runninghub_api.runninghub import (
+    create_task,
+    get_task_info,
+    get_task_outputs,
+    get_task_status,
+    get_workflow_json,
+)
+from mp_runninghub_api.types import NodeInfo
+from mp_runninghub_api.upload import upload_file
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 import requests
 
@@ -26,6 +36,7 @@ from mp_comfyui_lab.discovery.urls import (
     parse_runninghub_url,
 )
 from mp_comfyui_lab.executors.base import (
+    AmbiguousSubmissionError,
     CancelResult,
     CapabilityReport,
     Executor,
@@ -35,15 +46,23 @@ from mp_comfyui_lab.executors.base import (
     ProviderOutput,
     ProviderResponseError,
     ProviderSchemaError,
+    ProviderTaskState,
     SearchPage,
     SearchRequest,
     SubmissionReceipt,
-    UnsupportedCapabilityError,
+    TransientExecutorError,
+    ValidationIssue,
     ValidationReport,
     WorkflowRef,
 )
 from mp_comfyui_lab.experiments.models import MaterializedVariant, ResolvedFixtures
-from mp_comfyui_lab.security import sanitize_embedded_urls, sanitize_for_persistence
+from mp_comfyui_lab.json_types import thaw_json
+from mp_comfyui_lab.security import SafetyError, safe_filename
+from mp_comfyui_lab.security import (
+    sanitize_embedded_urls,
+    sanitize_for_persistence,
+    sanitize_untrusted_diagnostic,
+)
 
 
 BASE_URL = "https://www.runninghub.ai"
@@ -51,7 +70,6 @@ SEARCH_ENDPOINT = "/api/search/workflow"
 DETAIL_ENDPOINT = "/api/portal/workflow/detail"
 GRAPH_ENDPOINT = "/api/openapi/getJsonApiFormat"
 PUBLIC_REQUEST_TIMEOUT = (10, 60)
-PAID_EXECUTION_DISABLED = "runninghub paid execution is not enabled"
 PROVIDER_NUMERIC_STRING_MAX_LENGTH = 64
 MAX_GRAPH_DEPTH = 256
 MAX_GRAPH_NODES = 100_000
@@ -77,6 +95,49 @@ LORA_INVENTORY_TOKEN = re.compile(
 
 
 GraphFetcher = Callable[[str | None, str], Any]
+CredentialLoader = Callable[[], Any]
+UploadCall = Callable[..., str]
+CreateTaskCall = Callable[..., Any]
+StatusCall = Callable[..., Any]
+InfoCall = Callable[..., Any]
+OutputsCall = Callable[..., Any]
+
+_UPLOAD_MEDIA_TYPES = {
+    "image/png": "image",
+    "image/jpeg": "image",
+    "image/webp": "image",
+    "image/gif": "image",
+    "video/mp4": "video",
+    "video/webm": "video",
+    "audio/mpeg": "audio",
+    "audio/wav": "audio",
+    "audio/ogg": "audio",
+    "application/zip": "zip",
+}
+_FIXTURE_PLACEHOLDER = re.compile(r"^fixture://([0-9]+)$")
+_PAID_PROVIDER_STATES = {
+    "SUBMITTED": "SUBMITTED",
+    "QUEUED": "QUEUED",
+    "RUNNING": "RUNNING",
+    "SUCCESS": "SUCCESS",
+    "FAILED": "FAILED",
+    "CANCELLED": "CANCELLED",
+    "CANCELED": "CANCELLED",
+}
+_OUTPUT_MEDIA_TYPES = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "gif": "image/gif",
+    "mp4": "video/mp4",
+    "webm": "video/webm",
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "ogg": "audio/ogg",
+    "zip": "application/zip",
+    **{media_type: media_type for media_type in _UPLOAD_MEDIA_TYPES},
+}
 
 
 def _provider_aware_timestamp(value: str) -> str:
@@ -926,11 +987,24 @@ class RunningHubExecutor(Executor):
         self,
         session: requests.Session | None = None,
         graph_fetcher: GraphFetcher | None = None,
+        *,
+        credential_loader: CredentialLoader = load_default_config,
+        upload_call: UploadCall = upload_file,
+        create_task_call: CreateTaskCall = create_task,
+        status_call: StatusCall = get_task_status,
+        info_call: InfoCall = get_task_info,
+        outputs_call: OutputsCall = get_task_outputs,
     ) -> None:
         self.session = requests.Session() if session is None else session
         self.graph_fetcher = (
             get_workflow_json if graph_fetcher is None else graph_fetcher
         )
+        self._credential_loader = credential_loader
+        self._upload_call = upload_call
+        self._create_task_call = create_task_call
+        self._status_call = status_call
+        self._info_call = info_call
+        self._outputs_call = outputs_call
 
     @property
     def name(self) -> str:
@@ -1195,29 +1269,282 @@ class RunningHubExecutor(Executor):
         variant: MaterializedVariant,
         fixtures: ResolvedFixtures,
     ) -> ValidationReport:
-        del variant, fixtures
-        raise UnsupportedCapabilityError(PAID_EXECUTION_DISABLED)
+        errors, _ = self._fixture_bindings(variant, fixtures)
+        return ValidationReport(errors=tuple(errors))
+
+    @staticmethod
+    def _fixture_bindings(
+        variant: MaterializedVariant,
+        fixtures: ResolvedFixtures,
+    ) -> tuple[list[ValidationIssue], dict[int, tuple[str, str]]]:
+        errors: list[ValidationIssue] = []
+        fixture_by_index = {item.binding_index: item for item in fixtures.items}
+        if len(fixture_by_index) != len(fixtures.items):
+            errors.append(
+                ValidationIssue(
+                    code="duplicate_fixture_binding",
+                    message="fixture binding indexes must be unique",
+                )
+            )
+
+        occurrences: dict[int, list[tuple[str, str]]] = {}
+        for node_id, node in variant.graph.items():
+            if not isinstance(node, Mapping):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, Mapping):
+                continue
+            for field_name, value in inputs.items():
+                if not isinstance(value, str) or not value.startswith("fixture://"):
+                    continue
+                match = _FIXTURE_PLACEHOLDER.fullmatch(value)
+                if match is None:
+                    errors.append(
+                        ValidationIssue(
+                            code="malformed_fixture_placeholder",
+                            message="fixture placeholders must use fixture://<binding-index>",
+                        )
+                    )
+                    continue
+                binding_index = int(match.group(1))
+                occurrences.setdefault(binding_index, []).append(
+                    (str(node_id), str(field_name))
+                )
+
+        for binding_index, fixture in fixture_by_index.items():
+            matches = occurrences.get(binding_index, [])
+            if len(matches) != 1:
+                errors.append(
+                    ValidationIssue(
+                        code="ambiguous_fixture_placeholder",
+                        message=(
+                            f"fixture binding {binding_index} must occur exactly once"
+                        ),
+                    )
+                )
+            if fixture.media_type not in _UPLOAD_MEDIA_TYPES:
+                errors.append(
+                    ValidationIssue(
+                        code="unsupported_fixture_media_type",
+                        message=f"fixture binding {binding_index} has unsupported media type",
+                    )
+                )
+            if not fixture.path.is_file():
+                errors.append(
+                    ValidationIssue(
+                        code="missing_fixture_file",
+                        message=f"fixture binding {binding_index} is not a regular file",
+                    )
+                )
+        for binding_index in occurrences.keys() - fixture_by_index.keys():
+            errors.append(
+                ValidationIssue(
+                    code="missing_fixture_binding",
+                    message=f"placeholder binding {binding_index} has no resolved fixture",
+                )
+            )
+        bindings = {
+            binding_index: matches[0]
+            for binding_index, matches in occurrences.items()
+            if binding_index in fixture_by_index and len(matches) == 1
+        }
+        return errors, bindings
 
     def submit(
         self,
         variant: MaterializedVariant,
         fixtures: ResolvedFixtures,
     ) -> SubmissionReceipt:
-        del variant, fixtures
-        raise UnsupportedCapabilityError(PAID_EXECUTION_DISABLED)
+        errors, bindings = self._fixture_bindings(variant, fixtures)
+        if errors:
+            raise ExecutorError("RunningHub variant validation failed before submit")
+        try:
+            config = self._credential_loader()
+        except Exception as error:
+            raise ExecutorError("RunningHub credentials could not be loaded") from error
+        api_key = getattr(config, "apiKey", None)
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ExecutorError("RunningHub credentials are missing an API key")
+
+        materialized_graph = thaw_json(variant.graph)
+        node_info_list: list[NodeInfo] = []
+        for fixture in fixtures.items:
+            node_id, field_name = bindings[fixture.binding_index]
+            file_type = _UPLOAD_MEDIA_TYPES[fixture.media_type]
+            try:
+                uploaded_name = self._upload_call(
+                    api_key=None,
+                    file_path=str(fixture.path),
+                    file_type=file_type,
+                )
+            except Exception as error:
+                raise ExecutorError("RunningHub fixture upload failed") from error
+            if not isinstance(uploaded_name, str):
+                raise ExecutorError("RunningHub upload returned an invalid filename")
+            uploaded_name = uploaded_name.strip()
+            try:
+                safe_filename(uploaded_name)
+            except SafetyError as error:
+                raise ExecutorError("RunningHub upload returned an unsafe filename") from error
+            materialized_graph[node_id]["inputs"][field_name] = uploaded_name
+            node_info_list.append(
+                NodeInfo(
+                    nodeId=node_id,
+                    fieldName=field_name,
+                    fieldValue=uploaded_name,
+                )
+            )
+
+        try:
+            result = self._create_task_call(
+                api_key=None,
+                workflow_id=variant.source_workflow_id,
+                node_info_list=node_info_list,
+                workflow=json.dumps(materialized_graph, ensure_ascii=False),
+                instance_type=variant.instance_type,
+            )
+        except Exception as error:
+            if self._ambiguous_request_error(error):
+                raise AmbiguousSubmissionError(
+                    "RunningHub submission outcome is ambiguous"
+                ) from error
+            raise ExecutorError("RunningHub submission was rejected") from error
+
+        task_id = getattr(result, "taskId", None)
+        if (
+            not isinstance(task_id, str)
+            or not task_id.strip()
+            or task_id.strip().casefold() == "none"
+        ):
+            raise ExecutorError("RunningHub submission returned no task ID")
+        task_status = getattr(result, "taskStatus", None)
+        provider_state = (
+            None
+            if task_status is None
+            else self._provider_task_state(task_status)
+        )
+        return SubmissionReceipt(
+            provider_task_id=task_id.strip(),
+            provider_state=provider_state,
+        )
+
+    @staticmethod
+    def _ambiguous_request_error(error: BaseException) -> bool:
+        current: BaseException | None = error
+        while current is not None:
+            if isinstance(current, requests.RequestException):
+                return current.response is None
+            current = current.__cause__
+        return False
+
+    @staticmethod
+    def _provider_task_state(value: Any) -> ProviderTaskState:
+        if not isinstance(value, str) or not value.strip():
+            raise ExecutorError("RunningHub returned a malformed task status")
+        normalized = _PAID_PROVIDER_STATES.get(value.strip().upper())
+        if normalized is None:
+            return ProviderTaskState.UNKNOWN
+        return ProviderTaskState(normalized)
 
     def poll(self, provider_task_id: str) -> PollResult:
-        del provider_task_id
-        raise UnsupportedCapabilityError(PAID_EXECUTION_DISABLED)
+        if not isinstance(provider_task_id, str) or not provider_task_id.strip():
+            raise ExecutorError("RunningHub poll requires a nonblank task ID")
+        task_id = provider_task_id.strip()
+        try:
+            config = self._credential_loader()
+        except Exception as error:
+            raise ExecutorError("RunningHub credentials could not be loaded") from error
+        api_key = getattr(config, "apiKey", None)
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ExecutorError("RunningHub credentials are missing an API key")
+        try:
+            raw_status = self._status_call(api_key=None, task_id=task_id)
+            info = self._info_call(api_key=None, task_id=task_id)
+        except Exception as error:
+            raise TransientExecutorError("RunningHub poll request failed") from error
+        if not isinstance(info, dict):
+            raise ProviderSchemaError("RunningHub task info must be an object")
+        observed_task_id = info.get("taskId")
+        if observed_task_id is not None and observed_task_id != task_id:
+            raise ProviderSchemaError("RunningHub task info returned a different task ID")
+        state = self._provider_task_state(raw_status)
+        metadata = sanitize_for_persistence(info)
+        diagnostic = sanitize_untrusted_diagnostic(
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+        )
+        return PollResult(
+            provider_task_id=task_id,
+            state=state,
+            diagnostic=diagnostic,
+            provider_metadata=metadata,
+        )
 
     def collect_outputs(self, provider_task_id: str) -> tuple[ProviderOutput, ...]:
-        del provider_task_id
-        raise UnsupportedCapabilityError(PAID_EXECUTION_DISABLED)
+        if not isinstance(provider_task_id, str) or not provider_task_id.strip():
+            raise ExecutorError("RunningHub output collection requires a task ID")
+        task_id = provider_task_id.strip()
+        try:
+            config = self._credential_loader()
+        except Exception as error:
+            raise ExecutorError("RunningHub credentials could not be loaded") from error
+        api_key = getattr(config, "apiKey", None)
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ExecutorError("RunningHub credentials are missing an API key")
+        try:
+            raw_outputs = self._outputs_call(api_key=None, task_id=task_id)
+        except Exception as error:
+            raise TransientExecutorError(
+                "RunningHub output collection failed"
+            ) from error
+        if not isinstance(raw_outputs, (list, tuple)):
+            raise ProviderSchemaError("RunningHub outputs must be an ordered array")
+
+        outputs: list[ProviderOutput] = []
+        for provider_order, item in enumerate(raw_outputs):
+            url = getattr(item, "fileUrl", None)
+            node_id = getattr(item, "nodeId", None)
+            file_type = getattr(item, "fileType", None)
+            if not isinstance(url, str):
+                raise ProviderSchemaError("RunningHub output URL must be a string")
+            try:
+                _provider_http_url(url)
+            except ValueError as error:
+                raise ProviderSchemaError("RunningHub output URL is invalid") from error
+            if not isinstance(node_id, str) or not node_id.strip():
+                raise ProviderSchemaError("RunningHub output node ID is missing")
+            if not isinstance(file_type, str):
+                raise ProviderSchemaError("RunningHub output media type is missing")
+            media_type = _OUTPUT_MEDIA_TYPES.get(file_type.strip().casefold())
+            if media_type is None:
+                raise ProviderSchemaError("RunningHub output media type is unknown")
+            file_name = Path(urlsplit(url).path).name
+            try:
+                safe_filename(file_name)
+            except SafetyError as error:
+                raise ProviderSchemaError("RunningHub output filename is unsafe") from error
+            outputs.append(
+                ProviderOutput(
+                    node_id=node_id.strip(),
+                    url=url,
+                    media_type=media_type,
+                    file_name=file_name,
+                    provider_order=provider_order,
+                    provider_metadata=sanitize_for_persistence(
+                        {
+                            "task_cost_time": getattr(item, "taskCostTime", None),
+                            "consume_coins": getattr(item, "consumeCoins", None),
+                        }
+                    ),
+                )
+            )
+        return tuple(outputs)
 
     def cancel(self, provider_task_id: str) -> CancelResult:
         del provider_task_id
         return CancelResult(
             supported=False,
             cancelled=False,
-            diagnostic=PAID_EXECUTION_DISABLED,
+            diagnostic=(
+                "RunningHub API does not expose a supported cancellation operation"
+            ),
         )

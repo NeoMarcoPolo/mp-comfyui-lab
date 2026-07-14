@@ -95,7 +95,11 @@ _IMMUTABLE_TRANSITION_FIELDS = (
     "run_id",
     "experiment_id",
     "variant_id",
+    "plan_hash",
+    "exact_run_hash",
     "expected_output_count",
+    "expected_output_node_ids",
+    "expected_media_types",
     "created_at",
 )
 
@@ -139,6 +143,7 @@ class MaterializedVariant(_FrozenModel):
     instance_type: str | None = None
     expected_output_count: int = Field(gt=0)
     expected_output_node_ids: tuple[str, ...] = ()
+    expected_media_types: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
 
     @field_validator("graph")
@@ -151,20 +156,55 @@ class MaterializedVariant(_FrozenModel):
         return graph
 
 
+class OutputRecord(_FrozenModel):
+    ordinal: int = Field(ge=0)
+    provider_order: int = Field(ge=0)
+    node_id: NonBlankStr
+    media_type: NonBlankStr
+    local_relative_path: NonBlankStr
+    content_sha256: Sha256
+    size: int = Field(ge=0)
+
+    @field_validator("local_relative_path")
+    @classmethod
+    def require_safe_relative_output_path(cls, value: str) -> str:
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("local_relative_path must be a safe relative path")
+        return path.as_posix()
+
+
 class RunRecord(_FrozenModel):
     run_id: NonBlankStr
     experiment_id: NonBlankStr
     variant_id: NonBlankStr
     state: RunState
+    plan_hash: Sha256 | None = None
+    exact_run_hash: Sha256 | None = None
     provider_task_id: NonBlankStr | None = None
     expected_output_count: int = Field(gt=0)
+    expected_output_node_ids: tuple[str, ...] = ()
+    expected_media_types: tuple[str, ...] = ()
     actual_output_count: int = Field(default=0, ge=0)
+    outputs: tuple[OutputRecord, ...] = ()
     error: SanitizedJsonObject | None = None
+    diagnostics: tuple[SanitizedJsonObject, ...] = ()
     created_at: UtcDatetime | None = None
     submitted_at: UtcDatetime | None = None
     started_at: UtcDatetime | None = None
     completed_at: UtcDatetime | None = None
     updated_at: UtcDatetime | None = None
+
+    @field_validator(
+        "expected_output_node_ids",
+        "expected_media_types",
+        "outputs",
+        "diagnostics",
+        mode="before",
+    )
+    @classmethod
+    def run_json_arrays(cls, value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
 
     @model_validator(mode="after")
     def validate_provider_task_id(self) -> RunRecord:
