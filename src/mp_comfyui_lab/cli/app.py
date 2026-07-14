@@ -7,7 +7,9 @@ from enum import IntEnum
 from typing import Any, NoReturn, Protocol, Sequence
 
 from mp_runninghub_api.download import download_file
+from mp_runninghub_api.errors import RunningHubApiError
 from pydantic import ValidationError
+import requests
 
 from mp_comfyui_lab import __version__
 from mp_comfyui_lab.cli.output import emit_error, emit_success
@@ -25,7 +27,13 @@ from mp_comfyui_lab.discovery.service import (
 from mp_comfyui_lab.discovery.urls import UnsupportedSourceError, parse_runninghub_url
 from mp_comfyui_lab.evidence.build import build_evidence_graph
 from mp_comfyui_lab.evidence.models import CurrentEvidenceInput
-from mp_comfyui_lab.executors.base import Executor, ExecutorError, SearchRequest, WorkflowRef
+from mp_comfyui_lab.executors.base import (
+    Executor,
+    ExecutorError,
+    SearchRequest,
+    TransientOperationError,
+    WorkflowRef,
+)
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
 from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.experiments.engine import ApprovalError, ExperimentEngine
@@ -347,9 +355,23 @@ def _make_experiment_engine(
             if executor is not None
             else (lambda: RunningHubExecutor())
         ),
-        downloader=download_file,
+        downloader=_download_runninghub_output,
         sleep=time.sleep,
     )
+
+
+def _download_runninghub_output(url: str, target: Path) -> Path:
+    try:
+        return download_file(url, target)
+    except (
+        RunningHubApiError,
+        requests.RequestException,
+        TimeoutError,
+        ConnectionError,
+    ) as error:
+        raise TransientOperationError(
+            "RunningHub output download transport failed"
+        ) from error
 
 
 def _run_payload(record: RunRecord) -> dict[str, Any]:

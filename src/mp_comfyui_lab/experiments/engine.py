@@ -20,6 +20,7 @@ from mp_comfyui_lab.executors.base import (
     ExecutorError,
     ProviderTaskState,
     TransientExecutorError,
+    TransientOperationError,
 )
 from mp_comfyui_lab.json_types import thaw_json
 from mp_comfyui_lab.security import SafetyError
@@ -102,7 +103,6 @@ class ExperimentEngine:
             variant_id,
             approved_plan_hash,
         )
-        fixtures = self._resolve_fixtures(variant)
         materialized = MaterializedVariant(
             variant_id=variant.variant_id,
             source_workflow_id=variant.source_workflow_id,
@@ -132,12 +132,17 @@ class ExperimentEngine:
             created_at=created_at,
             updated_at=created_at,
         )
-        self._store.write_json_new(
-            experiment_id,
-            self._run_path(run_id),
-            record.model_dump(mode="json"),
-        )
         with self._store.run_lock(experiment_id, run_id):
+            fixtures = self._snapshot_fixtures(
+                experiment_id,
+                run_id,
+                variant,
+            )
+            self._store.write_json_new(
+                experiment_id,
+                self._run_path(run_id),
+                record.model_dump(mode="json"),
+            )
             executor = self._executor_factory()
             try:
                 validation = executor.validate_variant(materialized, fixtures)
@@ -172,6 +177,12 @@ class ExperimentEngine:
                     updated_at=failed_at,
                 )
                 return self._persist(record)
+            intent_at = self._now()
+            intent_values = record.model_dump(mode="python")
+            intent_values["submission_intent_at"] = intent_at
+            intent_values["updated_at"] = intent_at
+            record = RunRecord.model_validate(intent_values)
+            self._persist(record)
             try:
                 receipt = executor.submit(materialized, fixtures)
             except AmbiguousSubmissionError as error:
@@ -220,7 +231,7 @@ class ExperimentEngine:
             RunState.INCOMPLETE,
         }:
             return record
-        if record.provider_task_id is None:
+        if record.state is not RunState.PLANNED and record.provider_task_id is None:
             raise SafetyError("resumable run has no durable provider task ID")
         with self._store.run_lock(experiment_id, run_id):
             record = self._load_run(experiment_id, run_id)
@@ -231,6 +242,22 @@ class ExperimentEngine:
                 RunState.INCOMPLETE,
             }:
                 return record
+            if record.state is RunState.PLANNED:
+                ambiguous_at = self._now()
+                record = record.transition(
+                    RunState.INCOMPLETE,
+                    error=sanitize_for_persistence(
+                        {
+                            "kind": "ambiguous_submission",
+                            "diagnostic": (
+                                "planned run has no durable provider task ID; "
+                                "submission cannot be proven absent"
+                            ),
+                        }
+                    ),
+                    updated_at=ambiguous_at,
+                )
+                return self._persist(record)
             if record.provider_task_id is None:
                 raise SafetyError("resumable run has no durable provider task ID")
             return self._poll_current(record, self._executor_factory())
@@ -315,7 +342,12 @@ class ExperimentEngine:
             raise ApprovalError("selected variant exact run hash does not match")
         return plan, selected_variant
 
-    def _resolve_fixtures(self, variant: PlannedVariant) -> ResolvedFixtures:
+    def _snapshot_fixtures(
+        self,
+        experiment_id: str,
+        run_id: str,
+        variant: PlannedVariant,
+    ) -> ResolvedFixtures:
         indexes = [item.binding_index for item in variant.fixture_fingerprints]
         if len(indexes) != len(set(indexes)):
             raise FixtureIntegrityError("approved fixture bindings are duplicated")
@@ -323,9 +355,9 @@ class ExperimentEngine:
         resolved: list[ResolvedFixture] = []
         for fingerprint in variant.fixture_fingerprints:
             try:
-                path = self._config.resolve_fixture(fingerprint.uri)
+                source_path = self._config.resolve_fixture(fingerprint.uri)
                 descriptor = os.open(
-                    path,
+                    source_path,
                     os.O_RDONLY
                     | getattr(os, "O_BINARY", 0)
                     | getattr(os, "O_NOFOLLOW", 0),
@@ -337,12 +369,12 @@ class ExperimentEngine:
                 if not stat.S_ISREG(before.st_mode):
                     raise FixtureIntegrityError("approved fixture is not a regular file")
                 digest = hashlib.sha256()
-                size = 0
+                chunks: list[bytes] = []
                 while True:
                     chunk = os.read(descriptor, 65_536)
                     if not chunk:
                         break
-                    size += len(chunk)
+                    chunks.append(chunk)
                     digest.update(chunk)
                 after = os.fstat(descriptor)
             finally:
@@ -361,12 +393,36 @@ class ExperimentEngine:
             )
             if stable_before != stable_after:
                 raise FixtureIntegrityError("approved fixture changed during validation")
-            if size != fingerprint.size or digest.hexdigest() != fingerprint.sha256:
+            content = b"".join(chunks)
+            if (
+                len(content) != fingerprint.size
+                or digest.hexdigest() != fingerprint.sha256
+            ):
                 raise FixtureIntegrityError("approved fixture bytes do not match plan")
+            suffix = source_path.suffix.casefold() or ".bin"
+            snapshot_path = self._store.write_bytes_new(
+                experiment_id,
+                Path(
+                    "runs",
+                    run_id,
+                    "fixtures",
+                    (
+                        f"{fingerprint.binding_index:04d}-"
+                        f"{fingerprint.sha256[:16]}{suffix}"
+                    ),
+                ),
+                content,
+            )
+            if (
+                snapshot_path.stat().st_size != fingerprint.size
+                or hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+                != fingerprint.sha256
+            ):
+                raise FixtureIntegrityError("approved fixture snapshot is invalid")
             resolved.append(
                 ResolvedFixture(
                     uri=fingerprint.uri,
-                    path=path,
+                    path=snapshot_path,
                     sha256=fingerprint.sha256,
                     media_type=fingerprint.media_type,
                     binding_role="reference",
@@ -540,6 +596,7 @@ class ExperimentEngine:
                         OSError,
                         requests.RequestException,
                         TransientExecutorError,
+                        TransientOperationError,
                     ),
                 ):
                     raise
@@ -605,15 +662,15 @@ class ExperimentEngine:
                 updated_at=completed_at,
             )
             return self._persist(record)
+        reset_at = self._now()
+        reset_values = record.model_dump(mode="python")
+        reset_values["outputs"] = ()
+        reset_values["actual_output_count"] = 0
+        reset_values["updated_at"] = reset_at
+        record = RunRecord.model_validate(reset_values)
+        self._persist(record)
         for ordinal, output in enumerate(provider_outputs):
             try:
-                if ordinal < len(record.outputs):
-                    self._verify_reusable_output(
-                        record,
-                        output,
-                        ordinal,
-                    )
-                    continue
                 durable, record = self._retry_idempotent(
                     record,
                     "download_output",
@@ -649,12 +706,17 @@ class ExperimentEngine:
             self._persist(record)
 
         completed_at = self._now()
-        if record.actual_output_count < record.expected_output_count:
+        if record.actual_output_count != record.expected_output_count:
+            error_kind = (
+                "partial_outputs"
+                if record.actual_output_count < record.expected_output_count
+                else "extra_outputs"
+            )
             record = record.transition(
                 RunState.INCOMPLETE,
                 error=sanitize_for_persistence(
                     {
-                        "kind": "partial_outputs",
+                        "kind": error_kind,
                         "expected_output_count": record.expected_output_count,
                         "actual_output_count": record.actual_output_count,
                     }
@@ -705,6 +767,7 @@ class ExperimentEngine:
             record.experiment_id,
             relative_path,
             content,
+            reuse_matching=True,
         )
         return OutputRecord(
             ordinal=ordinal,
@@ -715,30 +778,3 @@ class ExperimentEngine:
             content_sha256=hashlib.sha256(content).hexdigest(),
             size=len(content),
         )
-
-    def _verify_reusable_output(
-        self,
-        record: RunRecord,
-        output: Any,
-        ordinal: int,
-    ) -> None:
-        durable = record.outputs[ordinal]
-        if (
-            durable.ordinal != ordinal
-            or output.node_id != durable.node_id
-            or output.media_type != durable.media_type
-            or output.provider_order != durable.provider_order
-        ):
-            raise SafetyError("provider output does not match durable output record")
-        try:
-            content = self._store.read_bytes(
-                record.experiment_id,
-                durable.local_relative_path,
-            )
-        except OSError as error:
-            raise SafetyError("durable output file is missing or unreadable") from error
-        if (
-            len(content) != durable.size
-            or hashlib.sha256(content).hexdigest() != durable.content_sha256
-        ):
-            raise SafetyError("durable output file does not match its content hash")

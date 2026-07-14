@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+import hashlib
 from html.parser import HTMLParser
 from ipaddress import ip_address
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Annotated, Any, NoReturn, TypeVar
 import unicodedata
 from urllib.parse import urlsplit
@@ -115,6 +118,7 @@ _UPLOAD_MEDIA_TYPES = {
     "application/zip": "zip",
 }
 _FIXTURE_PLACEHOLDER = re.compile(r"^fixture://([0-9]+)$")
+_PROVIDER_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$")
 _PAID_PROVIDER_STATES = {
     "SUBMITTED": "SUBMITTED",
     "QUEUED": "QUEUED",
@@ -1358,6 +1362,8 @@ class RunningHubExecutor(Executor):
         errors, bindings = self._fixture_bindings(variant, fixtures)
         if errors:
             raise ExecutorError("RunningHub variant validation failed before submit")
+        for fixture in fixtures.items:
+            self._verify_fixture_snapshot(fixture)
         try:
             config = self._credential_loader()
         except Exception as error:
@@ -1371,6 +1377,7 @@ class RunningHubExecutor(Executor):
         for fixture in fixtures.items:
             node_id, field_name = bindings[fixture.binding_index]
             file_type = _UPLOAD_MEDIA_TYPES[fixture.media_type]
+            self._verify_fixture_snapshot(fixture)
             try:
                 uploaded_name = self._upload_call(
                     api_key=None,
@@ -1379,6 +1386,7 @@ class RunningHubExecutor(Executor):
                 )
             except Exception as error:
                 raise ExecutorError("RunningHub fixture upload failed") from error
+            self._verify_fixture_snapshot(fixture)
             if not isinstance(uploaded_name, str):
                 raise ExecutorError("RunningHub upload returned an invalid filename")
             uploaded_name = uploaded_name.strip()
@@ -1413,10 +1421,12 @@ class RunningHubExecutor(Executor):
         task_id = getattr(result, "taskId", None)
         if (
             not isinstance(task_id, str)
-            or not task_id.strip()
+            or _PROVIDER_TASK_ID.fullmatch(task_id.strip()) is None
             or task_id.strip().casefold() == "none"
         ):
-            raise ExecutorError("RunningHub submission returned no task ID")
+            raise AmbiguousSubmissionError(
+                "RunningHub submission returned no usable task ID"
+            )
         task_status = getattr(result, "taskStatus", None)
         provider_state = (
             None
@@ -1427,6 +1437,37 @@ class RunningHubExecutor(Executor):
             provider_task_id=task_id.strip(),
             provider_state=provider_state,
         )
+
+    @staticmethod
+    def _verify_fixture_snapshot(fixture: Any) -> None:
+        try:
+            descriptor = os.open(
+                fixture.path,
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as error:
+            raise ExecutorError("RunningHub fixture snapshot cannot be opened") from error
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise ExecutorError("RunningHub fixture snapshot is not a regular file")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 65_536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or digest.hexdigest() != fixture.sha256
+        ):
+            raise ExecutorError("RunningHub fixture snapshot failed integrity check")
 
     @staticmethod
     def _ambiguous_request_error(error: BaseException) -> bool:

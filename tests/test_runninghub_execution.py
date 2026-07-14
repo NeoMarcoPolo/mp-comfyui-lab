@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,13 +52,14 @@ def _variant(
 
 def _fixtures(tmp_path: Path) -> ResolvedFixtures:
     fixture = tmp_path / "portrait.png"
-    fixture.write_bytes(b"fixture")
+    content = b"fixture"
+    fixture.write_bytes(content)
     return ResolvedFixtures(
         items=(
             ResolvedFixture(
                 uri="portrait.png",
                 path=fixture,
-                sha256="c" * 64,
+                sha256=hashlib.sha256(content).hexdigest(),
                 media_type="image/png",
                 binding_role="reference",
                 binding_index=0,
@@ -150,6 +152,68 @@ def test_submit_uploads_and_uses_exact_create_task_shape(tmp_path: Path) -> None
     materialized = json.loads(captured_create["workflow"])
     assert materialized["1"]["inputs"]["image"] == "uploaded-portrait.png"
     assert "fixture://0" not in captured_create["workflow"]
+
+
+def test_submit_rejects_tampered_fixture_before_credentials_or_create(
+    tmp_path: Path,
+) -> None:
+    fixtures = _fixtures(tmp_path)
+    fixtures.items[0].path.write_bytes(b"tampered snapshot")
+    calls: list[str] = []
+
+    def forbidden(name: str):
+        def call(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"tampered snapshot touched {name}")
+
+        return call
+
+    executor = RunningHubExecutor(
+        credential_loader=forbidden("credentials"),
+        upload_call=forbidden("upload"),
+        create_task_call=forbidden("create"),
+        status_call=forbidden("status"),
+        info_call=forbidden("info"),
+        outputs_call=forbidden("outputs"),
+    )
+
+    with pytest.raises(ExecutorError, match="fixture snapshot"):
+        executor.submit(_variant(), fixtures)
+
+    assert calls == []
+
+
+def test_submit_reverifies_snapshot_immediately_before_upload(
+    tmp_path: Path,
+) -> None:
+    fixtures = _fixtures(tmp_path)
+    calls: list[str] = []
+
+    def load_credentials():
+        calls.append("credentials")
+        fixtures.items[0].path.write_bytes(b"changed after credential gate")
+        return SimpleNamespace(apiKey="secret")
+
+    def forbidden(name: str):
+        def call(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"changed snapshot touched {name}")
+
+        return call
+
+    executor = RunningHubExecutor(
+        credential_loader=load_credentials,
+        upload_call=forbidden("upload"),
+        create_task_call=forbidden("create"),
+        status_call=forbidden("status"),
+        info_call=forbidden("info"),
+        outputs_call=forbidden("outputs"),
+    )
+
+    with pytest.raises(ExecutorError, match="fixture snapshot"):
+        executor.submit(_variant(), fixtures)
+
+    assert calls == ["credentials"]
 
 
 def test_poll_maps_known_status_and_sanitizes_info() -> None:
@@ -383,22 +447,39 @@ def test_submit_timeout_is_ambiguous_and_create_is_not_retried(
     assert creates == ["create"]
 
 
-@pytest.mark.parametrize("task_id", ["", "   ", "None"])
-def test_submit_rejects_missing_provider_task_id(
+@pytest.mark.parametrize(
+    "result",
+    [
+        SimpleNamespace(taskStatus="QUEUED"),
+        SimpleNamespace(taskId=None, taskStatus="QUEUED"),
+        SimpleNamespace(taskId="", taskStatus="QUEUED"),
+        SimpleNamespace(taskId="   ", taskStatus="QUEUED"),
+        SimpleNamespace(taskId="None", taskStatus="QUEUED"),
+        SimpleNamespace(taskId="task\nid", taskStatus="QUEUED"),
+        SimpleNamespace(taskId="task id", taskStatus="QUEUED"),
+        SimpleNamespace(taskId="x" * 513, taskStatus="QUEUED"),
+    ],
+)
+def test_submit_invalid_provider_task_id_is_ambiguous_after_create(
     tmp_path: Path,
-    task_id: str,
+    result: SimpleNamespace,
 ) -> None:
+    creates: list[str] = []
+
+    def create_task_call(**_kwargs):
+        creates.append("create")
+        return result
+
     executor = RunningHubExecutor(
         credential_loader=lambda: SimpleNamespace(apiKey="secret"),
         upload_call=lambda **_kwargs: "uploaded.png",
-        create_task_call=lambda **_kwargs: SimpleNamespace(
-            taskId=task_id,
-            taskStatus="QUEUED",
-        ),
+        create_task_call=create_task_call,
         status_call=lambda **_kwargs: None,
         info_call=lambda **_kwargs: None,
         outputs_call=lambda **_kwargs: None,
     )
 
-    with pytest.raises(ExecutorError, match="no task ID"):
+    with pytest.raises(AmbiguousSubmissionError, match="no usable task ID"):
         executor.submit(_variant(), _fixtures(tmp_path))
+
+    assert creates == ["create"]

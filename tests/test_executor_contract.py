@@ -671,6 +671,36 @@ def test_run_transition_revalidates_complete_record():
         planned.transition(RunState.RUNNING)
 
 
+def test_run_record_recursively_sanitizes_durable_diagnostics():
+    untrusted = (
+        "api_key=durable-secret Authorization: Bearer bearer-secret "
+        "https://cdn.example/output.png?sig=signed-secret"
+    )
+
+    record = RunRecord(
+        run_id="run-sanitized",
+        experiment_id="experiment-1",
+        variant_id="variant-1",
+        state=RunState.FAILED,
+        expected_output_count=1,
+        error={
+            "kind": "provider_error",
+            "validation_issue": untrusted,
+            "output": {"diagnostic": untrusted},
+        },
+        diagnostics=(
+            {"kind": "poll", "diagnostic": untrusted},
+            {"kind": "retry", "messages": [untrusted]},
+        ),
+    )
+
+    serialized = json.dumps(record.model_dump(mode="json"), sort_keys=True)
+    assert "durable-secret" not in serialized
+    assert "bearer-secret" not in serialized
+    assert "signed-secret" not in serialized
+    assert "?sig=" not in serialized
+
+
 def _run_for_transition(state: RunState, **updates) -> RunRecord:
     values = {
         "run_id": "run-1",
@@ -1010,18 +1040,17 @@ def test_state_changes_must_not_use_unvalidated_model_copy():
     assert "model_copy(update=...)" in RunRecord.transition.__doc__
 
 
-def test_run_record_allows_more_actual_outputs_than_expected():
-    record = RunRecord(
-        run_id="run-1",
-        experiment_id="experiment-1",
-        variant_id="variant-1",
-        state=RunState.SUCCESS,
-        provider_task_id="fake-task-1",
-        expected_output_count=1,
-        actual_output_count=2,
-    )
-
-    assert record.actual_output_count == 2
+def test_run_record_success_requires_exact_output_count():
+    with pytest.raises(ValidationError, match="equal expected_output_count"):
+        RunRecord(
+            run_id="run-1",
+            experiment_id="experiment-1",
+            variant_id="variant-1",
+            state=RunState.SUCCESS,
+            provider_task_id="fake-task-1",
+            expected_output_count=1,
+            actual_output_count=2,
+        )
 
 
 def test_workflow_and_run_datetimes_normalize_to_utc():

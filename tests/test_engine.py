@@ -4,6 +4,8 @@ import hashlib
 import importlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 
@@ -181,7 +183,61 @@ def test_fixture_hash_mismatch_fails_before_executor_construction(
         )
 
     assert paid_constructions == []
-    assert list((config.experiments_root / "plan-approved" / "runs").iterdir()) == []
+    runs_root = config.experiments_root / "plan-approved" / "runs"
+    assert list(runs_root.glob("*.json")) == []
+    assert list(runs_root.glob("*/fixtures/*")) == []
+
+
+def test_fixture_source_replacement_after_approval_uses_run_snapshot(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_plan(tmp_path, with_fixture=True)
+    original = tmp_path / "portrait.png"
+    approved_bytes = original.read_bytes()
+    observed: list[tuple[Path, bytes]] = []
+
+    class SnapshotProbeExecutor(FakeExecutor):
+        def validate_variant(self, variant, fixtures):
+            fixture = fixtures.items[0]
+            observed.append((fixture.path, fixture.path.read_bytes()))
+            return super().validate_variant(variant, fixtures)
+
+        def submit(self, variant, fixtures):
+            fixture = fixtures.items[0]
+            observed.append((fixture.path, fixture.path.read_bytes()))
+            return super().submit(variant, fixtures)
+
+    executor = SnapshotProbeExecutor(
+        poll_sequences={"fake-task-1": (ProviderTaskState.FAILED,)}
+    )
+
+    def executor_factory() -> SnapshotProbeExecutor:
+        original.write_bytes(b"replacement after approval")
+        return executor
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=executor_factory,
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.FAILED
+    assert [content for _, content in observed] == [approved_bytes, approved_bytes]
+    assert all(path != original for path, _ in observed)
+    assert all(
+        path.is_relative_to(
+            config.experiments_root / "plan-approved" / "runs" / record.run_id
+        )
+        for path, _ in observed
+    )
 
 
 def test_tampered_variant_artifact_fails_before_paid_boundary(
@@ -314,6 +370,64 @@ def test_validation_errors_are_durable_and_prevent_submission(
     assert executor.calls == ["validate_variant"]
 
 
+def test_all_run_artifacts_sanitize_untrusted_diagnostics(tmp_path: Path) -> None:
+    config, plan = _persist_plan(tmp_path)
+    untrusted = (
+        "api_key=durable-secret Authorization: Bearer bearer-secret "
+        "https://cdn.example/output.png?sig=signed-secret"
+    )
+    executors = (
+        FakeExecutor(
+            validation=ValidationReport(
+                errors=(ValidationIssue(code="invalid", message=untrusted),)
+            )
+        ),
+        FakeExecutor(
+            poll_sequences={
+                "fake-task-1": (
+                    PollResult(
+                        provider_task_id="fake-task-1",
+                        state=ProviderTaskState.FAILED,
+                        diagnostic=untrusted,
+                    ),
+                )
+            }
+        ),
+        FakeExecutor(
+            method_exceptions={"poll": (TimeoutError(untrusted),)},
+            poll_sequences={"fake-task-1": (ProviderTaskState.FAILED,)},
+        ),
+        FakeExecutor(method_exceptions={"submit": ExecutorError(untrusted)}),
+    )
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+
+    for executor in executors:
+        engine = engine_module.ExperimentEngine(
+            config=config,
+            executor_factory=lambda executor=executor: executor,
+            downloader=lambda _url, _target: None,
+            sleep=lambda _seconds: None,
+        )
+        engine.run(
+            "plan-approved",
+            "baseline",
+            approved_plan_hash=plan.plan_hash,
+        )
+
+    durable_bytes = b"\n".join(
+        path.read_bytes()
+        for path in (config.experiments_root / "plan-approved").rglob("*")
+        if path.is_file()
+    )
+    for secret in (
+        b"durable-secret",
+        b"bearer-secret",
+        b"signed-secret",
+        b"?sig=",
+    ):
+        assert secret not in durable_bytes
+
+
 def test_ambiguous_submission_is_incomplete_and_never_retried(
     tmp_path: Path,
 ) -> None:
@@ -347,6 +461,85 @@ def test_ambiguous_submission_is_incomplete_and_never_retried(
         strict=True,
     )
     assert persisted == record
+
+
+def test_submit_intent_recovers_crash_after_remote_return_without_resubmit(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_plan(tmp_path)
+
+    class CrashReceipt:
+        @property
+        def provider_task_id(self):
+            raise SystemExit("crash before provider ID persistence")
+
+    class CrashAfterSubmitExecutor(FakeExecutor):
+        def submit(self, variant, fixtures):
+            self.calls.append("submit")
+            self.submissions.append((variant, fixtures))
+            return CrashReceipt()
+
+    crashing_executor = CrashAfterSubmitExecutor()
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    crashing_engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: crashing_executor,
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(SystemExit, match="crash before provider ID persistence"):
+        crashing_engine.run(
+            "plan-approved",
+            "baseline",
+            approved_plan_hash=plan.plan_hash,
+        )
+
+    run_path = next(
+        (config.experiments_root / "plan-approved" / "runs").glob("*.json")
+    )
+    planned = RunRecord.model_validate_json(
+        run_path.read_text(encoding="utf-8"),
+        strict=True,
+    )
+    assert planned.state is RunState.PLANNED
+    assert planned.submission_intent_at is not None
+    assert planned.provider_task_id is None
+    assert crashing_executor.calls == ["validate_variant", "submit"]
+
+    unexpected_factories: list[str] = []
+    recovery_engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: unexpected_factories.append("executor"),
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    recovered = recovery_engine.resume("plan-approved", planned.run_id)
+
+    assert recovered.state is RunState.INCOMPLETE
+    assert thaw_json(recovered.error)["kind"] == "ambiguous_submission"
+    assert unexpected_factories == []
+
+    reconcile_executor = FakeExecutor(
+        poll_sequences={"operator-task-7": (ProviderTaskState.FAILED,)}
+    )
+    reconcile_engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: reconcile_executor,
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    reconciled = reconcile_engine.reconcile(
+        "plan-approved",
+        planned.run_id,
+        "operator-task-7",
+    )
+
+    assert reconciled.state is RunState.FAILED
+    assert reconciled.provider_task_id == "operator-task-7"
+    assert reconcile_executor.calls == ["poll"]
 
 
 def test_resume_polls_existing_task_id_without_validation_or_submission(
@@ -387,6 +580,48 @@ def test_resume_polls_existing_task_id_without_validation_or_submission(
     assert record.provider_task_id == "provider-task-1"
     assert executor.calls == ["poll"]
     assert executor.polls == ["provider-task-1"]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [RunState.SUCCESS, RunState.FAILED, RunState.CANCELLED],
+)
+def test_terminal_resume_is_read_only_without_executor(
+    tmp_path: Path,
+    state: RunState,
+) -> None:
+    config, _ = _persist_plan(tmp_path)
+    record = RunRecord(
+        run_id=f"run-terminal-{state.value.casefold()}",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=state,
+        provider_task_id=(
+            "provider-task-1"
+            if state in {RunState.SUCCESS, RunState.CANCELLED}
+            else None
+        ),
+        expected_output_count=1,
+        actual_output_count=1 if state is RunState.SUCCESS else 0,
+    )
+    ExperimentStore(config.experiments_root).write_json_new(
+        "plan-approved",
+        f"runs/{record.run_id}.json",
+        record.model_dump(mode="json"),
+    )
+    constructions: list[str] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: constructions.append("executor"),
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    resumed = engine.resume("plan-approved", record.run_id)
+
+    assert resumed == record
+    assert constructions == []
 
 
 def test_transient_poll_retries_use_backoff_without_resubmission(
@@ -567,6 +802,257 @@ def test_complete_verified_output_batch_is_success(tmp_path: Path) -> None:
     ]
 
 
+def test_resume_reuses_orphan_published_before_output_record_persistence(
+    tmp_path: Path,
+) -> None:
+    config, plan = _persist_plan(tmp_path)
+    content = b"published before crash"
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output.png?sig=secret",
+        media_type="image/png",
+        provider_order=0,
+    )
+    first_executor = FakeExecutor.success(outputs=(output,))
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(content)
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    crashing_engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: first_executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+    original_write = crashing_engine._store.write_bytes_new
+
+    def crash_after_output_publish(experiment_id, relative_path, value, **kwargs):
+        published = original_write(
+            experiment_id,
+            relative_path,
+            value,
+            **kwargs,
+        )
+        if Path(relative_path).parts[0] == "outputs":
+            raise SystemExit("crash after final output publish")
+        return published
+
+    crashing_engine._store.write_bytes_new = crash_after_output_publish
+
+    with pytest.raises(SystemExit, match="crash after final output publish"):
+        crashing_engine.run(
+            "plan-approved",
+            "baseline",
+            approved_plan_hash=plan.plan_hash,
+        )
+
+    run_path = next(
+        (config.experiments_root / "plan-approved" / "runs").glob("*.json")
+    )
+    interrupted = RunRecord.model_validate_json(
+        run_path.read_text(encoding="utf-8"),
+        strict=True,
+    )
+    assert interrupted.state is RunState.SUBMITTED
+    assert interrupted.outputs == ()
+    orphan = config.experiments_root / "plan-approved" / "outputs/baseline/0000-9.png"
+    assert orphan.read_bytes() == content
+
+    resume_executor = FakeExecutor(
+        poll_sequences={"fake-task-1": (ProviderTaskState.SUCCESS,)},
+        output_scripts={"fake-task-1": ((output,),)},
+    )
+    resume_engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: resume_executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    resumed = resume_engine.resume("plan-approved", interrupted.run_id)
+
+    assert resumed.state is RunState.SUCCESS
+    assert len(resumed.outputs) == 1
+    assert resumed.outputs[0].content_sha256 == hashlib.sha256(content).hexdigest()
+    assert orphan.read_bytes() == content
+    assert resume_executor.calls == ["poll", "collect_outputs"]
+
+
+def test_identical_second_run_reuses_matching_variant_output(tmp_path: Path) -> None:
+    config, plan = _persist_plan(tmp_path)
+    content = b"identical rerun output"
+    output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/output.png?sig=secret",
+        media_type="image/png",
+        provider_order=0,
+    )
+    executors = [
+        FakeExecutor.success(outputs=(output,)),
+        FakeExecutor.success(outputs=(output,)),
+    ]
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(content)
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executors.pop(0),
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    first = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+    second = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert first.state is second.state is RunState.SUCCESS
+    assert first.run_id != second.run_id
+    assert first.outputs == second.outputs
+    output_path = (
+        config.experiments_root
+        / "plan-approved"
+        / first.outputs[0].local_relative_path
+    )
+    assert output_path.read_bytes() == content
+
+
+def test_extra_provider_output_is_incomplete(tmp_path: Path) -> None:
+    config, plan = _persist_plan(tmp_path)
+    outputs = tuple(
+        ProviderOutput(
+            node_id="9",
+            url=f"https://cdn.example/output-{index}.png?sig=secret-{index}",
+            media_type="image/png",
+            provider_order=index,
+        )
+        for index in range(2)
+    )
+    executor = FakeExecutor.success(outputs=outputs)
+
+    def downloader(url: str, target: Path) -> Path:
+        target.write_bytes(url.encode("ascii"))
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.run(
+        "plan-approved",
+        "baseline",
+        approved_plan_hash=plan.plan_hash,
+    )
+
+    assert record.state is RunState.INCOMPLETE
+    assert record.actual_output_count == 2
+    assert len(record.outputs) == 2
+    assert thaw_json(record.error)["kind"] == "extra_outputs"
+
+
+def test_resume_provider_batch_shrink_replaces_stale_output_records(
+    tmp_path: Path,
+) -> None:
+    config, _ = _persist_plan(tmp_path)
+    first_content = b"current first"
+    stale_content = b"stale second"
+    durable_outputs = (
+        OutputRecord(
+            ordinal=0,
+            provider_order=0,
+            node_id="9",
+            media_type="image/png",
+            local_relative_path="outputs/baseline/0000-9.png",
+            content_sha256=hashlib.sha256(first_content).hexdigest(),
+            size=len(first_content),
+        ),
+        OutputRecord(
+            ordinal=1,
+            provider_order=1,
+            node_id="9",
+            media_type="image/png",
+            local_relative_path="outputs/baseline/0001-9.png",
+            content_sha256=hashlib.sha256(stale_content).hexdigest(),
+            size=len(stale_content),
+        ),
+    )
+    existing = RunRecord(
+        run_id="run-shrunk-batch",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.SUBMITTED,
+        provider_task_id="provider-task-1",
+        expected_output_count=2,
+        expected_output_node_ids=("9",),
+        expected_media_types=("image/png",),
+        actual_output_count=2,
+        outputs=durable_outputs,
+    )
+    store = ExperimentStore(config.experiments_root)
+    store.write_bytes_new(
+        "plan-approved",
+        durable_outputs[0].local_relative_path,
+        first_content,
+    )
+    store.write_bytes_new(
+        "plan-approved",
+        durable_outputs[1].local_relative_path,
+        stale_content,
+    )
+    store.write_json_new(
+        "plan-approved",
+        "runs/run-shrunk-batch.json",
+        existing.model_dump(mode="json"),
+    )
+    current_output = ProviderOutput(
+        node_id="9",
+        url="https://cdn.example/current.png?sig=live",
+        media_type="image/png",
+        provider_order=0,
+    )
+    executor = FakeExecutor(
+        poll_sequences={"provider-task-1": (ProviderTaskState.SUCCESS,)},
+        output_scripts={"provider-task-1": ((current_output,),)},
+    )
+    downloads: list[str] = []
+
+    def downloader(url: str, target: Path) -> Path:
+        downloads.append(url)
+        target.write_bytes(first_content)
+        return target
+
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: executor,
+        downloader=downloader,
+        sleep=lambda _seconds: None,
+    )
+
+    record = engine.resume("plan-approved", "run-shrunk-batch")
+
+    assert record.state is RunState.INCOMPLETE
+    assert record.actual_output_count == 1
+    assert record.outputs == (durable_outputs[0],)
+    assert thaw_json(record.error)["kind"] == "partial_outputs"
+    assert downloads == [current_output.url]
+
+
 def test_malformed_output_is_incomplete_and_preserves_prior_output(
     tmp_path: Path,
 ) -> None:
@@ -716,11 +1202,18 @@ def test_resume_reuses_matching_durable_output_without_overwrite(
         poll_sequences={"provider-task-1": (ProviderTaskState.SUCCESS,)},
         output_scripts={"provider-task-1": ((provider_output,),)},
     )
+    downloads: list[str] = []
+
+    def downloader(url: str, target: Path) -> Path:
+        downloads.append(url)
+        target.write_bytes(content)
+        return target
+
     engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
     engine = engine_module.ExperimentEngine(
         config=config,
         executor_factory=lambda: executor,
-        downloader=lambda _url, _target: pytest.fail("matching output redownloaded"),
+        downloader=downloader,
         sleep=lambda _seconds: None,
     )
 
@@ -733,6 +1226,7 @@ def test_resume_reuses_matching_durable_output_without_overwrite(
         durable_output.local_relative_path,
     ) == content
     assert executor.calls == ["poll", "collect_outputs"]
+    assert downloads == [provider_output.url]
 
 
 def test_reconcile_attaches_operator_task_id_then_polls_without_submit(
@@ -779,6 +1273,38 @@ def test_reconcile_attaches_operator_task_id_then_polls_without_submit(
     assert record.provider_task_id == "operator-task-7"
     assert ambiguous_executor.calls == ["validate_variant", "submit"]
     assert polling_executor.calls == ["poll", "collect_outputs"]
+
+
+def test_reconcile_rejects_nonambiguous_incomplete_run(tmp_path: Path) -> None:
+    config, _ = _persist_plan(tmp_path)
+    record = RunRecord(
+        run_id="run-partial",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.INCOMPLETE,
+        provider_task_id="provider-task-1",
+        expected_output_count=2,
+        actual_output_count=1,
+        error={"kind": "partial_outputs"},
+    )
+    ExperimentStore(config.experiments_root).write_json_new(
+        "plan-approved",
+        "runs/run-partial.json",
+        record.model_dump(mode="json"),
+    )
+    constructions: list[str] = []
+    engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
+    engine = engine_module.ExperimentEngine(
+        config=config,
+        executor_factory=lambda: constructions.append("executor"),
+        downloader=lambda _url, _target: None,
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(ValueError, match="only an ambiguous INCOMPLETE"):
+        engine.reconcile("plan-approved", "run-partial", "operator-task-1")
+
+    assert constructions == []
 
 
 def test_status_is_store_only_and_returns_full_run_record(tmp_path: Path) -> None:
@@ -1216,11 +1742,16 @@ def test_durable_output_hash_mismatch_fails_closed_without_overwrite(
         poll_sequences={"provider-task-1": (ProviderTaskState.SUCCESS,)},
         output_scripts={"provider-task-1": ((provider_output,),)},
     )
+
+    def downloader(_url: str, target: Path) -> Path:
+        target.write_bytes(approved)
+        return target
+
     engine_module = importlib.import_module("mp_comfyui_lab.experiments.engine")
     engine = engine_module.ExperimentEngine(
         config=config,
         executor_factory=lambda: executor,
-        downloader=lambda _url, _target: pytest.fail("mismatch redownloaded"),
+        downloader=downloader,
         sleep=lambda _seconds: None,
     )
 
@@ -1301,3 +1832,38 @@ def test_run_lock_allows_only_one_concurrent_resume_poll(tmp_path: Path) -> None
     assert [record.state for record in results] == [RunState.FAILED, RunState.FAILED]
     assert executor.calls == ["poll"]
     assert constructions == ["executor"]
+
+
+def test_run_lock_serializes_separate_processes(tmp_path: Path) -> None:
+    config, _ = _persist_plan(tmp_path)
+    store = ExperimentStore(config.experiments_root)
+    marker = tmp_path / "child-acquired.txt"
+    script = """
+from pathlib import Path
+import sys
+from mp_comfyui_lab.experiments.store import ExperimentStore
+
+store = ExperimentStore(Path(sys.argv[1]))
+with store.run_lock("plan-approved", "run-process-lock"):
+    Path(sys.argv[2]).write_text("acquired", encoding="utf-8")
+"""
+    with store.run_lock("plan-approved", "run-process-lock"):
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(config.experiments_root),
+                str(marker),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.25)
+        assert process.poll() is None
+        assert not marker.exists()
+
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, (stdout, stderr)
+    assert marker.read_text(encoding="utf-8") == "acquired"

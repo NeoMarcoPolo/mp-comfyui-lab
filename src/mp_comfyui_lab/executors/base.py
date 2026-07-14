@@ -148,6 +148,10 @@ class ExecutorError(RuntimeError):
     pass
 
 
+class TransientOperationError(RuntimeError):
+    """A retryable failure from an executor-neutral idempotent operation."""
+
+
 class TransientExecutorError(ExecutorError):
     pass
 

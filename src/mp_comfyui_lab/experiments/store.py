@@ -1,10 +1,12 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -460,9 +462,15 @@ class ExperimentStore:
         experiment_id: str,
         relative_path: str | Path,
         value: bytes,
+        *,
+        reuse_matching: bool = False,
     ) -> Path:
         destination = self._artifact_path(experiment_id, relative_path)
-        self._atomic_write_bytes_new(destination, value)
+        self._atomic_write_bytes_new(
+            destination,
+            value,
+            reuse_matching=reuse_matching,
+        )
         return destination
 
     def read_json(self, experiment_id: str, relative_path: str | Path) -> Any:
@@ -610,8 +618,14 @@ class ExperimentStore:
                 except FileNotFoundError:
                     pass
 
-    @staticmethod
-    def _atomic_write_bytes_new(destination: Path, value: bytes) -> None:
+    @classmethod
+    def _atomic_write_bytes_new(
+        cls,
+        destination: Path,
+        value: bytes,
+        *,
+        reuse_matching: bool,
+    ) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = None
         try:
@@ -628,7 +642,15 @@ class ExperimentStore:
             try:
                 os.link(temporary_path, destination)
             except FileExistsError as error:
-                raise SafetyError("artifact already exists; refusing to overwrite") from error
+                if not reuse_matching:
+                    raise SafetyError(
+                        "artifact already exists; refusing to overwrite"
+                    ) from error
+                if not cls._existing_bytes_match(destination, value):
+                    raise SafetyError(
+                        "artifact already exists with different content"
+                    ) from error
+                return
             except (AttributeError, NotImplementedError, OSError) as error:
                 raise SafetyError("safe no-clobber artifact publish is unavailable") from error
             if os.name != "nt":
@@ -646,3 +668,30 @@ class ExperimentStore:
                     temporary_path.unlink()
                 except FileNotFoundError:
                     pass
+
+    @classmethod
+    def _existing_bytes_match(cls, destination: Path, expected: bytes) -> bool:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(destination, flags)
+        except OSError as error:
+            raise SafetyError("existing artifact cannot be opened safely") from error
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_size != len(expected):
+                return False
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 65_536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        return (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            and digest.hexdigest() == hashlib.sha256(expected).hexdigest()
+        )

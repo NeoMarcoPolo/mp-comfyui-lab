@@ -30,7 +30,11 @@ from mp_comfyui_lab.json_types import (
     SanitizedJsonObject,
     thaw_json,
 )
-from mp_comfyui_lab.security import SafetyError, safe_filename
+from mp_comfyui_lab.security import (
+    SafetyError,
+    safe_filename,
+    sanitize_untrusted_diagnostic,
+)
 
 
 NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -101,6 +105,7 @@ _IMMUTABLE_TRANSITION_FIELDS = (
     "expected_output_node_ids",
     "expected_media_types",
     "created_at",
+    "submission_intent_at",
 )
 
 
@@ -109,6 +114,23 @@ def _is_ambiguous_submission(error: Any) -> bool:
         isinstance(error, Mapping)
         and error.get("kind") == "ambiguous_submission"
     )
+
+
+def _sanitize_diagnostic_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            (
+                sanitize_untrusted_diagnostic(key)
+                if isinstance(key, str)
+                else key
+            ): _sanitize_diagnostic_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return tuple(_sanitize_diagnostic_json(item) for item in value)
+    if isinstance(value, str):
+        return sanitize_untrusted_diagnostic(value)
+    return value
 
 
 class ResolvedFixture(_FrozenModel):
@@ -190,6 +212,7 @@ class RunRecord(_FrozenModel):
     error: SanitizedJsonObject | None = None
     diagnostics: tuple[SanitizedJsonObject, ...] = ()
     created_at: UtcDatetime | None = None
+    submission_intent_at: UtcDatetime | None = None
     submitted_at: UtcDatetime | None = None
     started_at: UtcDatetime | None = None
     completed_at: UtcDatetime | None = None
@@ -199,12 +222,22 @@ class RunRecord(_FrozenModel):
         "expected_output_node_ids",
         "expected_media_types",
         "outputs",
-        "diagnostics",
         mode="before",
     )
     @classmethod
     def run_json_arrays(cls, value: Any) -> Any:
         return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def sanitize_error_diagnostics(cls, value: Any) -> Any:
+        return None if value is None else _sanitize_diagnostic_json(value)
+
+    @field_validator("diagnostics", mode="before")
+    @classmethod
+    def sanitize_diagnostic_history(cls, value: Any) -> Any:
+        items = tuple(value) if isinstance(value, list) else value
+        return tuple(_sanitize_diagnostic_json(item) for item in items)
 
     @model_validator(mode="after")
     def validate_provider_task_id(self) -> RunRecord:
@@ -220,16 +253,17 @@ class RunRecord(_FrozenModel):
             raise ValueError(f"provider_task_id is required for {self.state.value}")
         if (
             self.state is RunState.SUCCESS
-            and self.actual_output_count < self.expected_output_count
+            and self.actual_output_count != self.expected_output_count
         ):
             raise ValueError(
-                "actual_output_count must meet expected_output_count for SUCCESS"
+                "actual_output_count must equal expected_output_count for SUCCESS"
             )
 
         timestamps = [
             timestamp
             for timestamp in (
                 self.created_at,
+                self.submission_intent_at,
                 self.submitted_at,
                 self.started_at,
                 self.completed_at,

@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 import mp_comfyui_lab
+from mp_runninghub_api.errors import RunningHubApiError
 import pytest
 
 from mp_comfyui_lab.cli import app
@@ -185,6 +186,63 @@ def test_run_cli_rejects_missing_explicit_approval_hash(capsys):
     assert "--approve-plan-hash" in payload["error"]["message"]
 
 
+def test_resume_cli_wires_existing_run_id(capsys):
+    record = RunRecord(
+        run_id="run-resume",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.FAILED,
+        expected_output_count=1,
+    )
+    engine = FakeExperimentEngine(record)
+
+    code = main(
+        ["resume", "plan-approved", "run-resume"],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.EXECUTION
+    assert engine.calls == [("resume", "plan-approved", "run-resume")]
+    assert payload["data"]["run_id"] == "run-resume"
+    assert payload["data"]["state"] == "FAILED"
+
+
+def test_reconcile_cli_wires_operator_task_id(capsys):
+    record = RunRecord(
+        run_id="run-reconcile",
+        experiment_id="plan-approved",
+        variant_id="baseline",
+        state=RunState.INCOMPLETE,
+        expected_output_count=1,
+        error={"kind": "ambiguous_submission"},
+    )
+    engine = FakeExperimentEngine(record)
+
+    code = main(
+        [
+            "reconcile",
+            "plan-approved",
+            "run-reconcile",
+            "--task-id",
+            "operator-task-7",
+        ],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.INCOMPLETE
+    assert engine.calls == [
+        (
+            "reconcile",
+            "plan-approved",
+            "run-reconcile",
+            "operator-task-7",
+        )
+    ]
+    assert payload["data"]["run_id"] == "run-reconcile"
+
+
 def test_status_cli_is_store_only_without_runninghub_construction(
     tmp_path,
     capsys,
@@ -224,6 +282,36 @@ def test_status_cli_is_store_only_without_runninghub_construction(
     assert payload["data"]["expected_output_count"] == 2
     assert payload["data"]["actual_output_count"] == 1
     assert payload["data"]["error"] == {"kind": "prior_error"}
+
+
+def test_default_cli_downloader_translates_runninghub_transport_error(
+    tmp_path,
+    monkeypatch,
+):
+    config = app.LabConfig.model_validate(
+        {"experiments_root": tmp_path / "experiments"},
+        context={"base_dir": tmp_path},
+    )
+    monkeypatch.setattr(app.LabConfig, "load", lambda _root: config)
+
+    def failing_download(_url, _target):
+        raise RunningHubApiError(
+            "download failed api_key=durable-secret "
+            "https://cdn.example/output.png?sig=signed-secret"
+        )
+
+    monkeypatch.setattr(app, "download_file", failing_download)
+    engine = app._make_experiment_engine(tmp_path)
+
+    with pytest.raises(RuntimeError) as raised:
+        engine._downloader(
+            "https://cdn.example/output.png?sig=live",
+            tmp_path / "output.png",
+        )
+
+    assert type(raised.value).__name__ == "TransientOperationError"
+    assert "durable-secret" not in str(raised.value)
+    assert "signed-secret" not in str(raised.value)
 
 
 @pytest.mark.parametrize(
