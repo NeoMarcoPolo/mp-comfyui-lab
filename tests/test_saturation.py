@@ -11,6 +11,7 @@ from mp_comfyui_lab.experiments.models import (
     PlannedVariant,
     PlanningConfidence,
 )
+from mp_comfyui_lab.experiments.planning import recompute_exact_run_hash
 from mp_comfyui_lab.experiments.saturation import (
     ExperimentHistory,
     RerunReasonRequired,
@@ -39,6 +40,7 @@ def _variant(
     hypothesis: DimensionName = DimensionName.CHECKPOINT,
     required_nodes: tuple[str, ...] = ("KSampler", "SaveImage"),
     corrective_hypotheses: dict[str, str] | None = None,
+    correction: dict[str, object] | None = None,
     warnings: tuple[str, ...] = (),
 ) -> PlannedVariant:
     graph = {
@@ -52,6 +54,8 @@ def _variant(
     }
     if corrective_hypotheses is not None:
         execution_parameters["corrective_hypotheses"] = corrective_hypotheses
+    if correction is not None:
+        execution_parameters["correction"] = correction
     return PlannedVariant(
         variant_id=variant_id,
         source_workflow_id="workflow-1",
@@ -251,7 +255,7 @@ def test_perceptually_equivalent_tested_capability_dominates_weaker_candidate() 
     )
     weaker = _variant(
         "unexplored-low-evidence",
-        capability_hash="6" * 64,
+        capability_hash="5" * 64,
         exact_run_hash="2" * 64,
         confidence=PlanningConfidence.UNEXPLORED,
     )
@@ -268,6 +272,33 @@ def test_perceptually_equivalent_tested_capability_dominates_weaker_candidate() 
     assert decision.reasons["unexplored-low-evidence"] == (
         "dominated_by_equivalent_tested_capability"
     )
+
+
+def test_equivalent_output_cannot_dominate_a_different_capability_claim() -> None:
+    tested_checkpoint = _variant(
+        "tested-checkpoint",
+        capability_hash="5" * 64,
+        exact_run_hash="1" * 64,
+    )
+    untested_lora = _variant(
+        "untested-lora",
+        capability_hash="6" * 64,
+        exact_run_hash="2" * 64,
+        confidence=PlanningConfidence.UNEXPLORED,
+        hypothesis=DimensionName.LORA_STACK,
+    )
+    plan = _plan(
+        tested_checkpoint,
+        untested_lora,
+        coverage=(DimensionName.CHECKPOINT, DimensionName.LORA_STACK),
+    )
+    history = ExperimentHistory()
+    history.record_success(tested_checkpoint, run_id="run-tested")
+    history.add_equivalent_group(["tested-checkpoint", "untested-lora"])
+
+    decision = next_wave(plan, history)
+
+    assert [item.variant_id for item in decision.variants] == ["untested-lora"]
 
 
 def test_weaker_tested_candidate_does_not_dominate_stronger_untested_claim() -> None:
@@ -328,7 +359,7 @@ def test_repeated_missing_node_failure_requires_corrective_hypothesis() -> None:
     )
 
 
-def test_plan_hashed_corrective_hypothesis_can_address_repeated_failure() -> None:
+def test_prose_only_corrective_hypothesis_cannot_bypass_repeated_failure() -> None:
     signature = "missing-node:TextEncodeQwen"
     corrected = _variant(
         "install-and-use-required-node",
@@ -345,9 +376,224 @@ def test_plan_hashed_corrective_hypothesis_can_address_repeated_failure() -> Non
 
     decision = next_wave(_plan(corrected), history)
 
-    assert [item.variant_id for item in decision.variants] == [
-        "install-and-use-required-node"
-    ]
+    assert decision.variants == ()
+    assert decision.reasons[corrected.variant_id] == (
+        "repeated_failure_requires_new_corrective_hypothesis"
+    )
+
+
+def test_machine_verified_correction_selects_changed_candidate_and_affects_hashes() -> None:
+    signature = "missing-node:TextEncodeQwen"
+    failed = _variant(
+        "failed-encoder",
+        capability_hash="8" * 64,
+        exact_run_hash="5" * 64,
+        hypothesis=DimensionName.ENCODER,
+        required_nodes=("TextEncodeQwen", "SaveImage"),
+    )
+    correction = {
+        "schema_version": 1,
+        "failure_signature": signature,
+        "failed_variant_id": failed.variant_id,
+        "failed_exact_run_hash": failed.exact_run_hash,
+        "failed_capability_hash": failed.capability_hash,
+        "candidate_variant_id": "corrected-encoder",
+        "changed_dimensions": [DimensionName.ENCODER.value],
+        "rationale": "replace the unavailable encoder",
+    }
+    uncorrected = _variant(
+        "corrected-encoder",
+        capability_hash="9" * 64,
+        exact_run_hash="0" * 64,
+        hypothesis=DimensionName.ENCODER,
+        required_nodes=("CLIPTextEncode", "SaveImage"),
+    )
+    draft = _variant(
+        "corrected-encoder",
+        capability_hash="9" * 64,
+        exact_run_hash="0" * 64,
+        hypothesis=DimensionName.ENCODER,
+        required_nodes=("CLIPTextEncode", "SaveImage"),
+        correction=correction,
+    )
+    corrected = draft.model_copy(
+        update={"exact_run_hash": recompute_exact_run_hash(draft)}
+    )
+    history = ExperimentHistory()
+    history.record_failure(failed, signature=signature, run_id="run-a")
+    history.record_failure(failed, signature=signature, run_id="run-b")
+
+    decision = next_wave(
+        _plan(corrected, coverage=(DimensionName.ENCODER,)),
+        history,
+    )
+
+    assert [item.variant_id for item in decision.variants] == ["corrected-encoder"]
+    assert recompute_exact_run_hash(uncorrected) != corrected.exact_run_hash
+    assert _plan(uncorrected).plan_hash != _plan(corrected).plan_hash
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("__record__", {}),
+        ("candidate_variant_id", "different-candidate"),
+        ("failed_exact_run_hash", "f" * 64),
+        ("failed_capability_hash", "e" * 64),
+        ("changed_dimensions", []),
+    ],
+)
+def test_invalid_correction_identity_or_dimensions_cannot_select_candidate(
+    field: str,
+    value: object,
+) -> None:
+    signature = "missing-node:TextEncodeQwen"
+    failed = _variant(
+        "failed-encoder",
+        capability_hash="8" * 64,
+        exact_run_hash="5" * 64,
+        hypothesis=DimensionName.ENCODER,
+        required_nodes=("TextEncodeQwen", "SaveImage"),
+    )
+    correction: dict[str, object] = {
+        "schema_version": 1,
+        "failure_signature": signature,
+        "failed_variant_id": failed.variant_id,
+        "failed_exact_run_hash": failed.exact_run_hash,
+        "failed_capability_hash": failed.capability_hash,
+        "candidate_variant_id": "candidate",
+        "changed_dimensions": [DimensionName.ENCODER.value],
+    }
+    if field == "__record__":
+        assert isinstance(value, dict)
+        correction = {str(key): item for key, item in value.items()}
+    else:
+        correction[field] = value
+    candidate = _variant(
+        "candidate",
+        capability_hash="9" * 64,
+        exact_run_hash="6" * 64,
+        hypothesis=DimensionName.ENCODER,
+        required_nodes=("CLIPTextEncode", "SaveImage"),
+        correction=correction,
+    )
+    history = ExperimentHistory()
+    history.record_failure(failed, signature=signature, run_id="run-a")
+    history.record_failure(failed, signature=signature, run_id="run-b")
+
+    decision = next_wave(
+        _plan(candidate, coverage=(DimensionName.ENCODER,)),
+        history,
+    )
+
+    assert decision.variants == ()
+
+
+def test_missing_node_correction_cannot_keep_failed_requirement() -> None:
+    signature = "missing-node:TextEncodeQwen"
+    failed = _variant(
+        "failed-encoder",
+        capability_hash="8" * 64,
+        exact_run_hash="5" * 64,
+        hypothesis=DimensionName.ENCODER,
+        required_nodes=("TextEncodeQwen", "SaveImage"),
+    )
+    candidate = _variant(
+        "candidate",
+        capability_hash="9" * 64,
+        exact_run_hash="6" * 64,
+        hypothesis=DimensionName.ENCODER,
+        required_nodes=("TextEncodeQwen", "SaveImage"),
+        correction={
+            "schema_version": 1,
+            "failure_signature": signature,
+            "failed_variant_id": failed.variant_id,
+            "failed_exact_run_hash": failed.exact_run_hash,
+            "failed_capability_hash": failed.capability_hash,
+            "candidate_variant_id": "candidate",
+            "changed_dimensions": [DimensionName.ENCODER.value],
+        },
+    )
+    history = ExperimentHistory()
+    history.record_failure(failed, signature=signature, run_id="run-a")
+    history.record_failure(failed, signature=signature, run_id="run-b")
+
+    decision = next_wave(
+        _plan(candidate, coverage=(DimensionName.ENCODER,)),
+        history,
+    )
+
+    assert decision.variants == ()
+
+
+def test_correction_outside_plan_dimensions_cannot_select_candidate() -> None:
+    signature = "missing-node:TextEncodeQwen"
+    failed = _variant(
+        "failed-encoder",
+        capability_hash="8" * 64,
+        exact_run_hash="5" * 64,
+        hypothesis=DimensionName.ENCODER,
+        required_nodes=("TextEncodeQwen", "SaveImage"),
+    )
+    candidate = _variant(
+        "candidate",
+        capability_hash="9" * 64,
+        exact_run_hash="6" * 64,
+        hypothesis=DimensionName.ENCODER,
+        required_nodes=("CLIPTextEncode", "SaveImage"),
+        correction={
+            "schema_version": 1,
+            "failure_signature": signature,
+            "failed_variant_id": failed.variant_id,
+            "failed_exact_run_hash": failed.exact_run_hash,
+            "failed_capability_hash": failed.capability_hash,
+            "candidate_variant_id": "candidate",
+            "changed_dimensions": [
+                DimensionName.ENCODER.value,
+                DimensionName.SAMPLER.value,
+            ],
+        },
+    )
+    history = ExperimentHistory()
+    history.record_failure(failed, signature=signature, run_id="run-a")
+    history.record_failure(failed, signature=signature, run_id="run-b")
+
+    decision = next_wave(
+        _plan(candidate, coverage=(DimensionName.ENCODER,)),
+        history,
+    )
+
+    assert decision.variants == ()
+
+
+def test_correction_must_change_failed_exact_and_capability_fingerprints() -> None:
+    signature = "provider-failed:unsupported configuration"
+    failed = _variant(
+        "failed-baseline",
+        capability_hash="8" * 64,
+        exact_run_hash="5" * 64,
+    )
+    no_op = _variant(
+        "candidate",
+        capability_hash=failed.capability_hash,
+        exact_run_hash=failed.exact_run_hash,
+        correction={
+            "schema_version": 1,
+            "failure_signature": signature,
+            "failed_variant_id": failed.variant_id,
+            "failed_exact_run_hash": failed.exact_run_hash,
+            "failed_capability_hash": failed.capability_hash,
+            "candidate_variant_id": "candidate",
+            "changed_dimensions": [DimensionName.CHECKPOINT.value],
+        },
+    )
+    history = ExperimentHistory()
+    history.record_failure(failed, signature=signature, run_id="run-a")
+    history.record_failure(failed, signature=signature, run_id="run-b")
+
+    decision = next_wave(_plan(no_op), history)
+
+    assert decision.variants == ()
 
 
 def test_exact_repeat_requires_recorded_rerun_reason_and_links_original_hash() -> None:

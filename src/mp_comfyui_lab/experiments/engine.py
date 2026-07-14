@@ -47,6 +47,7 @@ from .saturation import (
     ExperimentHistory,
     RerunRequest,
     WaveArtifact,
+    has_unapproved_correction_dimensions,
     next_wave,
     request_rerun,
 )
@@ -337,10 +338,12 @@ class ExperimentEngine:
                 approved_plan_hash,
             )
             completed_waves = self._load_completed_waves(experiment_id)
+            recovered_records = self._recover_wave_runs(experiment_id, plan)
             if (
                 completed_waves
                 and completed_waves[-1].plan_hash == plan.plan_hash
                 and completed_waves[-1].saturation_reason is not None
+                and not recovered_records
             ):
                 return completed_waves[-1]
 
@@ -355,6 +358,15 @@ class ExperimentEngine:
                 )
                 for variant in decision.variants
             )
+            pending_run_ids = tuple(
+                run_id
+                for variant_id in decision.pending_variant_ids
+                for variant in plan.variants
+                if variant.variant_id == variant_id
+                for run_id in history.pending_run_ids(variant.exact_run_hash)
+            )
+            if bool(pending_run_ids) != bool(decision.pending_variant_ids):
+                raise SafetyError("pending wave runs do not match pending variants")
             ordinal = completed_waves[-1].ordinal + 1 if completed_waves else 1
             refreshed_history = self._load_history(experiment_id, plan)
             self._load_equivalent_groups(experiment_id, refreshed_history)
@@ -365,14 +377,21 @@ class ExperimentEngine:
                 selected_variant_ids=tuple(
                     item.variant_id for item in decision.variants
                 ),
+                pending_variant_ids=decision.pending_variant_ids,
                 skips=dict(decision.reasons),
                 candidate_evidence={
                     variant_id: dict(evidence)
                     for variant_id, evidence in decision.evidence.items()
                 },
                 run_ids=tuple(record.run_id for record in records),
+                pending_run_ids=pending_run_ids,
                 objective_evidence=self._wave_objective_evidence(
-                    records,
+                    tuple(
+                        {
+                            record.run_id: record
+                            for record in (*recovered_records, *records)
+                        }.values()
+                    ),
                     refreshed_history,
                 ),
                 saturation_reason=decision.saturation_reason,
@@ -385,6 +404,15 @@ class ExperimentEngine:
             return artifact
 
     def resume(self, experiment_id: str, run_id: str) -> RunRecord:
+        return self._resume(experiment_id, run_id, return_when_active=False)
+
+    def _resume(
+        self,
+        experiment_id: str,
+        run_id: str,
+        *,
+        return_when_active: bool,
+    ) -> RunRecord:
         record = self._load_run(experiment_id, run_id)
         if record.state in {
             RunState.SUCCESS,
@@ -422,7 +450,33 @@ class ExperimentEngine:
                 return self._persist(record)
             if record.provider_task_id is None:
                 raise SafetyError("resumable run has no durable provider task ID")
-            return self._poll_current(record, self._executor_factory())
+            return self._poll_current(
+                record,
+                self._executor_factory(),
+                return_when_active=return_when_active,
+            )
+
+    def _recover_wave_runs(
+        self,
+        experiment_id: str,
+        plan: ExperimentPlan,
+    ) -> tuple[RunRecord, ...]:
+        exact_run_hashes = {variant.exact_run_hash for variant in plan.variants}
+        recovered: list[RunRecord] = []
+        for record in self._load_run_records(experiment_id):
+            if (
+                record.state in {RunState.SUBMITTED, RunState.RUNNING}
+                and record.provider_task_id is not None
+                and record.exact_run_hash in exact_run_hashes
+            ):
+                recovered.append(
+                    self._resume(
+                        experiment_id,
+                        record.run_id,
+                        return_when_active=True,
+                    )
+                )
+        return tuple(recovered)
 
     def reconcile(
         self,
@@ -522,6 +576,11 @@ class ExperimentEngine:
                 "plan contains a hypothesis outside approved dimensions; "
                 "create and approve the revised plan hash"
             )
+        if has_unapproved_correction_dimensions(plan):
+            raise ApprovalError(
+                "plan contains a correction outside approved dimensions; "
+                "create and approve the revised plan hash"
+            )
         return plan
 
     def _load_completed_waves(
@@ -574,15 +633,36 @@ class ExperimentEngine:
             (variant.variant_id, variant.exact_run_hash): variant
             for variant in plan.variants
         }
+        variants_by_exact_hash: dict[str, list[PlannedVariant]] = {}
+        for variant in plan.variants:
+            variants_by_exact_hash.setdefault(
+                variant.exact_run_hash,
+                [],
+            ).append(variant)
         output_groups: dict[tuple[tuple[object, ...], ...], set[str]] = {}
 
         for record in self._load_run_records(experiment_id):
+            variant = variants.get((record.variant_id, record.exact_run_hash))
+            if (
+                record.state in {RunState.SUBMITTED, RunState.RUNNING}
+                and record.provider_task_id is not None
+            ):
+                if record.exact_run_hash is not None:
+                    history.record_pending_exact(
+                        record.exact_run_hash,
+                        run_id=record.run_id,
+                    )
+                    for current_variant in variants_by_exact_hash.get(
+                        record.exact_run_hash,
+                        [],
+                    ):
+                        history.record_pending_capability(current_variant)
+                continue
             if record.exact_run_hash is not None:
                 history.record_exact_run(
                     record.exact_run_hash,
                     run_id=record.run_id,
                 )
-            variant = variants.get((record.variant_id, record.exact_run_hash))
             if variant is None:
                 continue
             if record.state is RunState.SUCCESS:
@@ -854,7 +934,13 @@ class ExperimentEngine:
             raise SafetyError("run artifact identity does not match its path")
         return record
 
-    def _poll_current(self, record: RunRecord, executor: Any) -> RunRecord:
+    def _poll_current(
+        self,
+        record: RunRecord,
+        executor: Any,
+        *,
+        return_when_active: bool = False,
+    ) -> RunRecord:
         task_id = record.provider_task_id
         if task_id is None:
             raise SafetyError("poll requires a durable provider task ID")
@@ -866,8 +952,22 @@ class ExperimentEngine:
                     lambda: executor.poll(task_id),
                 )
             except _RetryExhausted as error:
+                if return_when_active:
+                    return error.record
                 return self._retry_incomplete(error)
             except ExecutorError as error:
+                if return_when_active:
+                    current = self._load_run(
+                        record.experiment_id,
+                        record.run_id,
+                    )
+                    return self._retain_active_poll_diagnostic(
+                        current,
+                        {
+                            "kind": "poll_error",
+                            "diagnostic": sanitize_untrusted_diagnostic(str(error)),
+                        },
+                    )
                 completed_at = self._now()
                 record = record.transition(
                     RunState.INCOMPLETE,
@@ -918,6 +1018,8 @@ class ExperimentEngine:
                 values["updated_at"] = observed_at
                 record = RunRecord.model_validate(values)
                 self._persist(record)
+                if return_when_active:
+                    return record
                 self._sleep(_POLL_INTERVAL_SECONDS)
                 continue
             if poll.state is ProviderTaskState.RUNNING:
@@ -928,6 +1030,8 @@ class ExperimentEngine:
                         updated_at=observed_at,
                     )
                     self._persist(record)
+                if return_when_active:
+                    return record
                 self._sleep(_POLL_INTERVAL_SECONDS)
                 continue
             if poll.state is ProviderTaskState.CANCELLED:
@@ -958,6 +1062,14 @@ class ExperimentEngine:
                 return self._persist(record)
             if poll.state is ProviderTaskState.SUCCESS:
                 return self._collect_success(record, executor)
+            if return_when_active:
+                return self._retain_active_poll_diagnostic(
+                    record,
+                    {
+                        "kind": "unknown_provider_state",
+                        "diagnostic": poll.diagnostic,
+                    },
+                )
             record = record.transition(
                 RunState.INCOMPLETE,
                 error=sanitize_for_persistence(
@@ -970,6 +1082,19 @@ class ExperimentEngine:
                 updated_at=observed_at,
             )
             return self._persist(record)
+
+    def _retain_active_poll_diagnostic(
+        self,
+        record: RunRecord,
+        diagnostic: Mapping[str, Any],
+    ) -> RunRecord:
+        values = record.model_dump(mode="python")
+        values["diagnostics"] = (
+            *record.diagnostics,
+            sanitize_for_persistence(diagnostic),
+        )
+        values["updated_at"] = self._now()
+        return self._persist(RunRecord.model_validate(values))
 
     def _retry_idempotent(
         self,
