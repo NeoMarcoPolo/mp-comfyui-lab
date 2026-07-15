@@ -165,6 +165,44 @@ def test_next_wave_selects_strongest_representative_per_novel_capability() -> No
     )
 
 
+def test_next_wave_accepts_more_than_512_variants_and_dedupes_deterministically() -> None:
+    variants = tuple(
+        _variant(
+            f"variant-{index:04d}",
+            capability_hash=_hash(
+                ["capability", 0 if index == 2 else index]
+            ),
+            exact_run_hash=_hash(["exact", 0 if index == 1 else index]),
+        )
+        for index in range(513)
+    )
+    plan = _plan(*variants)
+    history = ExperimentHistory()
+    history.record_success(variants[0], run_id="run-existing")
+
+    first = next_wave(plan, history)
+    repeated = next_wave(plan, history)
+
+    assert len(plan.variants) == 513
+    assert len(first.variants) == 510
+    assert first.reasons["variant-0000"] == "exact_run_already_recorded"
+    assert first.reasons["variant-0001"] == "exact_run_already_recorded"
+    assert first.reasons["variant-0002"] == "dominated_by_tested_capability"
+    assert [item.variant_id for item in repeated.variants] == [
+        item.variant_id for item in first.variants
+    ]
+    assert dict(repeated.reasons) == dict(first.reasons)
+
+    for index, variant in enumerate(first.variants):
+        history.record_success(variant, run_id=f"run-{index:04d}")
+    saturated = next_wave(plan, history)
+
+    assert saturated.variants == ()
+    assert saturated.saturation_reason == (
+        "no_approved_non_dominated_novel_capability_signature_remains"
+    )
+
+
 def test_candidate_evidence_breaks_ties_by_provenance_then_engagement() -> None:
     popular = _variant(
         "popular",

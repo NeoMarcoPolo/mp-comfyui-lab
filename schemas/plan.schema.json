@@ -343,7 +343,6 @@
       "items": {
         "$ref": "#/$defs/PlannedVariant"
       },
-      "maxItems": 512,
       "minItems": 1,
       "title": "Variants",
       "type": "array"

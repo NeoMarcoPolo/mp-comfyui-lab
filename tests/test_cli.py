@@ -6,10 +6,10 @@ import subprocess
 import sys
 
 import mp_comfyui_lab
-from mp_runninghub_api.errors import RunningHubApiError
 import pytest
 
 from mp_comfyui_lab.cli import app
+from mp_comfyui_lab.executors.runninghub_transport import RunningHubApiError
 from mp_comfyui_lab.cli.app import ExitCode, ReadOnlyPlanningBundleLoader, main
 from mp_comfyui_lab.discovery.query import expand_query
 from mp_comfyui_lab.discovery.ranking import (
@@ -48,6 +48,7 @@ from mp_comfyui_lab.experiments.models import (
     SourceBundle,
 )
 from mp_comfyui_lab.experiments.planning import recompute_exact_run_hash
+from mp_comfyui_lab.experiments.saturation import WaveArtifact
 from mp_comfyui_lab.experiments.store import ExperimentStore
 from mp_comfyui_lab.security import SafetyError, sanitize_for_persistence
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
@@ -121,23 +122,33 @@ def test_unknown_command_preserves_argparse_diagnostic(capsys):
 class FakeExperimentEngine:
     def __init__(
         self,
-        record: RunRecord,
+        record: RunRecord | None = None,
         *,
+        wave: WaveArtifact | None = None,
         comparison_path: Path | None = None,
         finalists_path: Path | None = None,
         run_artifact_path: Path | None = None,
+        wave_artifact_path: Path | None = None,
     ) -> None:
         self.record = record
+        self.wave = wave
         self.calls: list[tuple] = []
         self.comparison_path = comparison_path
         self.finalists_path = finalists_path
         self.run_path = run_artifact_path
+        self.wave_path = wave_artifact_path
 
     def run(self, experiment_id, variant_id, *, approved_plan_hash):
         self.calls.append(
             ("run", experiment_id, variant_id, approved_plan_hash)
         )
         return self.record
+
+    def run_wave(self, experiment_id, *, approved_plan_hash):
+        self.calls.append(("run_wave", experiment_id, approved_plan_hash))
+        if self.wave is None:
+            raise AssertionError("test fake has no wave result")
+        return self.wave
 
     def rerun(
         self,
@@ -186,24 +197,72 @@ class FakeExperimentEngine:
             return self.run_path
         return (Path.cwd() / "runs" / f"{run_id}.json").resolve()
 
+    def wave_artifact_path(self, experiment_id, ordinal):
+        self.calls.append(("wave_artifact_path", experiment_id, ordinal))
+        if self.wave_path is not None:
+            return self.wave_path
+        return (Path.cwd() / "plans" / "waves" / f"{ordinal}.json").resolve()
 
-def test_run_cli_requires_and_passes_exact_plan_approval(capsys):
-    record = RunRecord(
-        run_id="run-cli",
-        experiment_id="plan-approved",
-        variant_id="baseline",
-        state=RunState.SUCCESS,
-        provider_task_id="provider-task-1",
-        expected_output_count=1,
-        actual_output_count=1,
+
+def _wave(
+    *,
+    run_state: RunState = RunState.SUCCESS,
+    saturation_reason: str | None = None,
+    pending: bool = False,
+) -> WaveArtifact:
+    selected_variant_ids = () if saturation_reason is not None or pending else ("strong",)
+    run_ids = () if saturation_reason is not None or pending else ("run-cli",)
+    pending_variant_ids = ("strong",) if pending else ()
+    pending_run_ids = ("run-pending",) if pending else ()
+    return WaveArtifact(
+        ordinal=2 if saturation_reason is not None else 1,
+        plan_hash="a" * 64,
+        considered_variant_ids=("strong", "weak"),
+        selected_variant_ids=selected_variant_ids,
+        pending_variant_ids=pending_variant_ids,
+        skips={
+            "strong": "exact_run_pending",
+            "weak": "capability_run_pending",
+        }
+        if pending
+        else (
+            {"strong": "exact_run_already_recorded", "weak": "dominated"}
+            if saturation_reason is not None
+            else {"weak": "weaker_representative_of_novel_capability"}
+        ),
+        candidate_evidence={
+            "strong": {"confidence": 3},
+            "weak": {"confidence": 1},
+        },
+        run_ids=run_ids,
+        pending_run_ids=pending_run_ids,
+        objective_evidence={
+            "run_states": (
+                {"strong": run_state.value}
+                if selected_variant_ids
+                else ({"strong": "RUNNING"} if pending else {})
+            ),
+            "output_complete": {
+                "strong": run_state is RunState.SUCCESS
+            }
+            if selected_variant_ids
+            else {},
+        },
+        saturation_reason=saturation_reason,
     )
-    engine = FakeExperimentEngine(record)
+
+
+def test_run_cli_executes_capability_wave_and_emits_stable_payload(
+    tmp_path: Path,
+    capsys,
+):
+    wave_path = (tmp_path / "experiments" / "plan-approved" / "plans" / "waves" / "1.json").resolve()
+    engine = FakeExperimentEngine(wave=_wave(), wave_artifact_path=wave_path)
 
     code = main(
         [
             "run",
             "plan-approved",
-            "baseline",
             "--approve-plan-hash",
             "a" * 64,
         ],
@@ -213,13 +272,33 @@ def test_run_cli_requires_and_passes_exact_plan_approval(capsys):
     payload = _single_json_document(capsys.readouterr())
     assert code == ExitCode.OK
     assert engine.calls == [
-        ("run", "plan-approved", "baseline", "a" * 64),
+        ("run_wave", "plan-approved", "a" * 64),
+        ("wave_artifact_path", "plan-approved", 1),
         ("review_artifact_paths", "plan-approved"),
     ]
     assert payload["command"] == "run"
-    assert payload["data"]["run_id"] == "run-cli"
-    assert payload["data"]["state"] == "SUCCESS"
-    assert payload["data"]["provider_task_id"] == "provider-task-1"
+    assert payload["data"] == {
+        "ordinal": 1,
+        "plan_hash": "a" * 64,
+        "considered_variant_ids": ["strong", "weak"],
+        "selected_variant_ids": ["strong"],
+        "pending_variant_ids": [],
+        "skipped_variant_ids": ["weak"],
+        "skip_reasons": {
+            "weak": "weaker_representative_of_novel_capability"
+        },
+        "run_ids": ["run-cli"],
+        "pending_run_ids": [],
+        "objective_evidence": {
+            "run_states": {"strong": "SUCCESS"},
+            "output_complete": {"strong": True},
+        },
+        "saturation_reason": None,
+        "wave_artifact_path": str(wave_path),
+    }
+    assert payload["artifacts"] == [
+        {"kind": "wave", "path": str(wave_path)}
+    ]
 
 
 def test_run_cli_retains_falsey_injected_engine(capsys, monkeypatch):
@@ -227,16 +306,7 @@ def test_run_cli_retains_falsey_injected_engine(capsys, monkeypatch):
         def __bool__(self) -> bool:
             return False
 
-    record = RunRecord(
-        run_id="run-falsey-engine",
-        experiment_id="plan-approved",
-        variant_id="baseline",
-        state=RunState.SUCCESS,
-        provider_task_id="provider-task-falsey",
-        expected_output_count=1,
-        actual_output_count=1,
-    )
-    engine = FalseyExperimentEngine(record)
+    engine = FalseyExperimentEngine(wave=_wave())
     monkeypatch.setattr(
         app,
         "_make_experiment_engine",
@@ -249,7 +319,6 @@ def test_run_cli_retains_falsey_injected_engine(capsys, monkeypatch):
         [
             "run",
             "plan-approved",
-            "baseline",
             "--approve-plan-hash",
             "a" * 64,
         ],
@@ -258,23 +327,49 @@ def test_run_cli_retains_falsey_injected_engine(capsys, monkeypatch):
 
     payload = _single_json_document(capsys.readouterr())
     assert code == ExitCode.OK
-    assert payload["data"]["run_id"] == "run-falsey-engine"
+    assert payload["data"]["run_ids"] == ["run-cli"]
     assert engine.calls[0] == (
-        "run",
+        "run_wave",
         "plan-approved",
-        "baseline",
         "a" * 64,
     )
 
 
 def test_run_cli_rejects_missing_explicit_approval_hash(capsys):
-    code = main(["run", "plan-approved", "baseline"])
+    code = main(["run", "plan-approved"])
 
     payload = _single_json_document(capsys.readouterr())
     assert code == ExitCode.USAGE
     assert payload["command"] == "run"
     assert payload["error"]["kind"] == "usage"
     assert "--approve-plan-hash" in payload["error"]["message"]
+
+
+def test_run_cli_rejects_positional_first_run_variant(capsys):
+    code = main(
+        [
+            "run",
+            "plan-approved",
+            "baseline",
+            "--approve-plan-hash",
+            "a" * 64,
+        ]
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.USAGE
+    assert payload["error"]["kind"] == "usage"
+    assert "unrecognized arguments: baseline" in payload["error"]["message"]
+
+
+def test_run_help_describes_wave_and_explicit_rerun_forms(capsys):
+    code = main(["run", "--help"])
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.OK
+    help_text = payload["data"]["text"]
+    assert "EXPERIMENT_ID [--rerun VARIANT_ID --reason TEXT]" in help_text
+    assert "EXPERIMENT_ID [VARIANT_ID" not in help_text
 
 
 def test_run_cli_rerun_requires_reason_and_wires_original_variant(capsys):
@@ -373,22 +468,16 @@ def test_run_cli_preserves_ambiguous_incomplete_recovery_without_review(
     tmp_path: Path,
     capsys,
 ) -> None:
-    run_path = (tmp_path / "store" / "runs" / "run-ambiguous.json").resolve()
-    record = RunRecord(
-        run_id="run-ambiguous",
-        experiment_id="plan-approved",
-        variant_id="baseline",
-        state=RunState.INCOMPLETE,
-        expected_output_count=1,
-        error={"kind": "ambiguous_submission"},
+    wave_path = (tmp_path / "store" / "plans" / "waves" / "1.json").resolve()
+    engine = FakeExperimentEngine(
+        wave=_wave(run_state=RunState.INCOMPLETE),
+        wave_artifact_path=wave_path,
     )
-    engine = FakeExperimentEngine(record, run_artifact_path=run_path)
 
     code = main(
         [
             "run",
             "plan-approved",
-            "baseline",
             "--approve-plan-hash",
             "a" * 64,
         ],
@@ -398,15 +487,17 @@ def test_run_cli_preserves_ambiguous_incomplete_recovery_without_review(
     payload = _single_json_document(capsys.readouterr())
     assert code == ExitCode.INCOMPLETE
     assert engine.calls == [
-        ("run", "plan-approved", "baseline", "a" * 64),
+        ("run_wave", "plan-approved", "a" * 64),
+        ("wave_artifact_path", "plan-approved", 1),
+        ("review_artifact_paths", "plan-approved"),
     ]
-    assert payload["data"]["run_id"] == "run-ambiguous"
-    assert payload["data"]["state"] == "INCOMPLETE"
-    assert payload["data"]["provider_task_id"] is None
-    assert payload["data"]["recovery_disposition"] == "reconcile_submission"
+    assert payload["data"]["run_ids"] == ["run-cli"]
+    assert payload["data"]["objective_evidence"]["run_states"] == {
+        "strong": "INCOMPLETE"
+    }
     assert "comparison_path" not in payload["data"]
     assert "finalists_path" not in payload["data"]
-    assert payload["artifacts"] == [{"kind": "run", "path": str(run_path)}]
+    assert payload["artifacts"] == [{"kind": "wave", "path": str(wave_path)}]
 
 
 def test_resume_cli_preserves_pending_provider_recovery_without_review(
@@ -447,30 +538,18 @@ def test_run_cli_returns_absolute_comparison_and_finalist_paths(
 ) -> None:
     comparison_path = (tmp_path / "facts.json").resolve()
     finalists_path = (tmp_path / "finalists.json").resolve()
-    run_artifact_path = (
-        tmp_path / "actual-store" / "plan-approved" / "runs" / "run-review-paths.json"
-    ).resolve()
-    record = RunRecord(
-        run_id="run-review-paths",
-        experiment_id="plan-approved",
-        variant_id="baseline",
-        state=RunState.SUCCESS,
-        provider_task_id="provider-task-paths",
-        expected_output_count=1,
-        actual_output_count=1,
-    )
+    wave_path = (tmp_path / "actual-store" / "plan-approved" / "plans" / "waves" / "1.json").resolve()
     engine = FakeExperimentEngine(
-        record,
+        wave=_wave(),
         comparison_path=comparison_path,
         finalists_path=finalists_path,
-        run_artifact_path=run_artifact_path,
+        wave_artifact_path=wave_path,
     )
 
     code = main(
         [
             "run",
             "plan-approved",
-            "baseline",
             "--approve-plan-hash",
             "a" * 64,
         ],
@@ -486,8 +565,8 @@ def test_run_cli_returns_absolute_comparison_and_finalist_paths(
         {"kind": "finalists", "path": str(finalists_path)},
     ]
     assert payload["artifacts"][0] == {
-        "kind": "run",
-        "path": str(run_artifact_path),
+        "kind": "wave",
+        "path": str(wave_path),
     }
 
 
@@ -838,6 +917,8 @@ def test_production_downloader_enforces_maximum_stream_bytes(
 @pytest.mark.parametrize(
     ("state", "expected_code"),
     [
+        (RunState.SUBMITTED, ExitCode.INCOMPLETE),
+        (RunState.RUNNING, ExitCode.INCOMPLETE),
         (RunState.INCOMPLETE, ExitCode.INCOMPLETE),
         (RunState.FAILED, ExitCode.EXECUTION),
         (RunState.CANCELLED, ExitCode.EXECUTION),
@@ -848,26 +929,12 @@ def test_execution_cli_maps_durable_state_to_exit_code(
     expected_code,
     capsys,
 ):
-    record = RunRecord(
-        run_id="run-cli-state",
-        experiment_id="plan-approved",
-        variant_id="baseline",
-        state=state,
-        provider_task_id=(
-            "provider-task-1"
-            if state in {RunState.CANCELLED}
-            else None
-        ),
-        expected_output_count=1,
-        error={"kind": "state_result"},
-    )
-    engine = FakeExperimentEngine(record)
+    engine = FakeExperimentEngine(wave=_wave(run_state=state))
 
     code = main(
         [
             "run",
             "plan-approved",
-            "baseline",
             "--approve-plan-hash",
             "a" * 64,
         ],
@@ -876,7 +943,32 @@ def test_execution_cli_maps_durable_state_to_exit_code(
 
     payload = _single_json_document(capsys.readouterr())
     assert code == expected_code
-    assert payload["data"]["state"] == state.value
+    assert payload["data"]["objective_evidence"]["run_states"] == {
+        "strong": state.value
+    }
+
+
+def test_saturated_noop_wave_is_success_and_returns_existing_artifact(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    wave_path = (tmp_path / "plans" / "waves" / "2.json").resolve()
+    engine = FakeExperimentEngine(
+        wave=_wave(saturation_reason="no_novel_capability"),
+        wave_artifact_path=wave_path,
+    )
+
+    code = main(
+        ["run", "plan-approved", "--approve-plan-hash", "a" * 64],
+        experiment_engine=engine,
+    )
+
+    payload = _single_json_document(capsys.readouterr())
+    assert code == ExitCode.OK
+    assert payload["data"]["ordinal"] == 2
+    assert payload["data"]["selected_variant_ids"] == []
+    assert payload["data"]["saturation_reason"] == "no_novel_capability"
+    assert payload["data"]["wave_artifact_path"] == str(wave_path)
 
 
 def test_root_unknown_option_does_not_become_command(capsys):
@@ -1379,7 +1471,22 @@ def test_default_read_only_planning_loader_uses_only_public_discovery_methods():
 
 def test_plan_main_constructs_only_read_only_default_executor(tmp_path, capsys, monkeypatch):
     graph = json.loads((Path(__file__).parent / "fixtures" / "runninghub" / "qwen_graph.json").read_text(encoding="utf-8"))
-    graph[next(iter(graph))]["inputs"]["signed_input"] = "https://cdn.example/input.png?token=secret&revision=1"
+    source_inputs = graph[next(iter(graph))]["inputs"]
+    source_inputs["signed_input"] = "https://cdn.example/input.png?token=secret&revision=1"
+    source_inputs.update(
+        {
+            "openai_api_key": "planning-openai-secret",
+            "aws_secret_access_key": "planning-aws-secret",
+            "hf_token": "planning-hf-secret",
+            "token_count": 12,
+            "max_tokens": 256,
+            "tokenizer": "qwen-tokenizer",
+            "token_type": "embedding",
+            "secret_style": "garden",
+            "model_name": "qwen",
+            "prompt": "A secret garden",
+        }
+    )
     executor = ReadOnlyExecutor(graph)
     monkeypatch.setattr(app, "RunningHubExecutor", lambda: executor)
     manifest = tmp_path / "plan.yaml"
@@ -1401,8 +1508,39 @@ dimensions:
     assert set(call[0] for call in executor.calls) == {"search", "fetch_workflow", "inspect_capabilities"}
     paths = [Path(item["path"]) for item in document["artifacts"]]
     source_snapshot = json.loads(next(path for path in paths if path.name == "source-bundle.json").read_text(encoding="utf-8"))
-    assert "token=secret" not in json.dumps(source_snapshot)
+    serialized_source = json.dumps(source_snapshot, sort_keys=True)
+    for secret in (
+        "token=secret",
+        "planning-openai-secret",
+        "planning-aws-secret",
+        "planning-hf-secret",
+    ):
+        assert secret not in serialized_source
     persisted_source = source_snapshot["sources"][0]
+    persisted_inputs = persisted_source["raw_graph"][next(iter(graph))]["inputs"]
+    assert persisted_inputs["openai_api_key"] == "[REDACTED]"
+    assert persisted_inputs["aws_secret_access_key"] == "[REDACTED]"
+    assert persisted_inputs["hf_token"] == "[REDACTED]"
+    assert {
+        key: persisted_inputs[key]
+        for key in (
+            "token_count",
+            "max_tokens",
+            "tokenizer",
+            "token_type",
+            "secret_style",
+            "model_name",
+            "prompt",
+        )
+    } == {
+        "token_count": 12,
+        "max_tokens": 256,
+        "tokenizer": "qwen-tokenizer",
+        "token_type": "embedding",
+        "secret_style": "garden",
+        "model_name": "qwen",
+        "prompt": "A secret garden",
+    }
     assert source_graph_hash(persisted_source["raw_graph"]) == persisted_source["source_hash"]
     assert capability_hash(persisted_source["raw_graph"]) == persisted_source["capability_hash"]
     plan_path = next(path for path in paths if path.parent.name == "plans")

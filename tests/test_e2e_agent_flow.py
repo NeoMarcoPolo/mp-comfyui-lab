@@ -48,6 +48,18 @@ def test_noninteractive_agent_flow_reaches_self_contained_handoff(
             / "qwen_graph.json"
         ).read_text(encoding="utf-8")
     )
+    graph_inputs = graph[next(iter(graph))]["inputs"]
+    graph_inputs.update(
+        {
+            "openai_api_key": "e2e-openai-secret",
+            "aws_secret_access_key": "e2e-aws-secret",
+            "hf_token": "e2e-hf-secret",
+            "token_count": 9,
+            "tokenizer": "qwen-tokenizer",
+            "secret_style": "garden",
+            "prompt": "A secret garden",
+        }
+    )
     candidate = WorkflowCandidate(
         executor="fake",
         workflow_id=WORKFLOW_ID,
@@ -133,7 +145,6 @@ dimensions:
         [
             "run",
             experiment_id,
-            variant_id,
             "--approve-plan-hash",
             plan_hash,
         ],
@@ -172,3 +183,25 @@ dimensions:
     assert bundle.is_absolute()
     assert bundle.is_dir()
     assert (bundle / "handoff.json").is_file()
+    serialized_bundle = b"\n".join(
+        path.read_bytes()
+        for path in sorted(bundle.rglob("*"))
+        if path.is_file()
+    )
+    for secret in (
+        b"e2e-openai-secret",
+        b"e2e-aws-secret",
+        b"e2e-hf-secret",
+    ):
+        assert secret not in serialized_bundle
+    selected_graph = json.loads(
+        (bundle / "selected-workflow-api.json").read_text(encoding="utf-8")
+    )
+    selected_inputs = selected_graph[next(iter(graph))]["inputs"]
+    assert selected_inputs["openai_api_key"] == "[REDACTED]"
+    assert selected_inputs["aws_secret_access_key"] == "[REDACTED]"
+    assert selected_inputs["hf_token"] == "[REDACTED]"
+    assert selected_inputs["token_count"] == 9
+    assert selected_inputs["tokenizer"] == "qwen-tokenizer"
+    assert selected_inputs["secret_style"] == "garden"
+    assert selected_inputs["prompt"] == "A secret garden"

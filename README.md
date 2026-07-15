@@ -18,6 +18,26 @@ $Lab = ".\.venv\Scripts\mp-comfy-lab.exe"
 & $Lab version
 ```
 
+The base package is also installable directly from a source checkout with
+`python -m pip install .`. Its runtime dependencies all come from the public
+Python package index; no sibling repository or private RunningHub SDK is
+required.
+
+Authenticated RunningHub graph and execution operations resolve credentials in
+this order: `RUNNINGHUB_API_KEY`, an explicitly selected local JSON file in
+`RUNNINGHUB_CONFIG_PATH`, then `mp_keys` compatibility when that package happens
+to be installed. The JSON file must contain an `apiKey` string. Keep either
+credential source outside version control; the lab never writes API keys into
+configuration, graphs, run records, or export bundles.
+
+```powershell
+$env:RUNNINGHUB_API_KEY = Read-Host "RunningHub API key"
+# Or: $env:RUNNINGHUB_CONFIG_PATH = "Z:/local-secrets/runninghub.json"
+```
+
+When no credential source is available, authenticated operations fail locally
+with a configuration error before an upload or submission.
+
 `config.local.yaml` holds local paths only and is Git-ignored. A minimal
 configuration is:
 
@@ -95,7 +115,6 @@ sources and materialize a deterministic approval plan:
 $plan = & $Lab plan examples/qwen-character.yaml | ConvertFrom-Json
 $ExperimentId = $plan.data.experiment_id
 $PlanHash = $plan.data.plan_hash
-$VariantId = $plan.data.variant_ids[0]
 $plan.data
 ```
 
@@ -111,18 +130,26 @@ CLI run and always requires the current exact plan hash.
 
 ## Run And Recover
 
-Run one approved variant with the exact hash returned by `plan`:
+Run the next approved capability wave with the exact hash returned by `plan`:
 
 ```powershell
-$run = & $Lab run $ExperimentId $VariantId --approve-plan-hash $PlanHash | ConvertFrom-Json
-$RunId = $run.data.run_id
-$run.data
+$wave = & $Lab run $ExperimentId --approve-plan-hash $PlanHash | ConvertFrom-Json
+$RunId = $wave.data.run_ids[0]
+$VariantId = $wave.data.selected_variant_ids[0]
+$wave.data
 ```
 
 `run` is approval-gated and can submit paid remote work. A changed, stale, or
 mistyped plan hash is rejected before submission. Search, inspect, similar, and
 plan are public read-only discovery operations; run, rerun, resume, and
 reconcile enter the paid execution lifecycle and may mutate provider state.
+Ordinary `run` evaluates the full approved frontier through `run_wave`; it does
+not accept a positional variant ID. Exact duplicates, weaker representatives,
+and capabilities dominated by durable evidence are reported in
+`skipped_variant_ids` and `skip_reasons` without submission. A saturated no-op
+wave returns its existing durable `wave_artifact_path` successfully. Pending or
+otherwise inconclusive waves retain their durable run IDs and return exit code
+`7`.
 
 An exact fingerprint is not silently repeated. Use `--rerun` with a durable,
 nonempty reason:

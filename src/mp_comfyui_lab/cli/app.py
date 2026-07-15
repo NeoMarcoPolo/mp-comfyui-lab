@@ -10,7 +10,6 @@ from enum import IntEnum
 from typing import Any, Callable, NoReturn, Protocol, Sequence
 from urllib.parse import urljoin, urlsplit
 
-from mp_runninghub_api.errors import RunningHubApiError
 from pydantic import ValidationError
 import requests
 
@@ -33,6 +32,7 @@ from mp_comfyui_lab.comparison.render import (
     ComparisonArtifacts,
     comparison_facts_sha256,
 )
+from mp_comfyui_lab.executors.runninghub_transport import RunningHubApiError
 from mp_comfyui_lab.config import LabConfig, LabConfigError
 from mp_comfyui_lab.discovery.query import QueryExpansionConfigError, expand_query
 from mp_comfyui_lab.discovery.ranking import RankedWorkflow, RankingConfigError
@@ -88,6 +88,7 @@ from mp_comfyui_lab.experiments.planning import (
     load_experiment_brief,
     recompute_exact_run_hash,
 )
+from mp_comfyui_lab.experiments.saturation import WaveArtifact
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.graph.models import SemanticRole
@@ -312,12 +313,11 @@ def _build_parser() -> StructuredArgumentParser:
     run = subparsers.add_parser(
         "run",
         usage=(
-            "%(prog)s EXPERIMENT_ID [VARIANT_ID | --rerun VARIANT_ID "
+            "%(prog)s EXPERIMENT_ID [--rerun VARIANT_ID "
             "--reason TEXT] --approve-plan-hash HASH"
         ),
     )
     run.add_argument("experiment_id", metavar="EXPERIMENT_ID")
-    run.add_argument("variant_id", metavar="VARIANT_ID", nargs="?")
     run.add_argument("--rerun", dest="rerun_variant_id", metavar="VARIANT_ID")
     run.add_argument("--reason", metavar="TEXT")
     run.add_argument(
@@ -390,10 +390,7 @@ def _build_parser() -> StructuredArgumentParser:
 
 
 def _validate_run_arguments(parsed: argparse.Namespace) -> None:
-    has_variant = parsed.variant_id is not None
     has_rerun = parsed.rerun_variant_id is not None
-    if has_variant == has_rerun:
-        raise UsageError("run requires exactly one of VARIANT_ID or --rerun VARIANT_ID")
     if not has_rerun and parsed.reason is not None:
         raise UsageError("--reason is valid only with --rerun")
     if has_rerun and (
@@ -697,12 +694,69 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
     }
 
 
+def _wave_payload(artifact: WaveArtifact, artifact_path: Path) -> dict[str, Any]:
+    skip_reasons = thaw_json(artifact.skips)
+    skipped_variant_ids = [
+        variant_id
+        for variant_id in artifact.considered_variant_ids
+        if variant_id in skip_reasons
+    ]
+    return {
+        "ordinal": artifact.ordinal,
+        "plan_hash": artifact.plan_hash,
+        "considered_variant_ids": list(artifact.considered_variant_ids),
+        "selected_variant_ids": list(artifact.selected_variant_ids),
+        "pending_variant_ids": list(artifact.pending_variant_ids),
+        "skipped_variant_ids": skipped_variant_ids,
+        "skip_reasons": {
+            variant_id: skip_reasons[variant_id]
+            for variant_id in skipped_variant_ids
+        },
+        "run_ids": list(artifact.run_ids),
+        "pending_run_ids": list(artifact.pending_run_ids),
+        "objective_evidence": thaw_json(artifact.objective_evidence),
+        "saturation_reason": artifact.saturation_reason,
+        "wave_artifact_path": str(artifact_path),
+    }
+
+
 def _execution_exit(record: RunRecord) -> ExitCode:
     if record.state is RunState.SUCCESS:
         return ExitCode.OK
     if record.state in {RunState.FAILED, RunState.CANCELLED}:
         return ExitCode.EXECUTION
     return ExitCode.INCOMPLETE
+
+
+def _wave_execution_exit(artifact: WaveArtifact) -> ExitCode:
+    if artifact.saturation_reason is not None:
+        return ExitCode.OK
+    if artifact.pending_variant_ids or artifact.pending_run_ids:
+        return ExitCode.INCOMPLETE
+
+    evidence = thaw_json(artifact.objective_evidence)
+    run_states = evidence.get("run_states")
+    if not isinstance(run_states, dict):
+        return ExitCode.INCOMPLETE
+    selected_states = {
+        run_states.get(variant_id) for variant_id in artifact.selected_variant_ids
+    }
+    if None in selected_states:
+        return ExitCode.INCOMPLETE
+    if selected_states & {
+        RunState.PLANNED.value,
+        RunState.SUBMITTED.value,
+        RunState.RUNNING.value,
+        RunState.INCOMPLETE.value,
+    }:
+        return ExitCode.INCOMPLETE
+    if selected_states & {RunState.FAILED.value, RunState.CANCELLED.value}:
+        return ExitCode.EXECUTION
+    return (
+        ExitCode.OK
+        if selected_states == {RunState.SUCCESS.value}
+        else ExitCode.INCOMPLETE
+    )
 
 
 def _load_comparison_runs(
@@ -1416,11 +1470,43 @@ def main(
                         reason=parsed.reason.strip(),
                     )
                 else:
-                    record = engine.run(
+                    wave = engine.run_wave(
                         parsed.experiment_id,
-                        parsed.variant_id,
                         approved_plan_hash=parsed.approve_plan_hash,
                     )
+                    wave_path = engine.wave_artifact_path(
+                        parsed.experiment_id,
+                        wave.ordinal,
+                    )
+                    data = _wave_payload(wave, wave_path)
+                    artifacts = [{"kind": "wave", "path": str(wave_path)}]
+                    review_paths = engine.review_artifact_paths(
+                        parsed.experiment_id
+                    )
+                    if (
+                        review_paths.comparison_path is not None
+                        and review_paths.finalists_path is not None
+                    ):
+                        data["comparison_path"] = str(
+                            review_paths.comparison_path
+                        )
+                        data["finalists_path"] = str(
+                            review_paths.finalists_path
+                        )
+                        artifacts.extend(
+                            [
+                                {
+                                    "kind": "comparison_facts",
+                                    "path": str(review_paths.comparison_path),
+                                },
+                                {
+                                    "kind": "finalists",
+                                    "path": str(review_paths.finalists_path),
+                                },
+                            ]
+                        )
+                    emit_success(parsed.command, data, artifacts)
+                    return _wave_execution_exit(wave)
             elif parsed.command == "resume":
                 record = engine.resume(parsed.experiment_id, parsed.run_id)
             elif parsed.command == "reconcile":

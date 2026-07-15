@@ -238,7 +238,7 @@ def test_graph_persistence_sanitizer_removes_url_authority_and_fragment_secrets(
             "load https://models.example/base?revision=1 now"
         ),
         "malformed_material": "https://models.example:notaport/base?revision=1",
-        "malformed_secret": "https://models.example:notaport/base?revision=1",
+        "malformed_secret": "[REDACTED]",
         "encoded_fragment": "https://models.example/base?revision=1",
     }
     serialized = json.dumps(sanitized, sort_keys=True)
@@ -547,6 +547,48 @@ def test_sanitize_for_persistence_redacts_canonical_secret_key_aliases():
         assert sanitized[key] == "[REDACTED]"
     assert sanitized["signatureVersion"] == "v4"
     assert sanitized["client_secret_hint"] == "public-name"
+
+
+def test_persistence_sanitizers_detect_terminal_credential_key_grammar() -> None:
+    secret_fields = {
+        "openai_api_key": "openai-secret",
+        "openaiApiKey": "camel-secret",
+        "AWS-SECRET-ACCESS-KEY": "aws-secret",
+        "provider access token": "access-secret",
+        "serviceAuthToken": "auth-secret",
+        "proxy_bearer_token": "bearer-secret",
+        "oauth-refresh-token": "refresh-secret",
+        "signingPrivateKey": "private-secret",
+        "database_password": "password-secret",
+        "legacy-passwd": "passwd-secret",
+        "cloudCredential": "credential-secret",
+        "cloud_credentials": "credentials-secret",
+        "hf_token": "hf-secret",
+    }
+    benign_fields = {
+        "token_count": 12,
+        "max_tokens": 256,
+        "tokenizer": "qwen-tokenizer",
+        "token_type": "embedding",
+        "monkey": "capuchin",
+        "keyboard": "ansi",
+        "secret_style": "garden",
+        "failure_signature": "missing-node:TextEncodeQwen",
+        "client_secret_hint": "public-name",
+        "model_name": "qwen",
+        "prompt": "A secret garden",
+    }
+    value = {**secret_fields, **benign_fields}
+
+    for sanitizer in (
+        security_module.sanitize_graph_for_persistence,
+        sanitize_for_persistence,
+    ):
+        sanitized = sanitizer(value)
+        assert sanitized == {
+            **{key: "[REDACTED]" for key in secret_fields},
+            **benign_fields,
+        }
 
 
 @pytest.mark.parametrize(

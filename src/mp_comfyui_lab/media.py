@@ -41,6 +41,16 @@ MEDIA_EXTENSIONS = {
     "audio/ogg": "ogg",
     "application/zip": "zip",
 }
+# CRC verification never expands more than the caller's limit or this default.
+MAX_ZIP_EXPANDED_BYTES = 512 * 1024 * 1024
+MAX_ZIP_MEMBERS = 2_048
+MAX_ZIP_COMPRESSION_RATIO = 100
+SUPPORTED_ZIP_COMPRESSION = frozenset(
+    {
+        zipfile.ZIP_STORED,
+        zipfile.ZIP_DEFLATED,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -81,6 +91,10 @@ class MediaVerificationError(SafetyError):
 
 
 class _ImagePixelLimitError(ValueError):
+    pass
+
+
+class _ZipPreflightError(ValueError):
     pass
 
 
@@ -244,8 +258,17 @@ def _inspect_media_file(
     if declared_mime_type == "application/zip":
         try:
             with zipfile.ZipFile(path) as archive:
+                _preflight_zip_archive(archive, max_bytes=max_bytes)
                 valid_archive = archive.testzip() is None
-        except (OSError, zipfile.BadZipFile, RuntimeError):
+        except (
+            EOFError,
+            NotImplementedError,
+            OSError,
+            RuntimeError,
+            _ZipPreflightError,
+            zipfile.BadZipFile,
+            zipfile.LargeZipFile,
+        ):
             valid_archive = False
         if not valid_archive:
             return _inspection_error(
@@ -261,6 +284,42 @@ def _inspect_media_file(
         detected_mime_type=detected_mime_type,
         detected_family=detected_family,
     )
+
+
+def _preflight_zip_archive(
+    archive: zipfile.ZipFile,
+    *,
+    max_bytes: int | None,
+) -> None:
+    expanded_limit = MAX_ZIP_EXPANDED_BYTES
+    if max_bytes is not None:
+        expanded_limit = min(expanded_limit, max_bytes)
+    members = archive.infolist()
+    if len(members) > MAX_ZIP_MEMBERS:
+        raise _ZipPreflightError("archive has too many members")
+
+    expanded_total = 0
+    for member in members:
+        if member.flag_bits & 0x1:
+            raise _ZipPreflightError("encrypted archive members are unsupported")
+        if member.compress_type not in SUPPORTED_ZIP_COMPRESSION:
+            raise _ZipPreflightError("archive compression method is unsupported")
+        if member.file_size < 0 or member.compress_size < 0:
+            raise _ZipPreflightError("archive member size is malformed")
+        if member.file_size > expanded_limit:
+            raise _ZipPreflightError("archive member exceeds expanded-size limit")
+
+        expanded_total += member.file_size
+        if expanded_total > expanded_limit:
+            raise _ZipPreflightError("archive exceeds aggregate expanded-size limit")
+        if member.file_size == 0:
+            continue
+        if (
+            member.compress_size == 0
+            or member.file_size
+            > member.compress_size * MAX_ZIP_COMPRESSION_RATIO
+        ):
+            raise _ZipPreflightError("archive member compression ratio is excessive")
 
 
 def verify_media_file(

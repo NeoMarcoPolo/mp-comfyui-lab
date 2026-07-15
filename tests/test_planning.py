@@ -629,6 +629,32 @@ def test_source_and_candidate_order_produce_identical_plan_bytes(tmp_path: Path)
     assert first.plan_hash == second.plan_hash
 
 
+def test_source_bundle_accepts_more_than_512_distinct_valid_candidates() -> None:
+    candidates = tuple(
+        Candidate(
+            candidate_id=f"candidate-{index:04d}",
+            hypothesis="checkpoint",
+            capability_signature=f"checkpoint:{index:04d}",
+            confidence="observed",
+            evidence_ids=("123",),
+            claims=(
+                CandidateClaim(
+                    dimension="checkpoint",
+                    value=f"checkpoint-{index:04d}.safetensors",
+                ),
+            ),
+        )
+        for index in range(513)
+    )
+
+    bundle = _bundle(candidates=candidates)
+
+    assert len(bundle.candidates) == 513
+    assert {item.candidate_id for item in bundle.candidates} == {
+        f"candidate-{index:04d}" for index in range(513)
+    }
+
+
 def test_fixture_resolution_rejects_symlink_special_and_changed_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "target.png"
     target.write_bytes(b"fixture")

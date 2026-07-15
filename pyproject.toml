@@ -12,7 +12,6 @@ dependencies = [
     "requests>=2.31,<3",
     "Pillow>=10,<13",
     "ImageHash>=4.3,<5",
-    "mp-runninghub-api @ file:///Z:/web/marcopolo/mp-runninghub-api",
 ]
 
 [project.optional-dependencies]

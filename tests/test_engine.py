@@ -12,10 +12,10 @@ import threading
 import time
 from types import SimpleNamespace
 
-from mp_runninghub_api.errors import RunningHubApiError
 import pytest
 import requests
 from PIL import Image
+from mp_comfyui_lab.executors.runninghub_transport import RunningHubApiError
 
 from helpers import FakeExecutor, valid_media_bytes
 from mp_comfyui_lab.config import LabConfig
@@ -3525,6 +3525,28 @@ def test_run_artifact_path_uses_actual_store_not_caller_cwd(
         / "wave-approved"
         / "runs"
         / "run-example.json"
+    ).resolve()
+    assert path.is_absolute()
+
+
+def test_wave_artifact_path_uses_actual_store_not_caller_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, _ = _persist_wave_plan(tmp_path)
+    engine = _wave_engine(config, FakeExecutor.success(outputs=()))
+    unrelated = tmp_path / "unrelated-wave-caller"
+    unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+
+    path = engine.wave_artifact_path("wave-approved", 3)
+
+    assert path == (
+        config.experiments_root
+        / "wave-approved"
+        / "plans"
+        / "waves"
+        / "3.json"
     ).resolve()
     assert path.is_absolute()
 

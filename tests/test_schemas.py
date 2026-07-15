@@ -7,10 +7,12 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 import mp_comfyui_lab.schemas as schema_module
 from mp_comfyui_lab.cli.app import ExitCode, main
 from mp_comfyui_lab.comparison.paths import path_component_is_link_or_junction
+from mp_comfyui_lab.experiments.models import DimensionName, ExperimentBrief
 from mp_comfyui_lab.schemas import (
     SchemaCheckError,
     check_schemas,
@@ -67,6 +69,110 @@ def test_handoff_schema_publishes_required_version_and_path_constraints() -> Non
     assert path["pattern"]
     assert "posix" in path["description"].lower()
     assert "relative" in path["description"].lower()
+
+
+def _brief_document(dimensions: object) -> dict[str, object]:
+    return {
+        "goal": "schema parity",
+        "sources": {
+            "queries": ["qwen"],
+            "urls": [],
+        },
+        "fixtures": {
+            "reference_images": [],
+            "prompt_lines": ["one"],
+        },
+        "expectations": {
+            "output_count": 1,
+            "media_types": ["image/png"],
+        },
+        "dimensions": dimensions,
+    }
+
+
+def _dimensions_json_schema_accepts(schema: dict, value: object) -> bool:
+    dimensions = schema["properties"]["dimensions"]
+    names = set(schema["$defs"]["DimensionName"]["enum"])
+    policies = set(schema["$defs"]["DimensionPolicy"]["enum"])
+    if dimensions.get("type") == "object":
+        return (
+            isinstance(value, dict)
+            and len(value) >= dimensions.get("minProperties", 0)
+            and all(
+                key in names and policy in policies
+                for key, policy in value.items()
+            )
+        )
+    if dimensions.get("type") == "array":
+        return (
+            isinstance(value, list)
+            and len(value) >= dimensions.get("minItems", 0)
+            and all(
+                isinstance(item, dict)
+                and set(item) == {"name", "policy"}
+                and item["name"] in names
+                and item["policy"] in policies
+                for item in value
+            )
+        )
+    return False
+
+
+def test_brief_dimension_mapping_schema_matches_runtime_both_ways() -> None:
+    schema = json.loads(render_schemas()["brief.schema.json"])
+    runtime_valid = _brief_document(
+        {"checkpoint": "approved", "sampler": "disabled"}
+    )
+
+    brief = ExperimentBrief.model_validate(runtime_valid)
+
+    assert _dimensions_json_schema_accepts(schema, runtime_valid["dimensions"])
+    assert [item.name.value for item in brief.dimensions] == [
+        "checkpoint",
+        "sampler",
+    ]
+
+    representative = {
+        schema["$defs"]["DimensionName"]["enum"][-1]:
+        schema["$defs"]["DimensionPolicy"]["enum"][0]
+    }
+    assert _dimensions_json_schema_accepts(schema, representative)
+    representative_name, representative_policy = next(iter(representative.items()))
+    representative_brief = ExperimentBrief.model_validate(
+        _brief_document(representative)
+    )
+    assert (
+        representative_brief.policy_for(DimensionName(representative_name)).value
+        == representative_policy
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        [],
+        [{"name": "checkpoint", "policy": "approved"}],
+        {},
+        {"unknown": "approved"},
+        {"checkpoint": "unknown"},
+    ],
+)
+def test_brief_dimension_mapping_schema_and_runtime_reject_same_invalid_shapes(
+    invalid: object,
+) -> None:
+    schema = json.loads(render_schemas()["brief.schema.json"])
+
+    assert not _dimensions_json_schema_accepts(schema, invalid)
+    with pytest.raises(ValidationError):
+        ExperimentBrief.model_validate(_brief_document(invalid))
+
+
+def test_plan_schema_has_no_variant_count_ceiling() -> None:
+    schema = json.loads(render_schemas()["plan.schema.json"])
+
+    variants = schema["properties"]["variants"]
+    assert variants["minItems"] == 1
+    assert "maxItems" not in variants
 
 
 def test_export_and_check_detect_missing_and_stale_files_without_repair(

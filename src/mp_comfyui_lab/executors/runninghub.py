@@ -15,15 +15,17 @@ from typing import Annotated, Any, NoReturn, TypeVar
 import unicodedata
 from urllib.parse import urlsplit
 
-from mp_runninghub_api.config import load_default_config
-from mp_runninghub_api.errors import RunningHubApiError
-from mp_runninghub_api.runninghub import (
+from mp_comfyui_lab.executors.runninghub_transport import (
+    NodeInfo,
+    RunningHubApiError,
+    RunningHubConfigError,
+    TaskCreateResult,
     get_task_info,
     get_task_outputs,
     get_task_status,
     get_workflow_json,
+    load_default_config,
 )
-from mp_runninghub_api.types import NodeInfo, TaskCreateResult
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 import requests
 
@@ -110,6 +112,19 @@ StatusCall = Callable[..., Any]
 InfoCall = Callable[..., Any]
 OutputsCall = Callable[..., Any]
 
+
+def _load_executor_api_key(credential_loader: CredentialLoader) -> str:
+    try:
+        config = credential_loader()
+    except RunningHubConfigError as error:
+        raise ExecutorError(str(error)) from error
+    except Exception as error:
+        raise ExecutorError("RunningHub credentials could not be loaded") from error
+    api_key = getattr(config, "apiKey", None)
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise ExecutorError("RunningHub credentials are missing an API key")
+    return api_key
+
 _UPLOAD_MEDIA_TYPES = {
     "image/png": "image",
     "image/jpeg": "image",
@@ -163,6 +178,8 @@ def upload_file_bytes(
     if not api_key:
         try:
             api_key = load_default_config().apiKey
+        except RunningHubConfigError as error:
+            raise RunningHubApiError(str(error)) from error
         except Exception as error:
             raise RunningHubApiError(
                 "Upload credentials could not be loaded"
@@ -239,10 +256,7 @@ def create_task_once(
 ) -> TaskCreateResult:
     """Transmit one paid create request exactly once, without redirects."""
     if not api_key:
-        try:
-            api_key = credential_loader().apiKey
-        except Exception as error:
-            raise ExecutorError("RunningHub credentials could not be loaded") from error
+        api_key = _load_executor_api_key(credential_loader)
     if not isinstance(api_key, str) or not api_key.strip():
         raise ExecutorError("RunningHub credentials are missing an API key")
 
@@ -1609,13 +1623,7 @@ class RunningHubExecutor(Executor):
             fixture.binding_index: self._read_fixture_snapshot(fixture)
             for fixture in fixtures.items
         }
-        try:
-            config = self._credential_loader()
-        except Exception as error:
-            raise ExecutorError("RunningHub credentials could not be loaded") from error
-        api_key = getattr(config, "apiKey", None)
-        if not isinstance(api_key, str) or not api_key.strip():
-            raise ExecutorError("RunningHub credentials are missing an API key")
+        _load_executor_api_key(self._credential_loader)
 
         materialized_graph = thaw_json(variant.graph)
         node_info_list: list[NodeInfo] = []
@@ -1757,13 +1765,7 @@ class RunningHubExecutor(Executor):
         if not isinstance(provider_task_id, str) or not provider_task_id.strip():
             raise ExecutorError("RunningHub poll requires a nonblank task ID")
         task_id = provider_task_id.strip()
-        try:
-            config = self._credential_loader()
-        except Exception as error:
-            raise ExecutorError("RunningHub credentials could not be loaded") from error
-        api_key = getattr(config, "apiKey", None)
-        if not isinstance(api_key, str) or not api_key.strip():
-            raise ExecutorError("RunningHub credentials are missing an API key")
+        _load_executor_api_key(self._credential_loader)
         try:
             raw_status = self._status_call(api_key=None, task_id=task_id)
             info = self._info_call(api_key=None, task_id=task_id)
@@ -1790,13 +1792,7 @@ class RunningHubExecutor(Executor):
         if not isinstance(provider_task_id, str) or not provider_task_id.strip():
             raise ExecutorError("RunningHub output collection requires a task ID")
         task_id = provider_task_id.strip()
-        try:
-            config = self._credential_loader()
-        except Exception as error:
-            raise ExecutorError("RunningHub credentials could not be loaded") from error
-        api_key = getattr(config, "apiKey", None)
-        if not isinstance(api_key, str) or not api_key.strip():
-            raise ExecutorError("RunningHub credentials are missing an API key")
+        _load_executor_api_key(self._credential_loader)
         try:
             raw_outputs = self._outputs_call(api_key=None, task_id=task_id)
         except Exception as error:

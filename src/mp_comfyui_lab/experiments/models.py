@@ -596,7 +596,6 @@ MAX_MANIFEST_SCALAR_LENGTH = 8_192
 MAX_MANIFEST_SOURCES = 128
 MAX_FIXTURES = 64
 MAX_PROMPT_LINES = 512
-MAX_PLAN_VARIANTS = 512
 _ARTIFACT_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
 _VAULT_ALIAS = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
@@ -618,6 +617,12 @@ class DimensionPolicy(StrEnum):
     APPROVED = "approved"
     BASELINE_ONLY = "baseline_only"
     DISABLED = "disabled"
+
+
+DimensionPolicyInput = Annotated[
+    dict[DimensionName, DimensionPolicy],
+    Field(min_length=1),
+]
 
 
 class PlanningConfidence(StrEnum):
@@ -762,7 +767,11 @@ class ExperimentBrief(_FrozenModel):
     expectations: ExpectationSpec
     dimensions: tuple[DimensionApproval, ...] = Field(min_length=1, max_length=len(DimensionName))
 
-    @field_validator("dimensions", mode="before")
+    @field_validator(
+        "dimensions",
+        mode="before",
+        json_schema_input_type=DimensionPolicyInput,
+    )
     @classmethod
     def validate_dimension_map(cls, value: Any) -> Any:
         if not isinstance(value, Mapping):
@@ -948,7 +957,7 @@ class ApprovedSourceProvenance(_FrozenModel):
 
 class SourceBundle(_FrozenModel):
     sources: tuple[PlanningSource, ...] = Field(min_length=1, max_length=MAX_MANIFEST_SOURCES)
-    candidates: tuple[Candidate, ...] = Field(default=(), max_length=MAX_PLAN_VARIANTS)
+    candidates: tuple[Candidate, ...] = ()
     baseline_workflow_id: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=256)] | None = None
     evidence_graph: Any
     compiler_warnings: tuple[str, ...] = Field(default=(), max_length=256)
@@ -1083,7 +1092,7 @@ class ExperimentPlan(_FrozenModel):
         max_length=MAX_MANIFEST_SOURCES,
     )
     partial_behavior_is_tested_capability: bool = False
-    variants: tuple[PlannedVariant, ...] = Field(min_length=1, max_length=MAX_PLAN_VARIANTS)
+    variants: tuple[PlannedVariant, ...] = Field(min_length=1)
     capability_coverage: tuple[DimensionName, ...] = Field(default=(), max_length=len(DimensionName))
     warnings: tuple[str, ...] = Field(default=(), max_length=512)
     approval_payload: SanitizedJsonObject

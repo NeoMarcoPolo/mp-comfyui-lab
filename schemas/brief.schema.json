@@ -1,22 +1,5 @@
 {
   "$defs": {
-    "DimensionApproval": {
-      "additionalProperties": false,
-      "properties": {
-        "name": {
-          "$ref": "#/$defs/DimensionName"
-        },
-        "policy": {
-          "$ref": "#/$defs/DimensionPolicy"
-        }
-      },
-      "required": [
-        "name",
-        "policy"
-      ],
-      "title": "DimensionApproval",
-      "type": "object"
-    },
     "DimensionName": {
       "enum": [
         "checkpoint",
@@ -159,13 +142,15 @@
   "additionalProperties": false,
   "properties": {
     "dimensions": {
-      "items": {
-        "$ref": "#/$defs/DimensionApproval"
+      "additionalProperties": {
+        "$ref": "#/$defs/DimensionPolicy"
       },
-      "maxItems": 10,
-      "minItems": 1,
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/DimensionName"
+      },
       "title": "Dimensions",
-      "type": "array"
+      "type": "object"
     },
     "expectations": {
       "$ref": "#/$defs/ExpectationSpec"

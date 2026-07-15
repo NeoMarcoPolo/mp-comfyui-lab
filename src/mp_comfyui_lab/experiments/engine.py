@@ -440,6 +440,16 @@ class ExperimentEngine:
             self._store.root(experiment_id) / "runs" / f"{run_id}.json"
         ).resolve()
 
+    def wave_artifact_path(self, experiment_id: str, ordinal: int) -> Path:
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
+            raise SafetyError("wave artifact ordinal must be a positive integer")
+        return (
+            self._store.root(experiment_id)
+            / "plans"
+            / "waves"
+            / f"{ordinal}.json"
+        ).resolve()
+
     def _regenerate_review_for_completed_record(
         self,
         record: RunRecord,

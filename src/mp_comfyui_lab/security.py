@@ -130,6 +130,33 @@ FRAGMENT_URL_USERINFO = re.compile(
     re.IGNORECASE,
 )
 VALID_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+CAMEL_SECURITY_KEY_BOUNDARY = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
+SECURITY_KEY_SEGMENT = re.compile(r"[A-Za-z0-9]+")
+SECRET_KEY_TERMINAL_PHRASES = (
+    ("api", "key"),
+    ("access", "key"),
+    ("secret", "access", "key"),
+    ("secret", "key"),
+    ("private", "key"),
+    ("signed", "url"),
+)
+SECRET_KEY_TERMINAL_SEGMENTS = frozenset(
+    {
+        "auth",
+        "authorization",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "passphrase",
+        "passwd",
+        "password",
+        "secret",
+        "token",
+    }
+)
 
 
 class SafetyError(ValueError):
@@ -148,8 +175,27 @@ def _canonical_key(value: str) -> str:
     return canonical_security_key(value)
 
 
+def _security_key_segments(value: str) -> tuple[str, ...]:
+    separated = CAMEL_SECURITY_KEY_BOUNDARY.sub(" ", value)
+    return tuple(
+        match.group(0).casefold()
+        for match in SECURITY_KEY_SEGMENT.finditer(separated)
+    )
+
+
 def _is_secret_key(value: str) -> bool:
-    return _canonical_key(value) in CANONICAL_SECRET_KEYS
+    if _canonical_key(value) in CANONICAL_SECRET_KEYS:
+        return True
+    segments = _security_key_segments(value)
+    if not segments:
+        return False
+    if segments[-1] in SECRET_KEY_TERMINAL_SEGMENTS:
+        return True
+    return any(
+        len(segments) >= len(phrase)
+        and segments[-len(phrase) :] == phrase
+        for phrase in SECRET_KEY_TERMINAL_PHRASES
+    )
 
 
 def authentication_query_keys(

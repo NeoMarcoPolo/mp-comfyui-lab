@@ -6,8 +6,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from mp_runninghub_api.errors import RunningHubApiError
-from mp_runninghub_api.types import NodeInfo
 import pytest
 import requests
 
@@ -21,6 +19,11 @@ from mp_comfyui_lab.executors.runninghub import (
     UPLOAD_ENDPOINT,
     RunningHubExecutor,
     upload_file_bytes,
+)
+from mp_comfyui_lab.executors.runninghub_transport import (
+    NodeInfo,
+    RunningHubApiError,
+    RunningHubConfigError,
 )
 from mp_comfyui_lab.experiments.models import (
     MaterializedVariant,
@@ -230,6 +233,23 @@ def test_construction_and_validation_do_not_touch_credentials_or_paid_calls(
     assert report.is_valid
     assert report.errors == ()
     assert calls == []
+
+
+def test_submit_surfaces_clear_local_missing_key_error(tmp_path: Path) -> None:
+    def missing_credentials():
+        raise RunningHubConfigError(
+            "RunningHub API key is unavailable; set RUNNINGHUB_API_KEY or "
+            "RUNNINGHUB_CONFIG_PATH"
+        )
+
+    executor = RunningHubExecutor(
+        credential_loader=missing_credentials,
+        upload_call=lambda **_kwargs: pytest.fail("missing key reached upload"),
+        create_task_call=lambda **_kwargs: pytest.fail("missing key reached create"),
+    )
+
+    with pytest.raises(ExecutorError, match="RUNNINGHUB_API_KEY"):
+        executor.submit(_variant(), _fixtures(tmp_path))
 
 
 def test_submit_uploads_and_uses_exact_create_task_shape(tmp_path: Path) -> None:
