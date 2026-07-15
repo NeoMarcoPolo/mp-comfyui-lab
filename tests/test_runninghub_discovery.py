@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import UTC
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from time import perf_counter
 from typing import Any
 
@@ -27,6 +28,7 @@ from mp_comfyui_lab.executors.base import (
     WorkflowRef,
 )
 from mp_comfyui_lab.executors.runninghub import RunningHubExecutor
+from mp_comfyui_lab.executors.runninghub_transport import RunningHubConfigError
 from mp_comfyui_lab.json_types import FrozenDict, thaw_json
 
 
@@ -71,9 +73,23 @@ class FalseySession(requests.Session):
         return False
 
 
+class FalseyCredentialLoader:
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+        self.calls = 0
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __call__(self) -> SimpleNamespace:
+        self.calls += 1
+        return SimpleNamespace(apiKey=self.api_key)
+
+
 def _executor(graph_fetcher: GraphFetcherSpy | None = None) -> RunningHubExecutor:
     return RunningHubExecutor(
         session=requests.Session(),
+        credential_loader=lambda: SimpleNamespace(apiKey="test-key"),
         graph_fetcher=(
             graph_fetcher if graph_fetcher is not None else GraphFetcherSpy()
         ),
@@ -207,15 +223,24 @@ def test_constructor_retains_falsey_injected_dependencies(
 ) -> None:
     session = FalseySession()
     graph_fetcher = FalseyGraphFetcher(_load_fixture("qwen_graph.json"))
+    credential_loader = FalseyCredentialLoader("injected-key-a")
     fallback_fetcher = GraphFetcherSpy(_load_fixture("qwen_graph.json"))
+    ambient_calls: list[str] = []
+
+    def ambient_loader() -> SimpleNamespace:
+        ambient_calls.append("ambient")
+        return SimpleNamespace(apiKey="ambient-key-b")
+
     monkeypatch.setattr(
         runninghub_module,
         "get_workflow_json",
         fallback_fetcher,
     )
+    monkeypatch.setattr(runninghub_module, "load_default_config", ambient_loader)
     executor = RunningHubExecutor(
         session=session,
         graph_fetcher=graph_fetcher,
+        credential_loader=credential_loader,
     )
 
     with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
@@ -226,7 +251,9 @@ def test_constructor_retains_falsey_injected_dependencies(
 
     assert executor.session is session
     assert executor.graph_fetcher is graph_fetcher
-    assert graph_fetcher.calls == [(None, WORKFLOW_ID)]
+    assert graph_fetcher.calls == [("injected-key-a", WORKFLOW_ID)]
+    assert credential_loader.calls == 1
+    assert ambient_calls == []
     assert fallback_fetcher.calls == []
 
 
@@ -520,7 +547,32 @@ def test_fetch_workflow_accepts_string_or_dict_graph(as_string: bool) -> None:
     assert fetched.graph["56"]["class_type"] == "KSampler"
     assert fetched.ref == ref
     assert fetched.detail.candidate.canonical_url == ref.canonical_url
-    assert graph_fetcher.calls == [(None, WORKFLOW_ID)]
+    assert graph_fetcher.calls == [("test-key", WORKFLOW_ID)]
+
+
+def test_fetch_workflow_preserves_clear_missing_credential_error() -> None:
+    graph_fetcher = GraphFetcherSpy(_load_fixture("qwen_graph.json"))
+
+    def missing_credentials() -> None:
+        raise RunningHubConfigError(
+            "RunningHub API key is unavailable; set RUNNINGHUB_API_KEY or "
+            "RUNNINGHUB_CONFIG_PATH"
+        )
+
+    executor = RunningHubExecutor(
+        session=requests.Session(),
+        graph_fetcher=graph_fetcher,
+        credential_loader=missing_credentials,
+    )
+
+    with responses.RequestsMock(assert_all_requests_are_fired=True) as mocked:
+        _add_json(mocked, executor.detail_url, _load_fixture("detail_next_scene.json"))
+        with pytest.raises(ExecutorError, match="RUNNINGHUB_API_KEY"):
+            executor.fetch_workflow(
+                WorkflowRef(executor="runninghub", workflow_id=WORKFLOW_ID)
+            )
+
+    assert graph_fetcher.calls == []
 
 
 @pytest.mark.parametrize(

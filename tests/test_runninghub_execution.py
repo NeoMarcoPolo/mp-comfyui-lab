@@ -78,6 +78,19 @@ def _fixtures(tmp_path: Path) -> ResolvedFixtures:
     )
 
 
+class FalseyCredentialLoader:
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+        self.calls = 0
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __call__(self) -> SimpleNamespace:
+        self.calls += 1
+        return SimpleNamespace(apiKey=self.api_key)
+
+
 @pytest.mark.parametrize("failure", ["timeout", "transient-status"])
 def test_create_task_once_never_retries_ambiguous_transmission(
     failure: str,
@@ -263,7 +276,7 @@ def test_submit_uploads_and_uses_exact_create_task_shape(tmp_path: Path) -> None
     def upload_call(**kwargs):
         calls.append(("upload", kwargs))
         assert kwargs == {
-            "api_key": None,
+            "api_key": "credential-secret",
             "content": b"fixture",
             "file_name": "portrait.png",
             "file_type": "image",
@@ -296,7 +309,7 @@ def test_submit_uploads_and_uses_exact_create_task_shape(tmp_path: Path) -> None
         "workflow",
         "instance_type",
     }
-    assert captured_create["api_key"] is None
+    assert captured_create["api_key"] == "credential-secret"
     assert captured_create["workflow_id"] == "workflow-1"
     assert captured_create["instance_type"] == "plus"
     assert captured_create["node_info_list"] == [
@@ -309,6 +322,108 @@ def test_submit_uploads_and_uses_exact_create_task_shape(tmp_path: Path) -> None
     materialized = json.loads(captured_create["workflow"])
     assert materialized["1"]["inputs"]["image"] == "uploaded-portrait.png"
     assert "fixture://0" not in captured_create["workflow"]
+
+
+def test_executor_uses_one_injected_key_for_submit_poll_outputs_and_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runninghub_module = importlib.import_module(
+        "mp_comfyui_lab.executors.runninghub"
+    )
+    ambient_calls: list[str] = []
+
+    def ambient_loader() -> SimpleNamespace:
+        ambient_calls.append("ambient")
+        return SimpleNamespace(apiKey="ambient-key-b")
+
+    monkeypatch.setattr(runninghub_module, "load_default_config", ambient_loader)
+    credential_loader = FalseyCredentialLoader("injected-key-a")
+    authenticated_calls: list[tuple[str, str]] = []
+
+    def upload_call(**kwargs):
+        authenticated_calls.append(("upload", kwargs["api_key"]))
+        return "uploaded-portrait.png"
+
+    def create_task_call(**kwargs):
+        authenticated_calls.append(("create", kwargs["api_key"]))
+        return SimpleNamespace(taskId="provider-task-1", taskStatus="QUEUED")
+
+    def status_call(**kwargs):
+        authenticated_calls.append(("status", kwargs["api_key"]))
+        return "SUCCESS"
+
+    def info_call(**kwargs):
+        authenticated_calls.append(("info", kwargs["api_key"]))
+        return {"taskId": kwargs["task_id"], "taskStatus": "SUCCESS"}
+
+    def outputs_call(**kwargs):
+        authenticated_calls.append(("outputs", kwargs["api_key"]))
+        return [
+            SimpleNamespace(
+                fileUrl="https://runninghub.ai/output.png",
+                fileType="png",
+                nodeId="9",
+            )
+        ]
+
+    executor = RunningHubExecutor(
+        credential_loader=credential_loader,
+        upload_call=upload_call,
+        create_task_call=create_task_call,
+        status_call=status_call,
+        info_call=info_call,
+        outputs_call=outputs_call,
+    )
+
+    receipt = executor.submit(_variant(), _fixtures(tmp_path))
+    poll = executor.poll(receipt.provider_task_id)
+    outputs = executor.collect_outputs(receipt.provider_task_id)
+
+    assert authenticated_calls == [
+        ("upload", "injected-key-a"),
+        ("create", "injected-key-a"),
+        ("status", "injected-key-a"),
+        ("info", "injected-key-a"),
+        ("outputs", "injected-key-a"),
+    ]
+    assert credential_loader.calls == 1
+    assert ambient_calls == []
+    durable_values = json.dumps(
+        {
+            "receipt": receipt.model_dump(mode="json"),
+            "poll": poll.model_dump(mode="json"),
+            "outputs": [item.model_dump(mode="json") for item in outputs],
+        },
+        sort_keys=True,
+    )
+    assert "injected-key-a" not in durable_values
+
+    resume_loader = FalseyCredentialLoader("resume-key-c")
+    resume_calls: list[tuple[str, str]] = []
+    resume_executor = RunningHubExecutor(
+        credential_loader=resume_loader,
+        upload_call=lambda **_kwargs: None,
+        create_task_call=lambda **_kwargs: None,
+        status_call=lambda **kwargs: (
+            resume_calls.append(("status", kwargs["api_key"])) or "RUNNING"
+        ),
+        info_call=lambda **kwargs: (
+            resume_calls.append(("info", kwargs["api_key"]))
+            or {"taskId": kwargs["task_id"], "taskStatus": "RUNNING"}
+        ),
+        outputs_call=lambda **_kwargs: None,
+    )
+
+    resumed = resume_executor.poll("provider-task-1")
+
+    assert resumed.state is ProviderTaskState.RUNNING
+    assert resume_calls == [
+        ("status", "resume-key-c"),
+        ("info", "resume-key-c"),
+    ]
+    assert resume_loader.calls == 1
+    assert ambient_calls == []
 
 
 @pytest.mark.parametrize("task_status", ["", 7, "FUTURE_PROVIDER_STATE"])
@@ -347,7 +462,7 @@ def test_submit_binds_snapshot_bytes_before_injected_upload_can_mutate_path(
     creates: list[str] = []
 
     def upload_call(*, api_key, content, file_name, file_type):
-        assert api_key is None
+        assert api_key == "secret"
         assert file_name == "portrait.png"
         assert file_type == "image"
         fixtures.items[0].path.write_bytes(b"attacker replacement")
@@ -474,9 +589,48 @@ def test_upload_file_bytes_sends_exact_multipart_content() -> None:
             "data": {"apiKey": "api-secret", "fileType": "image"},
             "files": {"file": ("portrait.png", content)},
             "timeout": 300,
+            "allow_redirects": False,
         }
     ]
     assert type(calls[0]["files"]["file"][1]) is bytes
+
+
+@pytest.mark.parametrize("status_code", [307, 308])
+def test_upload_file_bytes_rejects_redirect_without_forwarding_credentials(
+    status_code: int,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Response:
+        @property
+        def status_code(self) -> int:
+            return status_code
+
+        @staticmethod
+        def json():
+            return {}
+
+    class Session:
+        @staticmethod
+        def post(url, **kwargs):
+            calls.append({"url": url, **kwargs})
+            return Response()
+
+    with pytest.raises(RunningHubApiError, match=f"HTTP {status_code}"):
+        upload_file_bytes(
+            "api-secret",
+            b"approved immutable bytes",
+            "portrait.png",
+            "image",
+            session=Session(),
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["allow_redirects"] is False
+    assert calls[0]["data"] == {"apiKey": "api-secret", "fileType": "image"}
+    assert calls[0]["files"] == {
+        "file": ("portrait.png", b"approved immutable bytes")
+    }
 
 
 @pytest.mark.parametrize(
@@ -554,7 +708,7 @@ def test_poll_maps_known_status_and_sanitizes_info() -> None:
     assert "credential-secret" not in serialized
     assert [item[0] for item in calls] == ["credentials", "status", "info"]
     assert calls[1][1] == {
-        "api_key": None,
+        "api_key": "secret",
         "task_id": "provider-task-1",
     }
     assert calls[2][1] == calls[1][1]
@@ -608,7 +762,7 @@ def test_collect_outputs_preserves_provider_order_and_maps_media() -> None:
         ("credentials", None),
         (
             "outputs",
-            {"api_key": None, "task_id": "provider-task-1"},
+            {"api_key": "secret", "task_id": "provider-task-1"},
         ),
     ]
 

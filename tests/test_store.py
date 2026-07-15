@@ -7,6 +7,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
 from time import perf_counter, sleep
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
@@ -589,6 +590,33 @@ def test_persistence_sanitizers_detect_terminal_credential_key_grammar() -> None
             **{key: "[REDACTED]" for key in secret_fields},
             **benign_fields,
         }
+
+
+def test_graph_url_sanitizer_uses_credential_key_grammar_for_query_names() -> None:
+    value = {
+        "url": (
+            "https://cdn.example/input.png?"
+            "openai_api_key=openai-url-secret&"
+            "hfToken=hf-url-secret&"
+            "AWS-Secret-Access-Key=aws-url-secret&"
+            "max_tokens=256&token_count=12&tokenizer=qwen&model=qwen&seed=7"
+        )
+    }
+
+    sanitized = security_module.sanitize_graph_for_persistence(value)
+    query = dict(parse_qsl(urlsplit(sanitized["url"]).query))
+
+    assert query == {
+        "max_tokens": "256",
+        "token_count": "12",
+        "tokenizer": "qwen",
+        "model": "qwen",
+        "seed": "7",
+    }
+    serialized = json.dumps(sanitized, sort_keys=True)
+    assert "openai-url-secret" not in serialized
+    assert "hf-url-secret" not in serialized
+    assert "aws-url-secret" not in serialized
 
 
 @pytest.mark.parametrize(

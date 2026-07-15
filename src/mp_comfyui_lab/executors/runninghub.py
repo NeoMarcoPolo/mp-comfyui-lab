@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from threading import Lock
 from typing import Annotated, Any, NoReturn, TypeVar
 import unicodedata
 from urllib.parse import urlsplit
@@ -204,6 +205,7 @@ def upload_file_bytes(
             data={"apiKey": api_key, "fileType": file_type},
             files={"file": (safe_name, content)},
             timeout=timeout,
+            allow_redirects=False,
         )
     except requests.RequestException:
         raise RunningHubApiError("Upload request failed") from None
@@ -1251,6 +1253,8 @@ class RunningHubExecutor(Executor):
             get_workflow_json if graph_fetcher is None else graph_fetcher
         )
         self._credential_loader = credential_loader
+        self._resolved_api_key: str | None = None
+        self._credential_lock = Lock()
         self._upload_call = upload_call
         self._create_task_call = (
             partial(
@@ -1270,6 +1274,16 @@ class RunningHubExecutor(Executor):
     @property
     def name(self) -> str:
         return "runninghub"
+
+    def _api_key(self) -> str:
+        api_key = self._resolved_api_key
+        if api_key is None:
+            with self._credential_lock:
+                api_key = self._resolved_api_key
+                if api_key is None:
+                    api_key = _load_executor_api_key(self._credential_loader)
+                    self._resolved_api_key = api_key
+        return api_key
 
     def _post_public(
         self,
@@ -1458,8 +1472,9 @@ class RunningHubExecutor(Executor):
             ref.workflow_id,
             canonical_url=canonical_url,
         )
+        api_key = self._api_key()
         try:
-            raw_graph = self.graph_fetcher(None, ref.workflow_id)
+            raw_graph = self.graph_fetcher(api_key, ref.workflow_id)
         except Exception:
             raise ExecutorError(
                 f"RunningHub graph fetch failed for workflow {ref.workflow_id}"
@@ -1623,7 +1638,7 @@ class RunningHubExecutor(Executor):
             fixture.binding_index: self._read_fixture_snapshot(fixture)
             for fixture in fixtures.items
         }
-        _load_executor_api_key(self._credential_loader)
+        api_key = self._api_key()
 
         materialized_graph = thaw_json(variant.graph)
         node_info_list: list[NodeInfo] = []
@@ -1633,7 +1648,7 @@ class RunningHubExecutor(Executor):
             content, file_name = approved_uploads[fixture.binding_index]
             try:
                 uploaded_name = self._upload_call(
-                    api_key=None,
+                    api_key=api_key,
                     content=content,
                     file_name=file_name,
                     file_type=file_type,
@@ -1658,7 +1673,7 @@ class RunningHubExecutor(Executor):
 
         try:
             result = self._create_task_call(
-                api_key=None,
+                api_key=api_key,
                 workflow_id=variant.source_workflow_id,
                 node_info_list=node_info_list,
                 workflow=json.dumps(materialized_graph, ensure_ascii=False),
@@ -1765,10 +1780,10 @@ class RunningHubExecutor(Executor):
         if not isinstance(provider_task_id, str) or not provider_task_id.strip():
             raise ExecutorError("RunningHub poll requires a nonblank task ID")
         task_id = provider_task_id.strip()
-        _load_executor_api_key(self._credential_loader)
+        api_key = self._api_key()
         try:
-            raw_status = self._status_call(api_key=None, task_id=task_id)
-            info = self._info_call(api_key=None, task_id=task_id)
+            raw_status = self._status_call(api_key=api_key, task_id=task_id)
+            info = self._info_call(api_key=api_key, task_id=task_id)
         except Exception as error:
             raise TransientExecutorError("RunningHub poll request failed") from error
         if not isinstance(info, dict):
@@ -1792,9 +1807,9 @@ class RunningHubExecutor(Executor):
         if not isinstance(provider_task_id, str) or not provider_task_id.strip():
             raise ExecutorError("RunningHub output collection requires a task ID")
         task_id = provider_task_id.strip()
-        _load_executor_api_key(self._credential_loader)
+        api_key = self._api_key()
         try:
-            raw_outputs = self._outputs_call(api_key=None, task_id=task_id)
+            raw_outputs = self._outputs_call(api_key=api_key, task_id=task_id)
         except Exception as error:
             raise TransientExecutorError(
                 "RunningHub output collection failed"

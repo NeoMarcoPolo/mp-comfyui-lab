@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from mp_comfyui_lab.cli.app import ExitCode, main
 from mp_comfyui_lab.discovery.models import WorkflowCandidate, WorkflowDetail
@@ -51,6 +52,13 @@ def test_noninteractive_agent_flow_reaches_self_contained_handoff(
     graph_inputs = graph[next(iter(graph))]["inputs"]
     graph_inputs.update(
         {
+            "credential_query_input": (
+                "https://cdn.example/e2e.png?"
+                "openai_api_key=e2e-url-openai-secret&"
+                "hfToken=e2e-url-hf-secret&"
+                "AWS-Secret-Access-Key=e2e-url-aws-secret&"
+                "max_tokens=128&token_count=9&tokenizer=qwen&model=qwen&seed=11"
+            ),
             "openai_api_key": "e2e-openai-secret",
             "aws_secret_access_key": "e2e-aws-secret",
             "hf_token": "e2e-hf-secret",
@@ -135,6 +143,21 @@ dimensions:
     experiment_id = planned["data"]["experiment_id"]
     plan_hash = planned["data"]["plan_hash"]
     variant_id = planned["data"]["variant_ids"][0]
+    source_bundle_path = next(
+        Path(artifact["path"])
+        for artifact in planned["artifacts"]
+        if Path(artifact["path"]).name == "source-bundle.json"
+    )
+    serialized_source_bundle = source_bundle_path.read_text(encoding="utf-8")
+    for secret in (
+        "e2e-url-openai-secret",
+        "e2e-url-hf-secret",
+        "e2e-url-aws-secret",
+    ):
+        assert secret not in serialized_source_bundle
+    persisted_source = json.loads(serialized_source_bundle)["sources"][0]["raw_graph"]
+    persisted_source_inputs = persisted_source[next(iter(graph))]["inputs"]
+    assert urlsplit(persisted_source_inputs["credential_query_input"]).query == ""
 
     def download_output(_url: str, target: Path) -> Path:
         target.write_bytes(valid_media_bytes("image/png"))
@@ -192,16 +215,24 @@ dimensions:
         b"e2e-openai-secret",
         b"e2e-aws-secret",
         b"e2e-hf-secret",
+        b"e2e-url-openai-secret",
+        b"e2e-url-hf-secret",
+        b"e2e-url-aws-secret",
     ):
         assert secret not in serialized_bundle
-    selected_graph = json.loads(
-        (bundle / "selected-workflow-api.json").read_text(encoding="utf-8")
-    )
-    selected_inputs = selected_graph[next(iter(graph))]["inputs"]
-    assert selected_inputs["openai_api_key"] == "[REDACTED]"
-    assert selected_inputs["aws_secret_access_key"] == "[REDACTED]"
-    assert selected_inputs["hf_token"] == "[REDACTED]"
-    assert selected_inputs["token_count"] == 9
-    assert selected_inputs["tokenizer"] == "qwen-tokenizer"
-    assert selected_inputs["secret_style"] == "garden"
-    assert selected_inputs["prompt"] == "A secret garden"
+    for graph_name in (
+        "source-workflow-api.json",
+        "selected-workflow-api.json",
+    ):
+        durable_graph = json.loads(
+            (bundle / graph_name).read_text(encoding="utf-8")
+        )
+        durable_inputs = durable_graph[next(iter(graph))]["inputs"]
+        assert durable_inputs["openai_api_key"] == "[REDACTED]"
+        assert durable_inputs["aws_secret_access_key"] == "[REDACTED]"
+        assert durable_inputs["hf_token"] == "[REDACTED]"
+        assert urlsplit(durable_inputs["credential_query_input"]).query == ""
+        assert durable_inputs["token_count"] == 9
+        assert durable_inputs["tokenizer"] == "qwen-tokenizer"
+        assert durable_inputs["secret_style"] == "garden"
+        assert durable_inputs["prompt"] == "A secret garden"

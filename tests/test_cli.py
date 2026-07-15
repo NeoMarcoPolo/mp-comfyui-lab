@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 import mp_comfyui_lab
 import pytest
@@ -1473,6 +1474,13 @@ def test_plan_main_constructs_only_read_only_default_executor(tmp_path, capsys, 
     graph = json.loads((Path(__file__).parent / "fixtures" / "runninghub" / "qwen_graph.json").read_text(encoding="utf-8"))
     source_inputs = graph[next(iter(graph))]["inputs"]
     source_inputs["signed_input"] = "https://cdn.example/input.png?token=secret&revision=1"
+    source_inputs["credential_query_input"] = (
+        "https://cdn.example/query.png?"
+        "openai_api_key=planning-url-openai-secret&"
+        "hfToken=planning-url-hf-secret&"
+        "AWS-Secret-Access-Key=planning-url-aws-secret&"
+        "max_tokens=256&token_count=12&tokenizer=qwen&model=qwen&seed=7"
+    )
     source_inputs.update(
         {
             "openai_api_key": "planning-openai-secret",
@@ -1514,6 +1522,9 @@ dimensions:
         "planning-openai-secret",
         "planning-aws-secret",
         "planning-hf-secret",
+        "planning-url-openai-secret",
+        "planning-url-hf-secret",
+        "planning-url-aws-secret",
     ):
         assert secret not in serialized_source
     persisted_source = source_snapshot["sources"][0]
@@ -1521,6 +1532,7 @@ dimensions:
     assert persisted_inputs["openai_api_key"] == "[REDACTED]"
     assert persisted_inputs["aws_secret_access_key"] == "[REDACTED]"
     assert persisted_inputs["hf_token"] == "[REDACTED]"
+    assert urlsplit(persisted_inputs["credential_query_input"]).query == ""
     assert {
         key: persisted_inputs[key]
         for key in (
@@ -1546,6 +1558,14 @@ dimensions:
     plan_path = next(path for path in paths if path.parent.name == "plans")
     persisted = json.loads(plan_path.read_text(encoding="utf-8"))
     assert sanitize_for_persistence(persisted) == persisted
+    assert all(
+        secret not in json.dumps(persisted, sort_keys=True)
+        for secret in (
+            "planning-url-openai-secret",
+            "planning-url-hf-secret",
+            "planning-url-aws-secret",
+        )
+    )
     plan = ExperimentPlan.model_validate_json(plan_path.read_text(encoding="utf-8"), strict=True)
     assert plan.recompute_plan_hash() == plan.plan_hash == plan_path.stem
     assert recompute_exact_run_hash(plan.variants[0]) == plan.variants[0].exact_run_hash

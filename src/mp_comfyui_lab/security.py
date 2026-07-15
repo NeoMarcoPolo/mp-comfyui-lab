@@ -203,6 +203,11 @@ def authentication_query_keys(
 ) -> frozenset[str]:
     canonical = {canonical_security_key(key) for key, _ in query_items}
     rejected = set(canonical & CANONICAL_SIGNED_QUERY_KEYS)
+    rejected.update(
+        canonical_security_key(key)
+        for key, _ in query_items
+        if _is_secret_key(key)
+    )
     if any(key.startswith("xamz") for key in canonical):
         rejected.update(
             key
