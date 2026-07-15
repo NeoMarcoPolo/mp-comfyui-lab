@@ -97,6 +97,8 @@ from mp_comfyui_lab.mutations import compile_observed_candidates
 from mp_comfyui_lab.security import (
     SafetyError,
     sanitize_for_persistence,
+    sanitize_graph_for_persistence,
+    sanitize_planning_for_persistence,
     sanitize_untrusted_diagnostic,
 )
 from mp_comfyui_lab.schemas import (
@@ -154,7 +156,7 @@ class ReadOnlyPlanningBundleLoader:
         fetched = self._executor.fetch_workflow(ref)
         # Inspection is intentional evidence collection, not provider validation.
         capability_report = self._executor.inspect_capabilities(fetched)
-        graph = sanitize_for_persistence(thaw_json(fetched.graph))
+        graph = sanitize_graph_for_persistence(thaw_json(fetched.graph))
         source = PlanningSource(
             workflow_id=fetched.detail.candidate.workflow_id,
             canonical_url=fetched.detail.candidate.canonical_url,
@@ -1193,7 +1195,11 @@ def _plan_artifacts(
     written = [
         store.write_text_new(experiment_id, "brief.yaml", brief_document),
         store.write_json_new(experiment_id, "search-results.json", discovery_snapshot),
-        store.write_sanitized_json_new(experiment_id, "sources/source-bundle.json", source_snapshot),
+        store._write_pre_sanitized_json_new(
+            experiment_id,
+            "sources/source-bundle.json",
+            sanitize_planning_for_persistence(source_snapshot),
+        ),
         store.write_json_new(
             experiment_id,
             "evidence/graph.json",
@@ -1202,18 +1208,20 @@ def _plan_artifacts(
     ]
     for variant in plan.variants:
         written.append(
-            store.write_json_new(
+            store._write_pre_sanitized_json_new(
                 experiment_id,
                 f"variants/{variant.variant_id}.json",
-                variant.model_dump(mode="json"),
+                sanitize_planning_for_persistence(
+                    variant.model_dump(mode="json")
+                ),
             )
         )
     # This final artifact is the durable success marker for the experiment.
     written.append(
-        store.write_json_new(
+        store._write_pre_sanitized_json_new(
             experiment_id,
             f"plans/{plan.plan_hash}.json",
-            plan.model_dump(mode="json"),
+            sanitize_planning_for_persistence(plan.model_dump(mode="json")),
         )
     )
     return experiment_id, tuple({"kind": "plan", "path": str(path)} for path in written)

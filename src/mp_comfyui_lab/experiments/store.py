@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 import errno
 import hashlib
@@ -127,18 +127,33 @@ class ExperimentStore:
         self._atomic_write_new(destination, f"{serialized}\n")
         return destination
 
-    def write_sanitized_json_new(self, experiment_id: str, relative_path: str | Path, value: Any) -> Path:
-        destination = self._artifact_path(experiment_id, relative_path)
-        serialized = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
-        self._atomic_write_new(destination, f"{serialized}\n")
-        return destination
-
-    def write_sanitized_json(
+    def _write_pre_sanitized_json_new(
         self,
         experiment_id: str,
         relative_path: str | Path,
-        value: Any,
+        value: Mapping[str, Any],
     ) -> Path:
+        if not isinstance(value, Mapping):
+            raise SafetyError("pre-sanitized JSON artifact must be an object")
+        destination = self._artifact_path(experiment_id, relative_path)
+        serialized = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        self._atomic_write_new(destination, f"{serialized}\n")
+        return destination
+
+    def _write_pre_sanitized_json(
+        self,
+        experiment_id: str,
+        relative_path: str | Path,
+        value: Mapping[str, Any],
+    ) -> Path:
+        if not isinstance(value, Mapping):
+            raise SafetyError("pre-sanitized JSON artifact must be an object")
         destination = self._artifact_path(experiment_id, relative_path)
         return self._write_json_value(destination, value)
 

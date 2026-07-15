@@ -31,8 +31,12 @@ from mp_comfyui_lab.mutations.planner import (
     select_candidates,
     validate_candidate_patch,
 )
-from mp_comfyui_lab.security import SafetyError
-from mp_comfyui_lab.security import sanitize_for_persistence
+from mp_comfyui_lab.security import (
+    SafetyError,
+    sanitize_for_persistence,
+    sanitize_graph_for_persistence,
+    sanitize_planning_for_persistence,
+)
 
 from .models import (
     MAX_MANIFEST_BYTES,
@@ -574,9 +578,11 @@ def _variant(
         materialized = materialize_variant(thaw_json(source.raw_graph), patch)
     except (PatchValidationError, PatchTopologyError, ValidationError, ValueError) as error:
         raise PlanningValidationError(f"structural materialization failed: {error}") from error
-    graph = sanitize_for_persistence(thaw_json(materialized.graph))
-    patch_payload = sanitize_for_persistence(patch.model_dump(mode="json"))
-    diff_payload = sanitize_for_persistence(materialized.diff.model_dump(mode="json"))
+    graph = sanitize_graph_for_persistence(thaw_json(materialized.graph))
+    patch_payload = sanitize_graph_for_persistence(patch.model_dump(mode="json"))
+    diff_payload = sanitize_graph_for_persistence(
+        materialized.diff.model_dump(mode="json")
+    )
     expected_output_count, output_node_ids, expected_media_types = _output_details(
         brief=brief,
         graph=graph,
@@ -592,7 +598,7 @@ def _variant(
             "graph": graph,
             "source_hash": source.source_hash,
             "fixtures": [item.model_dump(mode="json") for item in fixture_fingerprints],
-            "prompt_lines": list(prompt_lines),
+            "prompt_lines": execution_parameters["prompt_lines"],
             "execution_parameters": execution_parameters,
             "expected_output_count": expected_output_count,
             "output_node_ids": list(output_node_ids),
@@ -704,7 +710,7 @@ def build_plan(
         )
         coverage.add(candidate.hypothesis)
     variants_tuple = tuple(variants)
-    plan_payload = sanitize_for_persistence({
+    plan_payload = sanitize_planning_for_persistence({
         "source_hashes": sorted(item.source_hash for item in source_bundle.sources),
         "source_provenance": [
             {

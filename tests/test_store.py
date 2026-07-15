@@ -619,6 +619,74 @@ def test_graph_url_sanitizer_uses_credential_key_grammar_for_query_names() -> No
     assert "aws-url-secret" not in serialized
 
 
+def test_planning_sanitizer_is_graph_aware_only_for_explicit_fields() -> None:
+    graph_url = (
+        "https://cdn.example/input.png?"
+        "openai_api_key=openai-secret&hf_token=hf-secret&"
+        "aws_secret_access_key=aws-secret&X-Amz-Signature=signature-secret&"
+        "sig=sig-secret&token=token-secret&access_token=access-secret&"
+        "max_tokens=256&token_count=12&tokenizer=qwen&model=qwen&"
+        "seed=7&revision=3"
+    )
+    value = {
+        "raw_graph": {
+            "1": {
+                "inputs": {
+                    "url": graph_url,
+                    "openai_api_key": "object-secret",
+                }
+            }
+        },
+        "semantic_patch": {
+            "mutations": [{"value": graph_url}],
+        },
+        "provider_url": graph_url,
+        "raw_graph_backup": graph_url,
+    }
+
+    sanitized = security_module.sanitize_planning_for_persistence(value)
+    expected_query = {
+        "max_tokens": "256",
+        "token_count": "12",
+        "tokenizer": "qwen",
+        "model": "qwen",
+        "seed": "7",
+        "revision": "3",
+    }
+
+    assert dict(
+        parse_qsl(urlsplit(sanitized["raw_graph"]["1"]["inputs"]["url"]).query)
+    ) == expected_query
+    assert dict(
+        parse_qsl(
+            urlsplit(sanitized["semantic_patch"]["mutations"][0]["value"]).query
+        )
+    ) == expected_query
+    assert sanitized["raw_graph"]["1"]["inputs"]["openai_api_key"] == "[REDACTED]"
+    assert urlsplit(sanitized["provider_url"]).query == ""
+    assert urlsplit(sanitized["raw_graph_backup"]).query == ""
+    assert urlsplit(
+        sanitize_for_persistence({"output_url": graph_url})["output_url"]
+    ).query == ""
+    serialized = json.dumps(sanitized, sort_keys=True)
+    for secret in (
+        "openai-secret",
+        "hf-secret",
+        "aws-secret",
+        "signature-secret",
+        "sig-secret",
+        "token-secret",
+        "access-secret",
+        "object-secret",
+    ):
+        assert secret not in serialized
+
+
+def test_store_does_not_expose_an_unvalidated_sanitizer_bypass() -> None:
+    assert not hasattr(ExperimentStore, "write_sanitized_json_new")
+    assert not hasattr(ExperimentStore, "write_sanitized_json")
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [

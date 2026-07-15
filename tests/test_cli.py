@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import mp_comfyui_lab
 import pytest
@@ -51,7 +51,11 @@ from mp_comfyui_lab.experiments.models import (
 from mp_comfyui_lab.experiments.planning import recompute_exact_run_hash
 from mp_comfyui_lab.experiments.saturation import WaveArtifact
 from mp_comfyui_lab.experiments.store import ExperimentStore
-from mp_comfyui_lab.security import SafetyError, sanitize_for_persistence
+from mp_comfyui_lab.security import (
+    SafetyError,
+    sanitize_for_persistence,
+    sanitize_planning_for_persistence,
+)
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import normalize_graph
 
@@ -1479,7 +1483,11 @@ def test_plan_main_constructs_only_read_only_default_executor(tmp_path, capsys, 
         "openai_api_key=planning-url-openai-secret&"
         "hfToken=planning-url-hf-secret&"
         "AWS-Secret-Access-Key=planning-url-aws-secret&"
-        "max_tokens=256&token_count=12&tokenizer=qwen&model=qwen&seed=7"
+        "X-Amz-Signature=planning-url-signature-secret&"
+        "sig=planning-url-sig-secret&token=planning-url-token-secret&"
+        "access_token=planning-url-access-secret&"
+        "max_tokens=256&token_count=12&tokenizer=qwen&model=qwen&"
+        "seed=7&revision=3"
     )
     source_inputs.update(
         {
@@ -1525,6 +1533,10 @@ dimensions:
         "planning-url-openai-secret",
         "planning-url-hf-secret",
         "planning-url-aws-secret",
+        "planning-url-signature-secret",
+        "planning-url-sig-secret",
+        "planning-url-token-secret",
+        "planning-url-access-secret",
     ):
         assert secret not in serialized_source
     persisted_source = source_snapshot["sources"][0]
@@ -1532,7 +1544,30 @@ dimensions:
     assert persisted_inputs["openai_api_key"] == "[REDACTED]"
     assert persisted_inputs["aws_secret_access_key"] == "[REDACTED]"
     assert persisted_inputs["hf_token"] == "[REDACTED]"
-    assert urlsplit(persisted_inputs["credential_query_input"]).query == ""
+    expected_query = {
+        "max_tokens": "256",
+        "token_count": "12",
+        "tokenizer": "qwen",
+        "model": "qwen",
+        "seed": "7",
+        "revision": "3",
+    }
+    assert dict(
+        parse_qsl(urlsplit(persisted_inputs["credential_query_input"]).query)
+    ) == expected_query
+    assert dict(parse_qsl(urlsplit(persisted_inputs["signed_input"]).query)) == {
+        "revision": "1"
+    }
+    normalized_node = next(
+        node
+        for node in persisted_source["normalized_graph"]["nodes"]
+        if node["node_id"] == next(iter(graph))
+    )
+    assert dict(
+        parse_qsl(
+            urlsplit(normalized_node["inputs"]["credential_query_input"]).query
+        )
+    ) == expected_query
     assert {
         key: persisted_inputs[key]
         for key in (
@@ -1555,20 +1590,43 @@ dimensions:
     }
     assert source_graph_hash(persisted_source["raw_graph"]) == persisted_source["source_hash"]
     assert capability_hash(persisted_source["raw_graph"]) == persisted_source["capability_hash"]
+    variant_path = next(path for path in paths if path.parent.name == "variants")
+    persisted_variant = json.loads(variant_path.read_text(encoding="utf-8"))
     plan_path = next(path for path in paths if path.parent.name == "plans")
     persisted = json.loads(plan_path.read_text(encoding="utf-8"))
-    assert sanitize_for_persistence(persisted) == persisted
+    assert sanitize_planning_for_persistence(persisted) == persisted
     assert all(
         secret not in json.dumps(persisted, sort_keys=True)
         for secret in (
             "planning-url-openai-secret",
             "planning-url-hf-secret",
             "planning-url-aws-secret",
+            "planning-url-signature-secret",
+            "planning-url-sig-secret",
+            "planning-url-token-secret",
+            "planning-url-access-secret",
         )
     )
+    for durable_graph in (
+        persisted_variant["materialized_graph"],
+        persisted["variants"][0]["materialized_graph"],
+        persisted["approval_payload"]["variants"][0]["materialized_graph"],
+    ):
+        durable_inputs = durable_graph[next(iter(graph))]["inputs"]
+        assert dict(
+            parse_qsl(urlsplit(durable_inputs["credential_query_input"]).query)
+        ) == expected_query
+        assert dict(parse_qsl(urlsplit(durable_inputs["signed_input"]).query)) == {
+            "revision": "1"
+        }
     plan = ExperimentPlan.model_validate_json(plan_path.read_text(encoding="utf-8"), strict=True)
     assert plan.recompute_plan_hash() == plan.plan_hash == plan_path.stem
     assert recompute_exact_run_hash(plan.variants[0]) == plan.variants[0].exact_run_hash
+    canonical_plan = plan.canonical_json()
+    assert (
+        ExperimentPlan.model_validate_json(canonical_plan, strict=True).canonical_json()
+        == canonical_plan
+    )
     persisted["variants"][0]["materialized_graph"][next(iter(persisted["variants"][0]["materialized_graph"]))]["inputs"]["signed_input"] = "tampered"
     with pytest.raises(Exception):
         ExperimentPlan.model_validate(persisted)

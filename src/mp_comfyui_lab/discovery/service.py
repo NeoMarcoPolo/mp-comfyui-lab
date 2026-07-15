@@ -760,7 +760,7 @@ class DiscoveryService:
             graph=safe_graph,
         )
         artifacts: list[Artifact] = [self._persist_detail(experiment_id, fetched.detail)]
-        graph_path = self.store.write_sanitized_json(
+        graph_path = self.store._write_pre_sanitized_json(
             experiment_id,
             Path("sources") / ref.workflow_id / "graph.json",
             safe_graph,
@@ -778,10 +778,12 @@ class DiscoveryService:
                 capability_hash=capability_digest,
                 roles=roles,
             )
-            normalized_path = self.store.write_sanitized_json(
+            normalized_path = self.store._write_pre_sanitized_json(
                 experiment_id,
                 Path("sources") / ref.workflow_id / "normalized.json",
-                normalized.model_dump(mode="json"),
+                sanitize_graph_for_persistence(
+                    normalized.model_dump(mode="json")
+                ),
             )
             artifacts.append(Artifact(kind="normalized", path=str(normalized_path)))
         except (GraphHashError, GraphNormalizationError, RecursionError, UnicodeError) as error:

@@ -39,6 +39,7 @@ from mp_comfyui_lab.media import (
 from mp_comfyui_lab.security import SafetyError
 from mp_comfyui_lab.security import safe_filename
 from mp_comfyui_lab.security import sanitize_for_persistence
+from mp_comfyui_lab.security import sanitize_planning_for_persistence
 from mp_comfyui_lab.security import sanitize_untrusted_diagnostic
 
 from .models import (
@@ -221,10 +222,12 @@ class ExperimentEngine:
                 run_id,
                 variant,
             )
-            self._store.write_json_new(
+            self._store._write_pre_sanitized_json_new(
                 experiment_id,
                 self._run_path(run_id),
-                record.model_dump(mode="json"),
+                sanitize_planning_for_persistence(
+                    record.model_dump(mode="json")
+                ),
             )
             executor = self._executor_factory()
             try:
@@ -1322,10 +1325,10 @@ class ExperimentEngine:
         return f"runs/{run_id}.json"
 
     def _persist(self, record: RunRecord) -> RunRecord:
-        self._store.write_json(
+        self._store._write_pre_sanitized_json(
             record.experiment_id,
             self._run_path(record.run_id),
-            record.model_dump(mode="json"),
+            sanitize_planning_for_persistence(record.model_dump(mode="json")),
         )
         return record
 

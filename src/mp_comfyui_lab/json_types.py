@@ -8,7 +8,10 @@ from typing import Annotated, Any
 from pydantic import BeforeValidator, GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
 
-from mp_comfyui_lab.security import sanitize_for_persistence
+from mp_comfyui_lab.security import (
+    sanitize_for_persistence,
+    sanitize_planning_for_persistence,
+)
 
 
 class FrozenDict(Mapping[str, Any]):
@@ -108,8 +111,17 @@ def _sanitize_json_object(value: Any) -> Any:
     return sanitize_for_persistence(thaw_json(validated))
 
 
+def _sanitize_planning_json_object(value: Any) -> Any:
+    validated = freeze_json_object(value)
+    return sanitize_planning_for_persistence(thaw_json(validated))
+
+
 FrozenJsonObject = FrozenDict
 SanitizedJsonObject = Annotated[
     FrozenDict,
     BeforeValidator(_sanitize_json_object),
+]
+PlanningSanitizedJsonObject = Annotated[
+    FrozenDict,
+    BeforeValidator(_sanitize_planning_json_object),
 ]

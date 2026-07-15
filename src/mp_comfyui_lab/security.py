@@ -78,6 +78,15 @@ CANONICAL_AZURE_SAS_QUERY_KEYS = frozenset(
     }
 )
 REDACTED = "[REDACTED]"
+PLANNING_GRAPH_VALUE_FIELDS = frozenset(
+    {
+        "raw_graph",
+        "normalized_graph",
+        "materialized_graph",
+        "semantic_patch",
+        "diff",
+    }
+)
 MAX_DIAGNOSTIC_JSON_LENGTH = 65_536
 MAX_GRAPH_FRAGMENT_LENGTH = 65_536
 MAX_GRAPH_FRAGMENT_DECODE_LAYERS = 4
@@ -630,3 +639,25 @@ def _sanitize_for_persistence(value: Any) -> Any:
 
 def sanitize_for_persistence(value: Any) -> Any:
     return _sanitize_for_persistence(value)
+
+
+def sanitize_planning_for_persistence(value: Any) -> Any:
+    """Preserve safe graph query values only in explicit planning fields."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            if isinstance(key, str) and _is_secret_key(key):
+                sanitized[key] = REDACTED
+                continue
+            if key in PLANNING_GRAPH_VALUE_FIELDS:
+                sanitized[key] = sanitize_graph_for_persistence(item)
+                continue
+            sanitized[key] = sanitize_planning_for_persistence(item)
+        return sanitized
+    if isinstance(value, list):
+        return [sanitize_planning_for_persistence(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_planning_for_persistence(item) for item in value)
+    if isinstance(value, str):
+        return sanitize_embedded_urls(value)
+    return value

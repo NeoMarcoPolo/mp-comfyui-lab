@@ -28,6 +28,7 @@ from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
 from mp_comfyui_lab.graph.normalize import GraphNormalizationError, normalize_graph
 from mp_comfyui_lab.json_types import (
     FrozenJsonObject,
+    PlanningSanitizedJsonObject,
     SanitizedJsonObject,
     thaw_json,
 )
@@ -1095,7 +1096,7 @@ class ExperimentPlan(_FrozenModel):
     variants: tuple[PlannedVariant, ...] = Field(min_length=1)
     capability_coverage: tuple[DimensionName, ...] = Field(default=(), max_length=len(DimensionName))
     warnings: tuple[str, ...] = Field(default=(), max_length=512)
-    approval_payload: SanitizedJsonObject
+    approval_payload: PlanningSanitizedJsonObject
 
     @field_validator(
         "source_hashes",

@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import types
 import ctypes
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 from pydantic import ValidationError
@@ -53,6 +54,8 @@ from mp_comfyui_lab.graph.patch import materialize_variant
 from mp_comfyui_lab.graph.models import SemanticRole
 from mp_comfyui_lab.graph.normalize import normalize_graph
 from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
+from mp_comfyui_lab.json_types import thaw_json
+from mp_comfyui_lab.security import sanitize_graph_for_persistence
 
 
 def _graph(*, reference_count: int = 1, prompt_fanout: bool = True) -> dict:
@@ -549,6 +552,129 @@ def test_fixture_fingerprints_change_plan_hash_without_persisting_absolute_path(
     dumped = first.canonical_json()
     assert str(portrait) not in dumped
     assert "portrait.png" in dumped
+
+
+def test_benign_source_query_values_survive_planning_and_affect_exact_hashes(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+
+    def planned(revision: int) -> tuple[PlanningSource, ExperimentPlan]:
+        graph = _graph()
+        graph["6"]["inputs"]["model_url"] = (
+            "https://cdn.example/model?"
+            "openai_api_key=openai-secret&hf_token=hf-secret&"
+            "aws_secret_access_key=aws-secret&X-Amz-Signature=signature-secret&"
+            "sig=sig-secret&token=token-secret&access_token=access-secret&"
+            f"max_tokens=256&token_count=12&tokenizer=qwen&model=qwen&seed=7&revision={revision}"
+        )
+        safe_graph = sanitize_graph_for_persistence(graph)
+        bundle = _bundle(graph=safe_graph)
+        return bundle.sources[0], build_plan(
+            _brief(),
+            bundle,
+            config=_config(tmp_path),
+        )
+
+    first_source, first = planned(1)
+    second_source, second = planned(2)
+
+    assert first_source.source_hash != second_source.source_hash
+    assert first.variants[0].exact_run_hash != second.variants[0].exact_run_hash
+    assert first.plan_hash != second.plan_hash
+    assert first_source.capability_hash == capability_hash(first_source.raw_graph)
+    assert first.variants[0].capability_hash == capability_hash(
+        first.variants[0].materialized_graph
+    )
+    expected_query = {
+        "max_tokens": "256",
+        "token_count": "12",
+        "tokenizer": "qwen",
+        "model": "qwen",
+        "seed": "7",
+        "revision": "1",
+    }
+    for graph in (
+        thaw_json(first_source.raw_graph),
+        thaw_json(first.variants[0].materialized_graph),
+        thaw_json(first.approval_payload)["variants"][0]["materialized_graph"],
+    ):
+        assert dict(
+            parse_qsl(urlsplit(graph["6"]["inputs"]["model_url"]).query)
+        ) == expected_query
+    serialized = first.canonical_json()
+    for secret in (
+        "openai-secret",
+        "hf-secret",
+        "aws-secret",
+        "signature-secret",
+        "sig-secret",
+        "token-secret",
+        "access-secret",
+    ):
+        assert secret not in serialized
+
+
+def test_semantic_patch_and_diff_preserve_benign_graph_query_values(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "portrait.png").write_bytes(b"fixture")
+    value = (
+        "https://models.example/checkpoint?"
+        "openai_api_key=openai-secret&token=token-secret&"
+        "max_tokens=64&model=qwen&seed=5&revision=8"
+    )
+    candidate = Candidate(
+        candidate_id="checkpoint-url",
+        hypothesis="checkpoint",
+        capability_signature="checkpoint:url",
+        confidence=ConfidenceLabel.OBSERVED,
+        evidence_ids=("123",),
+        semantic_patch=SemanticPatch(
+            mutations=(
+                SetRoleInput(
+                    role=SemanticRole.CHECKPOINT,
+                    binding_index=0,
+                    field_name="ckpt_name",
+                    value=value,
+                ),
+            )
+        ),
+    )
+
+    plan = build_plan(
+        _brief(),
+        _bundle(candidates=(candidate,)),
+        config=_config(tmp_path),
+    )
+    variant = next(item for item in plan.variants if item.variant_id == "checkpoint-url")
+    expected_query = {
+        "max_tokens": "64",
+        "model": "qwen",
+        "seed": "5",
+        "revision": "8",
+    }
+    patch_value = next(
+        mutation["value"]
+        for mutation in thaw_json(variant.semantic_patch)["mutations"]
+        if mutation["field_name"] == "ckpt_name"
+    )
+    diff_values = json.dumps(thaw_json(variant.diff), sort_keys=True)
+    materialized_value = thaw_json(variant.materialized_graph)["4"]["inputs"][
+        "ckpt_name"
+    ]
+
+    assert dict(parse_qsl(urlsplit(patch_value).query)) == expected_query
+    assert "max_tokens=64" in diff_values
+    assert "revision=8" in diff_values
+    assert dict(parse_qsl(urlsplit(materialized_value).query)) == expected_query
+    approval = thaw_json(plan.approval_payload)
+    approved_variant = next(
+        item for item in approval["variants"] if item["variant_id"] == "checkpoint-url"
+    )
+    assert approved_variant == variant.model_dump(mode="json")
+    assert "openai-secret" not in plan.canonical_json()
+    assert "token-secret" not in plan.canonical_json()
 
 
 def test_prompt_order_and_dimension_approval_participate_in_plan_hash(tmp_path: Path) -> None:

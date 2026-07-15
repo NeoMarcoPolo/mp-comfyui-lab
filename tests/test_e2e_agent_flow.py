@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from mp_comfyui_lab.cli.app import ExitCode, main
 from mp_comfyui_lab.discovery.models import WorkflowCandidate, WorkflowDetail
@@ -16,6 +16,20 @@ from helpers import FakeExecutor, valid_media_bytes
 
 WORKFLOW_ID = "1980860923768426497"
 WORKFLOW_URL = f"https://www.runninghub.ai/post/{WORKFLOW_ID}"
+
+
+def _http_urls(value: object) -> tuple[str, ...]:
+    if isinstance(value, dict):
+        return tuple(
+            url
+            for item in value.values()
+            for url in _http_urls(item)
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(url for item in value for url in _http_urls(item))
+    if isinstance(value, str) and value.startswith(("http://", "https://")):
+        return (value,)
+    return ()
 
 
 def _invoke(capsys, arguments, **dependencies):
@@ -57,7 +71,11 @@ def test_noninteractive_agent_flow_reaches_self_contained_handoff(
                 "openai_api_key=e2e-url-openai-secret&"
                 "hfToken=e2e-url-hf-secret&"
                 "AWS-Secret-Access-Key=e2e-url-aws-secret&"
-                "max_tokens=128&token_count=9&tokenizer=qwen&model=qwen&seed=11"
+                "X-Amz-Signature=e2e-url-signature-secret&"
+                "sig=e2e-url-sig-secret&token=e2e-url-token-secret&"
+                "access_token=e2e-url-access-secret&"
+                "max_tokens=128&token_count=9&tokenizer=qwen&model=qwen&"
+                "seed=11&revision=4"
             ),
             "openai_api_key": "e2e-openai-secret",
             "aws_secret_access_key": "e2e-aws-secret",
@@ -125,7 +143,8 @@ fixtures:
   reference_images:
     - uri: portrait.png
       binding_index: 0
-  prompt_lines: [cinematic next scene]
+  prompt_lines:
+    - "https://prompt.example/template?access_token=e2e-prompt-access-secret&model=qwen&seed=17&revision=6"
 expectations:
   output_count: 1
   media_types: [image/png]
@@ -153,11 +172,25 @@ dimensions:
         "e2e-url-openai-secret",
         "e2e-url-hf-secret",
         "e2e-url-aws-secret",
+        "e2e-url-signature-secret",
+        "e2e-url-sig-secret",
+        "e2e-url-token-secret",
+        "e2e-url-access-secret",
     ):
         assert secret not in serialized_source_bundle
     persisted_source = json.loads(serialized_source_bundle)["sources"][0]["raw_graph"]
     persisted_source_inputs = persisted_source[next(iter(graph))]["inputs"]
-    assert urlsplit(persisted_source_inputs["credential_query_input"]).query == ""
+    expected_query = {
+        "max_tokens": "128",
+        "token_count": "9",
+        "tokenizer": "qwen",
+        "model": "qwen",
+        "seed": "11",
+        "revision": "4",
+    }
+    assert dict(
+        parse_qsl(urlsplit(persisted_source_inputs["credential_query_input"]).query)
+    ) == expected_query
 
     def download_output(_url: str, target: Path) -> Path:
         target.write_bytes(valid_media_bytes("image/png"))
@@ -218,6 +251,11 @@ dimensions:
         b"e2e-url-openai-secret",
         b"e2e-url-hf-secret",
         b"e2e-url-aws-secret",
+        b"e2e-url-signature-secret",
+        b"e2e-url-sig-secret",
+        b"e2e-url-token-secret",
+        b"e2e-url-access-secret",
+        b"e2e-prompt-access-secret",
     ):
         assert secret not in serialized_bundle
     for graph_name in (
@@ -231,8 +269,31 @@ dimensions:
         assert durable_inputs["openai_api_key"] == "[REDACTED]"
         assert durable_inputs["aws_secret_access_key"] == "[REDACTED]"
         assert durable_inputs["hf_token"] == "[REDACTED]"
-        assert urlsplit(durable_inputs["credential_query_input"]).query == ""
+        assert dict(
+            parse_qsl(urlsplit(durable_inputs["credential_query_input"]).query)
+        ) == expected_query
         assert durable_inputs["token_count"] == 9
         assert durable_inputs["tokenizer"] == "qwen-tokenizer"
         assert durable_inputs["secret_style"] == "garden"
         assert durable_inputs["prompt"] == "A secret garden"
+    semantic_patch = json.loads(
+        (bundle / "semantic-patch.json").read_text(encoding="utf-8")
+    )
+    prompt_urls = tuple(
+        url for url in _http_urls(semantic_patch) if "prompt.example" in url
+    )
+    assert len(prompt_urls) == 1
+    assert dict(parse_qsl(urlsplit(prompt_urls[0]).query)) == {
+        "model": "qwen",
+        "seed": "17",
+        "revision": "6",
+    }
+    selected_urls = _http_urls(
+        json.loads((bundle / "selected-workflow-api.json").read_text(encoding="utf-8"))
+    )
+    assert any(
+        dict(parse_qsl(urlsplit(url).query))
+        == {"model": "qwen", "seed": "17", "revision": "6"}
+        for url in selected_urls
+        if "prompt.example" in url
+    )
