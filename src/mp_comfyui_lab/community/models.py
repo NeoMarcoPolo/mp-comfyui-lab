@@ -52,6 +52,17 @@ class WorkflowIdentity(BaseModel):
         return "::".join(parts)
 
 
+class WorkflowVariant(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    variant_id: str
+    source_key: str
+    api_graph_path: str | None = None
+    ui_graph_paths: tuple[str, ...] = ()
+    source_graph_hash: str
+    image_hash: str
+
+
 class WorkflowRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -62,4 +73,5 @@ class WorkflowRecord(BaseModel):
     ui_graph_paths: tuple[str, ...]
     source_graph_hashes: tuple[str, ...]
     image_hashes: tuple[str, ...]
+    variants: tuple[WorkflowVariant, ...] = ()
     identity_review_required: bool = False

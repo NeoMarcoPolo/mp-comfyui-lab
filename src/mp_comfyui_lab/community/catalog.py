@@ -13,6 +13,7 @@ from mp_comfyui_lab.community.models import (
     WorkflowIdentity,
     WorkflowRecord,
     WorkflowSource,
+    WorkflowVariant,
 )
 from mp_comfyui_lab.graph.hashing import (
     GraphHashError,
@@ -293,6 +294,31 @@ def _workflow_id(identity: WorkflowIdentity) -> str:
     return hashlib.sha256(identity.key.encode("utf-8")).hexdigest()[:24]
 
 
+def _variant(
+    source: WorkflowSource,
+    api_graph_path: str | None,
+    ui_graph_paths: Sequence[str],
+    source_graph_hash: str,
+) -> WorkflowVariant:
+    payload = "\0".join(
+        (
+            source.source_key,
+            api_graph_path or "",
+            "|".join(sorted(ui_graph_paths)),
+            source_graph_hash,
+            source.attachment_sha256,
+        )
+    )
+    return WorkflowVariant(
+        variant_id=hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24],
+        source_key=source.source_key,
+        api_graph_path=api_graph_path,
+        ui_graph_paths=tuple(sorted(ui_graph_paths)),
+        source_graph_hash=source_graph_hash,
+        image_hash=source.attachment_sha256,
+    )
+
+
 def _graph_hashes(
     graph: Mapping[str, Any], manifest_hash: str
 ) -> tuple[str, str, bool]:
@@ -364,6 +390,12 @@ def build_workflow_catalog(
                             "source_hash": source_digest,
                             "image_hash": source.attachment_sha256,
                             "review": len(api_refs) > 1 or fallback_review,
+                            "variant": _variant(
+                                source,
+                                relative_path,
+                                [str(item["relative_path"]) for item in ui_refs],
+                                source_digest,
+                            ),
                         }
                     )
             else:
@@ -391,6 +423,12 @@ def build_workflow_catalog(
                             "source_hash": ui_hash,
                             "image_hash": source.attachment_sha256,
                             "review": True,
+                            "variant": _variant(
+                                source,
+                                None,
+                                [relative_path],
+                                ui_hash,
+                            ),
                         }
                     )
 
@@ -403,6 +441,9 @@ def build_workflow_catalog(
         items = grouped[identity_key]
         identity = items[0]["identity"]
         sources = {item["source"].source_key: item["source"] for item in items}
+        variants = {
+            item["variant"].variant_id: item["variant"] for item in items
+        }
         records.append(
             WorkflowRecord(
                 workflow_id=_workflow_id(identity),
@@ -412,6 +453,7 @@ def build_workflow_catalog(
                 ui_graph_paths=tuple(sorted({path for item in items for path in item["ui_paths"]})),
                 source_graph_hashes=tuple(sorted({item["source_hash"] for item in items})),
                 image_hashes=tuple(sorted({item["image_hash"] for item in items})),
+                variants=tuple(variants[key] for key in sorted(variants)),
                 identity_review_required=any(item["review"] for item in items),
             )
         )

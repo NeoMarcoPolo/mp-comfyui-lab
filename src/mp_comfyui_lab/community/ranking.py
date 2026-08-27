@@ -121,6 +121,7 @@ class RankedWorkflow(BaseModel):
     adoption_component: float
     starboard_component: float
     score: float
+    representative_variant_id: str | None = None
     inclusion_reasons: tuple[str, ...] = ()
     exclusion_reason: str | None = None
 
@@ -160,9 +161,17 @@ def _canonical_messages(
     by_id = _message_by_id(evidence)
     found: dict[str, MessageEvidence] = {}
     for source in workflow.sources:
-        message = evidence.messages.get(
-            f"{source.guild_id}/{source.channel_id}/{source.message_id}"
-        ) or by_id.get(source.message_id)
+        message = _canonical_message_for_source(source, evidence, by_id)
+        if message is not None and not message.author_is_bot:
+            found[message.message_id] = message
+    return sorted(found.values(), key=lambda item: (item.timestamp, item.message_id))
+
+
+def _canonical_message_for_source(source, evidence, by_id):
+    message = evidence.messages.get(
+        f"{source.guild_id}/{source.channel_id}/{source.message_id}"
+    ) or by_id.get(source.message_id)
+    if message is not None:
         visited = set()
         while (
             message is not None
@@ -174,9 +183,7 @@ def _canonical_messages(
             if referenced is None:
                 break
             message = referenced
-        if message is not None and not message.author_is_bot:
-            found[message.message_id] = message
-    return sorted(found.values(), key=lambda item: (item.timestamp, item.message_id))
+    return message
 
 
 def _aggregate(workflow: WorkflowRecord, evidence: EvidenceSnapshot, now: datetime) -> dict:
@@ -230,6 +237,39 @@ def _aggregate(workflow: WorkflowRecord, evidence: EvidenceSnapshot, now: dateti
         message.author_id for message in canonical if message.author_id != primary_author
     }
     adoption_count = len(source_authors | canonical_authors)
+    by_id = _message_by_id(evidence)
+    historical_by_source = {
+        item.source_message_id: item.historical_star_count
+        for item in evidence.starboard_snapshots
+    }
+    source_scores = {}
+    for source in workflow.sources:
+        message = _canonical_message_for_source(source, evidence, by_id)
+        if message is None:
+            source_scores[source.source_key] = (0, 0.0)
+            continue
+        stars = sum(
+            item.count for item in message.reactions if _is_star(item.emoji_name)
+        )
+        weighted = sum(
+            item.count * _reaction_weight(item.emoji_name)
+            for item in message.reactions
+            if not _is_star(item.emoji_name)
+        )
+        source_scores[source.source_key] = (
+            max(stars, historical_by_source.get(message.message_id, 0)),
+            weighted,
+        )
+    representative_variant_id = None
+    if workflow.variants:
+        representative_variant_id = sorted(
+            workflow.variants,
+            key=lambda variant: (
+                -source_scores.get(variant.source_key, (0, 0.0))[0],
+                -source_scores.get(variant.source_key, (0, 0.0))[1],
+                variant.variant_id,
+            ),
+        )[0].variant_id
     age_days = max(0.0, (now - primary_timestamp).total_seconds() / 86_400)
     opportunity_factor = min(1.0, max(0.25, age_days / 14.0))
     return {
@@ -241,6 +281,7 @@ def _aggregate(workflow: WorkflowRecord, evidence: EvidenceSnapshot, now: dateti
         "adoption_count": adoption_count,
         "starboard": starboard,
         "opportunity_factor": opportunity_factor,
+        "representative_variant_id": representative_variant_id,
     }
 
 
@@ -307,6 +348,7 @@ def score_workflows(
                 adoption_component=adoption_component,
                 starboard_component=starboard_component,
                 score=score,
+                representative_variant_id=aggregate["representative_variant_id"],
             )
         )
     return sorted(ranked, key=lambda item: (-item.score, item.workflow.workflow_id))

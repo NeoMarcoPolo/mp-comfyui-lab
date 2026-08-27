@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from mp_comfyui_lab.community.models import WorkflowIdentity, WorkflowRecord, WorkflowSource
+from mp_comfyui_lab.community.models import (
+    WorkflowIdentity,
+    WorkflowRecord,
+    WorkflowSource,
+    WorkflowVariant,
+)
 from mp_comfyui_lab.community.ranking import (
     EvidenceSnapshot,
     score_workflows,
@@ -53,6 +58,16 @@ def _record(
         ui_graph_paths=(),
         source_graph_hashes=(f"graph-{workflow_id}",),
         image_hashes=(f"image-{workflow_id}",),
+        variants=(
+            WorkflowVariant(
+                variant_id=f"variant-{workflow_id}",
+                source_key=source.source_key,
+                api_graph_path=f"{workflow_id}.json",
+                ui_graph_paths=(),
+                source_graph_hash=f"graph-{workflow_id}",
+                image_hash=f"image-{workflow_id}",
+            ),
+        ),
     )
 
 
@@ -134,7 +149,22 @@ def test_score_counts_each_independent_non_bot_author_once() -> None:
                 }
             )
         )
-    record = original.model_copy(update={"sources": tuple(sources)})
+    record = original.model_copy(
+        update={
+            "sources": tuple(sources),
+            "variants": tuple(
+                WorkflowVariant(
+                    variant_id=f"variant-{source.message_id}",
+                    source_key=source.source_key,
+                    api_graph_path=f"{source.message_id}.json",
+                    ui_graph_paths=(),
+                    source_graph_hash=f"graph-{source.message_id}",
+                    image_hash=f"image-{source.message_id}",
+                )
+                for source in sources
+            ),
+        }
+    )
     messages = {
         f"guild/channel/{source.message_id}": {
             **_message(original),
@@ -150,6 +180,47 @@ def test_score_counts_each_independent_non_bot_author_once() -> None:
 
     assert ranked.independent_adoption_count == 1
     assert ranked.adoption_component == 1 / 3
+
+
+def test_score_selects_representative_variant_from_highest_engagement_source() -> None:
+    original = _record("one", family="krea-2", author="creator")
+    repost_source = original.sources[0].model_copy(
+        update={
+            "message_id": "two",
+            "message_url": "https://discord.com/channels/guild/channel/two",
+            "attachment_id": "attachment-two",
+            "author_id": "adopter",
+        }
+    )
+    record = original.model_copy(
+        update={
+            "sources": (*original.sources, repost_source),
+            "variants": (
+                *original.variants,
+                WorkflowVariant(
+                    variant_id="variant-two",
+                    source_key=repost_source.source_key,
+                    api_graph_path="two.json",
+                    ui_graph_paths=(),
+                    source_graph_hash="graph-two",
+                    image_hash="image-two",
+                ),
+            ),
+        }
+    )
+    messages = {
+        "guild/channel/one": _message(original, stars=1),
+        "guild/channel/two": {
+            **_message(original, stars=9),
+            "message_id": "two",
+            "canonical_url": repost_source.message_url,
+            "author_id": "adopter",
+        },
+    }
+
+    ranked = score_workflows([record], _evidence([record], messages), NOW)[0]
+
+    assert ranked.representative_variant_id == "variant-two"
 
 
 def test_new_post_confidence_floor_does_not_let_one_reaction_beat_established_post() -> None:

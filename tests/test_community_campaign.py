@@ -104,6 +104,14 @@ def test_campaign_writes_deterministic_source_backed_artifacts(tmp_path: Path) -
     assert selection["selected"][0]["workflow"]["identity"]["family"] == "krea-2"
     assert selection["selected"][0]["workflow"]["api_graph_paths"] == ["graphs/api.json"]
     assert selection["selected"][0]["workflow"]["ui_graph_paths"] == ["graphs/ui.json"]
+    assert selection["selected"][0]["representative_variant"] == {
+        "api_graph_path": "graphs/api.json",
+        "image_hash": "image-sha",
+        "source_graph_hash": selection["selected"][0]["workflow"]["source_graph_hashes"][0],
+        "source_key": "channel/message/attachment",
+        "ui_graph_paths": ["graphs/ui.json"],
+        "variant_id": selection["selected"][0]["representative_variant_id"],
+    }
 
 
 def test_campaign_fails_closed_for_incomplete_evidence(tmp_path: Path) -> None:

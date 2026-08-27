@@ -80,6 +80,24 @@ def _summary_markdown(selection) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _selected_payload(item) -> dict[str, Any]:
+    payload = item.model_dump(mode="json")
+    representative = next(
+        (
+            variant
+            for variant in item.workflow.variants
+            if variant.variant_id == item.representative_variant_id
+        ),
+        None,
+    )
+    if representative is None:
+        raise ValueError(
+            f"Selected workflow {item.workflow.workflow_id} has no representative variant"
+        )
+    payload["representative_variant"] = representative.model_dump(mode="json")
+    return payload
+
+
 def run_campaign(
     manifest_paths: Sequence[Path],
     engagement_path: Path,
@@ -159,7 +177,7 @@ def run_campaign(
             "inputs": inputs,
             "selected_count": len(selection.selected),
             "excluded_count": len(selection.excluded),
-            "selected": [item.model_dump(mode="json") for item in selection.selected],
+            "selected": [_selected_payload(item) for item in selection.selected],
             "excluded": [item.model_dump(mode="json") for item in selection.excluded],
         },
     )

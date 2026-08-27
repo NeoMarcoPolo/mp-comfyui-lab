@@ -136,6 +136,11 @@ def test_catalog_merges_ui_api_pairs_reposts_and_prompt_only_variants(tmp_path: 
     assert {source.message_id for source in records[0].sources} == {"1", "2"}
     assert len(records[0].api_graph_paths) == 2
     assert len(records[0].ui_graph_paths) == 2
+    assert len(records[0].variants) == 2
+    assert {variant.source_key for variant in records[0].variants} == {
+        records[0].sources[0].source_key,
+        records[0].sources[1].source_key,
+    }
 
 
 def test_catalog_keeps_versions_tasks_and_material_techniques_distinct(tmp_path: Path) -> None:
