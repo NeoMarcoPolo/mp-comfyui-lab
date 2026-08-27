@@ -191,3 +191,26 @@ def test_catalog_keeps_ui_only_sources_distinct_and_flags_review(tmp_path: Path)
 
     assert len(records) == 2
     assert all(record.identity_review_required for record in records)
+
+
+def test_catalog_preserves_graph_with_orphan_inactive_lora_branch_for_review(tmp_path: Path) -> None:
+    graph = _api_graph("krea2_native_fp8.safetensors")
+    graph["orphan"] = {
+        "class_type": "WanVideoLoraSelect",
+        "inputs": {"lora": "unused.safetensors", "strength": 1.0},
+    }
+    image = _write_source(
+        tmp_path,
+        message_id="1",
+        filename="krea.png",
+        graph=graph,
+        graph_name="graphs/api-orphan.json",
+        content="Krea 2 workflow",
+    )
+
+    records = build_workflow_catalog([_manifest(tmp_path, "all.json", [image])], tmp_path)
+
+    assert len(records) == 1
+    assert records[0].identity.family == "krea-2"
+    assert records[0].identity.capability_hash.startswith("fallback:")
+    assert records[0].identity_review_required is True

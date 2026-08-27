@@ -14,7 +14,12 @@ from mp_comfyui_lab.community.models import (
     WorkflowRecord,
     WorkflowSource,
 )
-from mp_comfyui_lab.graph.hashing import capability_hash, source_graph_hash
+from mp_comfyui_lab.graph.hashing import (
+    GraphHashError,
+    capability_hash,
+    source_graph_hash,
+)
+from mp_comfyui_lab.graph.normalize import GraphNormalizationError
 
 
 _MODEL_EXTENSIONS = (
@@ -215,6 +220,24 @@ def _workflow_id(identity: WorkflowIdentity) -> str:
     return hashlib.sha256(identity.key.encode("utf-8")).hexdigest()[:24]
 
 
+def _graph_hashes(
+    graph: Mapping[str, Any], manifest_hash: str
+) -> tuple[str, str, bool]:
+    identity_graph = _identity_graph(graph)
+    try:
+        return capability_hash(identity_graph), source_graph_hash(graph), False
+    except (GraphHashError, GraphNormalizationError):
+        fallback = hashlib.sha256(
+            json.dumps(
+                identity_graph,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        return f"fallback:{fallback}", manifest_hash, True
+
+
 def build_workflow_catalog(
     manifest_paths: Sequence[Path], graph_root: Path
 ) -> list[WorkflowRecord]:
@@ -238,12 +261,16 @@ def build_workflow_catalog(
                     evidence = _evidence_text(image, graph)
                     family, version = _classify_family(evidence)
                     models, loras = _model_stack(graph)
+                    capability_digest, source_digest, fallback_review = _graph_hashes(
+                        graph,
+                        str(api_ref.get("sha256_canonical_json") or "unknown"),
+                    )
                     identity = WorkflowIdentity(
                         family=family,
                         version=version,
                         task=_classify_task(evidence, family),
                         technique=_classify_technique(evidence),
-                        capability_hash=capability_hash(_identity_graph(graph)),
+                        capability_hash=capability_digest,
                         core_models=models,
                         loras=loras,
                         sampler_signature=_sampler_signature(graph),
@@ -254,9 +281,9 @@ def build_workflow_catalog(
                             "source": source,
                             "api_path": relative_path,
                             "ui_paths": [str(item["relative_path"]) for item in ui_refs],
-                            "source_hash": source_graph_hash(graph),
+                            "source_hash": source_digest,
                             "image_hash": source.attachment_sha256,
-                            "review": len(api_refs) > 1,
+                            "review": len(api_refs) > 1 or fallback_review,
                         }
                     )
             else:
