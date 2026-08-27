@@ -194,7 +194,8 @@ def test_selection_excludes_obsolete_and_lower_quality_duplicates() -> None:
     obsolete = _record("old", family="sdxl")
     native = _record("native", family="flux-2", models=("flux2_fp8.safetensors",))
     gguf = _record("gguf", family="flux-2", models=("flux2_q4.gguf",))
-    records = [obsolete, native, gguf]
+    int8 = _record("int8", family="flux-2", models=("flux2_int8_convrot.safetensors",))
+    records = [obsolete, native, gguf, int8]
     messages = {
         f"guild/channel/{record.workflow_id}": _message(record, stars=5)
         for record in records
@@ -205,4 +206,5 @@ def test_selection_excludes_obsolete_and_lower_quality_duplicates() -> None:
 
     assert excluded["old"] == "obsolete_family"
     assert excluded["gguf"] == "lower_quality_duplicate"
+    assert excluded["int8"] == "lower_quality_duplicate"
     assert "native" in {item.workflow.workflow_id for item in result.selected}

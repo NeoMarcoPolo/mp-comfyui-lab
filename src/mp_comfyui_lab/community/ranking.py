@@ -314,7 +314,21 @@ def score_workflows(
 
 def _is_low_bit(record: WorkflowRecord) -> bool:
     folded = " ".join(record.identity.core_models).casefold()
-    return any(token in folded for token in (".gguf", "q2", "q3", "q4", "int4", "nf4"))
+    return any(
+        token in folded
+        for token in (
+            ".gguf",
+            "int4",
+            "int6",
+            "int8",
+            "nf4",
+            "q2",
+            "q3",
+            "q4",
+            "q5",
+            "q6",
+        )
+    )
 
 
 def _eligibility_reasons(ranked: Sequence[RankedWorkflow]) -> dict[str, str | None]:
