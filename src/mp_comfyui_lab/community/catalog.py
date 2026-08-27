@@ -46,19 +46,45 @@ def _all_strings(value: Any) -> Iterable[str]:
             yield from _all_strings(item)
 
 
-def _evidence_text(image: Mapping[str, Any], graph: Mapping[str, Any] | None) -> str:
-    values = [
+def _message_evidence_text(image: Mapping[str, Any]) -> str:
+    return " ".join(
+        [
         str(image.get("filename") or ""),
         str(image.get("message_content") or ""),
         *[str(item) for item in image.get("search_reasons") or []],
         *[str(item) for item in image.get("search_queries") or []],
-    ]
-    if graph is not None:
-        values.extend(_all_strings(graph))
-    return " ".join(values).casefold()
+        ]
+    ).casefold()
 
 
-def _classify_family(evidence: str) -> tuple[str, str]:
+def _graph_family_evidence(graph: Mapping[str, Any]) -> tuple[str, bool]:
+    values = []
+    has_core_model = False
+    for node in graph.values():
+        if not isinstance(node, Mapping):
+            continue
+        class_type = str(node.get("class_type") or "")
+        values.append(class_type)
+        compact_class = _compact(class_type)
+        is_core_loader = (
+            any(
+                token in compact_class
+                for token in (
+                    "checkpointloader",
+                    "diffusionmodelloader",
+                    "unetloader",
+                )
+            )
+            and "clip" not in compact_class
+            and "vae" not in compact_class
+        )
+        if is_core_loader:
+            has_core_model = True
+            values.extend(_all_strings(node.get("inputs", {})))
+    return " ".join(values).casefold(), has_core_model
+
+
+def _classify_family_text(evidence: str) -> tuple[str, str]:
     compact = _compact(evidence)
     if "scail2" in compact:
         return "scail2", "2"
@@ -70,7 +96,9 @@ def _classify_family(evidence: str) -> tuple[str, str]:
         return "wan-2.1", "2.1"
     if "krea2" in compact:
         return "krea-2", "2"
-    if any(token in compact for token in ("zimageturbo", "zitturbo", "zit")):
+    if "minimaxh3" in compact or "hailuoh3" in compact:
+        return "minimax-h3", "3"
+    if ("zimage" in compact and "turbo" in compact) or "zitturbo" in compact:
         return "zit", "current"
     if "zimage" in compact:
         return "z-image", "current"
@@ -84,8 +112,6 @@ def _classify_family(evidence: str) -> tuple[str, str]:
         return "qwen-image-edit", "current"
     if "qwen" in compact:
         return "qwen-image", "current"
-    if "minimax" in compact and any(token in compact for token in ("h3", "hailuo")):
-        return "minimax-h3", "3"
     if "hunyuan" in compact:
         return "hunyuan", "unknown"
     if "pony" in compact:
@@ -95,20 +121,67 @@ def _classify_family(evidence: str) -> tuple[str, str]:
     return "unknown", "unknown"
 
 
-def _classify_task(evidence: str, family: str) -> str:
-    compact = _compact(evidence)
-    if any(token in compact for token in ("referencetovideo", "r2v", "ref2video")):
-        return "reference-to-video"
-    if any(token in compact for token in ("imagetovideo", "i2v", "img2video")):
-        return "image-to-video"
-    if any(token in compact for token in ("texttovideo", "t2v", "txt2video")):
+def _classify_family(
+    graph_evidence: str,
+    message_evidence: str,
+    has_core_model: bool,
+) -> tuple[str, str]:
+    family = _classify_family_text(graph_evidence)
+    if family[0] != "unknown":
+        return family
+    message_compact = _compact(message_evidence)
+    if "scail2" in message_compact:
+        return "scail2", "2"
+    if "animate" in message_compact:
+        return "animate", "current"
+    if not has_core_model:
+        return _classify_family_text(message_evidence)
+    return family
+
+
+def _classify_task(
+    graph: Mapping[str, Any] | None,
+    family: str,
+    fallback_evidence: str = "",
+) -> str:
+    graph_text = " ".join(_all_strings(graph)).casefold() if graph is not None else ""
+    compact = _compact(graph_text)
+    node_types = {
+        _compact(str(node.get("class_type") or ""))
+        for node in (graph or {}).values()
+        if isinstance(node, Mapping)
+    }
+    has_load_image = any(
+        node_type in {"loadimage", "loadimagemask"} for node_type in node_types
+    )
+    if family in {"wan-2.1", "wan-2.2", "minimax-h3", "animate"}:
+        if any(
+            token in compact
+            for token in ("minimaxh3referencetovideo", "ref2va", "referencetovideo")
+        ):
+            return "reference-to-video"
+        if has_load_image or any(
+            token in compact for token in ("imagetovideo", "i2v", "img2video")
+        ):
+            return "image-to-video"
         return "text-to-video"
-    if "edit" in compact and "image" in compact:
+    if family == "qwen-image-edit":
         return "image-edit"
-    if any(token in compact for token in ("videocombine", "savevideo", "videooutput", "animate")):
-        return "text-to-video"
-    if family in {"wan-2.1", "wan-2.2", "minimax-h3"}:
-        return "text-to-video"
+    if family in {
+        "flux-2",
+        "flux-2-klein",
+        "krea-2",
+        "qwen-image",
+        "scail2",
+        "z-image",
+        "zit",
+    }:
+        return "image-edit" if has_load_image else "text-to-image"
+    fallback = _compact(fallback_evidence)
+    if any(token in fallback for token in ("referencetovideo", "r2v", "ref2video")):
+        return "reference-to-video"
+    if any(token in fallback for token in ("imagetovideo", "i2v", "img2video")):
+        return "image-to-video"
     return "text-to-image"
 
 
@@ -258,8 +331,13 @@ def build_workflow_catalog(
                 for api_ref in api_refs:
                     relative_path = str(api_ref["relative_path"])
                     graph = json.loads((graph_root / relative_path).read_text(encoding="utf-8"))
-                    evidence = _evidence_text(image, graph)
-                    family, version = _classify_family(evidence)
+                    graph_evidence, has_core_model = _graph_family_evidence(graph)
+                    message_evidence = _message_evidence_text(image)
+                    family, version = _classify_family(
+                        graph_evidence,
+                        message_evidence,
+                        has_core_model,
+                    )
                     models, loras = _model_stack(graph)
                     capability_digest, source_digest, fallback_review = _graph_hashes(
                         graph,
@@ -268,8 +346,10 @@ def build_workflow_catalog(
                     identity = WorkflowIdentity(
                         family=family,
                         version=version,
-                        task=_classify_task(evidence, family),
-                        technique=_classify_technique(evidence),
+                        task=_classify_task(graph, family, message_evidence),
+                        technique=_classify_technique(
+                            f"{graph_evidence} {message_evidence}"
+                        ),
                         capability_hash=capability_digest,
                         core_models=models,
                         loras=loras,
@@ -287,16 +367,16 @@ def build_workflow_catalog(
                         }
                     )
             else:
-                evidence = _evidence_text(image, None)
-                family, version = _classify_family(evidence)
+                message_evidence = _message_evidence_text(image)
+                family, version = _classify_family("", message_evidence, False)
                 for ui_ref in ui_refs:
                     relative_path = str(ui_ref["relative_path"])
                     ui_hash = str(ui_ref.get("sha256_canonical_json") or hashlib.sha256(relative_path.encode()).hexdigest())
                     identity = WorkflowIdentity(
                         family=family,
                         version=version,
-                        task=_classify_task(evidence, family),
-                        technique=_classify_technique(evidence),
+                        task=_classify_task(None, family, message_evidence),
+                        technique=_classify_technique(message_evidence),
                         capability_hash=f"ui:{ui_hash}",
                         core_models=(),
                         loras=(),

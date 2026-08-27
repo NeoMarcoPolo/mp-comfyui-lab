@@ -214,3 +214,77 @@ def test_catalog_preserves_graph_with_orphan_inactive_lora_branch_for_review(tmp
     assert records[0].identity.family == "krea-2"
     assert records[0].identity.capability_hash.startswith("fallback:")
     assert records[0].identity_review_required is True
+
+
+def test_catalog_uses_core_graph_family_and_task_before_mixed_message_context(tmp_path: Path) -> None:
+    minimax = _api_graph("minimax_h3_ref2va_bf16.safetensors")
+    minimax["reference"] = {
+        "class_type": "LoadImage",
+        "inputs": {"image": "reference.png"},
+    }
+    minimax["h3"] = {
+        "class_type": "MiniMaxH3ReferenceToVideo",
+        "inputs": {"model": ["model", 0], "reference": ["reference", 0]},
+    }
+    krea = _api_graph("krea2_raw_bf16.safetensors")
+    zimage = _api_graph("z_image_turbo_bf16.safetensors")
+    zimage["upscale"] = {
+        "class_type": "SeedVR2VideoUpscaler",
+        "inputs": {"images": ["save", 0]},
+    }
+    kroma = _api_graph("kroma-v0.2-turbo.safetensors")
+    kroma["vae"] = {
+        "class_type": "VAELoader",
+        "inputs": {"vae_name": "wan_2.1_vae.safetensors"},
+    }
+    images = [
+        _write_source(
+            tmp_path,
+            message_id="1",
+            filename="minimax.png",
+            graph=minimax,
+            graph_name="graphs/api-minimax.json",
+            content="Qwen edit and MiniMax H3 experiments",
+        ),
+        _write_source(
+            tmp_path,
+            message_id="2",
+            filename="krea.png",
+            graph=krea,
+            graph_name="graphs/api-krea.json",
+            content="this was my image for the I2V workflow",
+        ),
+        _write_source(
+            tmp_path,
+            message_id="3",
+            filename="zimage.png",
+            graph=zimage,
+            graph_name="graphs/api-zimage.json",
+            content="metadata attached",
+        ),
+        _write_source(
+            tmp_path,
+            message_id="4",
+            filename="kroma.png",
+            graph=kroma,
+            graph_name="graphs/api-kroma.json",
+            content="MiniMax H3 cleanup comparison",
+        ),
+    ]
+
+    records = build_workflow_catalog([_manifest(tmp_path, "mixed.json", images)], tmp_path)
+    by_message = {record.sources[0].message_id: record.identity for record in records}
+
+    assert (by_message["1"].family, by_message["1"].task) == (
+        "minimax-h3",
+        "reference-to-video",
+    )
+    assert (by_message["2"].family, by_message["2"].task) == (
+        "krea-2",
+        "text-to-image",
+    )
+    assert (by_message["3"].family, by_message["3"].task) == (
+        "zit",
+        "text-to-image",
+    )
+    assert by_message["4"].family == "unknown"
