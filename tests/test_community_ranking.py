@@ -279,3 +279,13 @@ def test_selection_excludes_obsolete_and_lower_quality_duplicates() -> None:
     assert excluded["gguf"] == "lower_quality_duplicate"
     assert excluded["int8"] == "lower_quality_duplicate"
     assert "native" in {item.workflow.workflow_id for item in result.selected}
+
+
+def test_selection_excludes_gguf_even_when_it_is_the_only_family_candidate() -> None:
+    gguf = _record("gguf-only", family="qwen-image", models=("qwen-image-2512-Q8_0.gguf",))
+    messages = {"guild/channel/gguf-only": _message(gguf, stars=12)}
+
+    result = select_test_workflows(score_workflows([gguf], _evidence([gguf], messages), NOW))
+
+    assert result.selected == ()
+    assert result.excluded[0].exclusion_reason == "lower_quality_duplicate"

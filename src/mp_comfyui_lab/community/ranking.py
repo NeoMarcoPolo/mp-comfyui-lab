@@ -373,6 +373,10 @@ def _is_low_bit(record: WorkflowRecord) -> bool:
     )
 
 
+def _uses_gguf(record: WorkflowRecord) -> bool:
+    return any(model.casefold().endswith(".gguf") for model in record.identity.core_models)
+
+
 def _eligibility_reasons(ranked: Sequence[RankedWorkflow]) -> dict[str, str | None]:
     reasons: dict[str, str | None] = {}
     quality_groups: dict[tuple[str, str, str], list[WorkflowRecord]] = defaultdict(list)
@@ -386,6 +390,8 @@ def _eligibility_reasons(ranked: Sequence[RankedWorkflow]) -> dict[str, str | No
             reasons[record.workflow_id] = "obsolete_family"
         elif family not in APPROVED_FAMILIES:
             reasons[record.workflow_id] = "not_approved_family"
+        elif _uses_gguf(record):
+            reasons[record.workflow_id] = "lower_quality_duplicate"
         else:
             group = quality_groups[(family, record.identity.task, record.identity.technique)]
             if _is_low_bit(record) and any(not _is_low_bit(candidate) for candidate in group):
