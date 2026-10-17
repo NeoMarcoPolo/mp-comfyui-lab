@@ -763,6 +763,7 @@ class DimensionApproval(_FrozenModel):
 class ExperimentBrief(_FrozenModel):
     goal: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=MAX_MANIFEST_SCALAR_LENGTH)]
     partial_behavior_is_tested_capability: bool = False
+    preserve_source_graph: bool = False
     sources: SourceSpec
     fixtures: FixtureSpec
     expectations: ExpectationSpec
@@ -788,6 +789,28 @@ class ExperimentBrief(_FrozenModel):
         if len({item.name for item in values}) != len(values):
             raise ValueError("dimensions must not repeat capability names")
         return tuple(sorted(values, key=lambda item: item.name.value))
+
+    @model_validator(mode="after")
+    def validate_preserved_source_graph(self) -> Self:
+        if not self.preserve_source_graph:
+            return self
+        if self.fixtures.reference_images:
+            raise ValueError(
+                "preserve_source_graph requires empty reference_images"
+            )
+        if self.expectations.output_count == "auto":
+            raise ValueError(
+                "preserve_source_graph requires an explicit output_count"
+            )
+        if any(
+            item.policy is not DimensionPolicy.BASELINE_ONLY
+            for item in self.dimensions
+        ):
+            raise ValueError(
+                "preserve_source_graph requires every declared dimension to be "
+                "baseline_only"
+            )
+        return self
 
     def policy_for(self, name: DimensionName) -> DimensionPolicy:
         for item in self.dimensions:

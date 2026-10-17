@@ -169,6 +169,11 @@
       "title": "Partial Behavior Is Tested Capability",
       "type": "boolean"
     },
+    "preserve_source_graph": {
+      "default": false,
+      "title": "Preserve Source Graph",
+      "type": "boolean"
+    },
     "sources": {
       "$ref": "#/$defs/SourceSpec"
     }

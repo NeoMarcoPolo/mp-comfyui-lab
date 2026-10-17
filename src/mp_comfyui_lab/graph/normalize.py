@@ -354,7 +354,13 @@ def _is_lora_node(node: NormalizedNode) -> bool:
 
 def _is_model_flow_field(field_name: str) -> bool:
     canonical = _canonical_field_name(field_name)
-    return canonical in {"model", "unet"} or canonical.endswith(("model", "unet"))
+    if canonical == "strengthmodel":
+        return False
+    return (
+        canonical in {"model", "unet"}
+        or canonical.endswith(("model", "unet"))
+        or re.fullmatch(r"(?:model|unet)\d+", canonical) is not None
+    )
 
 
 def _model_links(node: NormalizedNode) -> list[tuple[str, tuple[str, int]]]:
@@ -384,6 +390,20 @@ def _lora_chains(
     nodes_by_id: Mapping[str, NormalizedNode],
     bindings: list[RoleBinding],
 ) -> tuple[_LoraChain, ...]:
+    if not bindings:
+        return ()
+
+    linked_sources = {
+        link[0]
+        for node in nodes_by_id.values()
+        for link in node.input_links.values()
+    }
+    bindings = [
+        binding
+        for binding in bindings
+        if nodes_by_id[binding.node_id].input_links
+        or binding.node_id in linked_sources
+    ]
     if not bindings:
         return ()
 

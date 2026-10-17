@@ -418,7 +418,10 @@ def _fixture_fingerprints(
 def _common_fixture_patch(
     brief: ExperimentBrief,
     source: PlanningSource,
-) -> tuple[SemanticPatch, str]:
+) -> tuple[SemanticPatch | None, str]:
+    if brief.preserve_source_graph:
+        return None, ""
+
     mutations: list[Any] = []
     references = source.normalized_graph.bindings(SemanticRole.REFERENCE_IMAGE)
     for fixture in brief.fixtures.reference_images:
@@ -563,7 +566,7 @@ def _variant(
     brief: ExperimentBrief,
     variant_id: str,
     source: PlanningSource,
-    patch: SemanticPatch,
+    patch: SemanticPatch | None,
     hypothesis: DimensionName | None,
     candidate: Candidate | None,
     content_classification: ContentClassification,
@@ -574,15 +577,29 @@ def _variant(
     prompt_lines: tuple[str, ...],
     prompt_fanout_node_id: str,
 ) -> PlannedVariant:
-    try:
-        materialized = materialize_variant(thaw_json(source.raw_graph), patch)
-    except (PatchValidationError, PatchTopologyError, ValidationError, ValueError) as error:
-        raise PlanningValidationError(f"structural materialization failed: {error}") from error
-    graph = sanitize_graph_for_persistence(thaw_json(materialized.graph))
-    patch_payload = sanitize_graph_for_persistence(patch.model_dump(mode="json"))
-    diff_payload = sanitize_graph_for_persistence(
-        materialized.diff.model_dump(mode="json")
-    )
+    if patch is None:
+        graph = sanitize_graph_for_persistence(thaw_json(source.raw_graph))
+        patch_payload = None
+        diff_payload = None
+        materialization_warnings: tuple[str, ...] = ()
+    else:
+        try:
+            materialized = materialize_variant(thaw_json(source.raw_graph), patch)
+        except (PatchValidationError, PatchTopologyError, ValidationError, ValueError) as error:
+            raise PlanningValidationError(
+                f"structural materialization failed: {error}"
+            ) from error
+        graph = sanitize_graph_for_persistence(thaw_json(materialized.graph))
+        patch_payload = sanitize_graph_for_persistence(
+            patch.model_dump(mode="json")
+        )
+        diff_payload = sanitize_graph_for_persistence(
+            materialized.diff.model_dump(mode="json")
+        )
+        materialization_warnings = tuple(
+            sanitize_for_persistence(item.message)
+            for item in materialized.validation.warnings
+        )
     expected_output_count, output_node_ids, expected_media_types = _output_details(
         brief=brief,
         graph=graph,
@@ -605,7 +622,7 @@ def _variant(
             "expected_media_types": list(expected_media_types),
         }
     )
-    warnings = [sanitize_for_persistence(item.message) for item in materialized.validation.warnings]
+    warnings = list(materialization_warnings)
     if candidate is not None and candidate.confidence.value == "unexplored":
         warnings.append("candidate has unexplored compatibility")
     return PlannedVariant(

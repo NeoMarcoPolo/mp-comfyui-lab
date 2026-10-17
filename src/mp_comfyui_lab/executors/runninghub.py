@@ -460,6 +460,15 @@ ProviderNumericString = Annotated[
         max_length=PROVIDER_NUMERIC_STRING_MAX_LENGTH,
     ),
 ]
+# RunningHub started emitting signed values for ordering fields (e.g. search
+# `seq` = "-1783671122", observed 2026-08-25); ids stay unsigned above.
+ProviderSignedNumericString = Annotated[
+    str,
+    Field(
+        pattern=r"^-?[0-9]+$",
+        max_length=PROVIDER_NUMERIC_STRING_MAX_LENGTH,
+    ),
+]
 ProviderNonnegativeInt = Annotated[int, Field(ge=0)]
 ProviderTimestamp = Annotated[str, AfterValidator(_provider_aware_timestamp)]
 ProviderHttpUrl = Annotated[str, AfterValidator(_provider_http_url)]
@@ -491,8 +500,8 @@ class _ProviderStatistics(_ProviderModel):
 class _ProviderTag(_ProviderModel):
     id: ProviderNumericString
     name: str
-    nameEn: str
-    labels: None
+    nameEn: str | None
+    labels: str | None
 
 
 class _ProviderCover(_ProviderModel):
@@ -514,19 +523,19 @@ class _ProviderEnvelope(_ProviderModel):
 class _SearchRecord(_ProviderModel):
     id: ProviderNumericString
     name: str
-    desc: str
+    desc: str | None
     systemWorkflow: bool
     publishTime: ProviderTimestamp
     timestamp: ProviderNumericString
-    preview: None
+    preview: Any
     owner: _ProviderOwner
     statisticsInfo: _ProviderStatistics
-    nodeCount: None
+    nodeCount: ProviderNonnegativeInt | None
     liked: ProviderNonnegativeInt
     covers: list[_ProviderCover]
     tags: list[_ProviderTag]
-    labels: str
-    seq: ProviderNumericString
+    labels: str | None
+    seq: ProviderSignedNumericString
     homeShow: None
 
 
@@ -561,18 +570,18 @@ class _ProviderPublishAccess(_ProviderModel):
 class _DetailData(_ProviderModel):
     id: ProviderNumericString
     name: str
-    desc: str
+    desc: str | None
     systemWorkflow: bool
     publishTime: ProviderTimestamp
     timestamp: ProviderNumericString
     md5: None
     imageSize: None
-    preview: _ProviderCover
+    preview: _ProviderCover | None
     owner: _ProviderOwner
     workflowContent: None
     nodeCount: ProviderNonnegativeInt
     statisticsInfo: _ProviderStatistics
-    labels: str
+    labels: str | None
     tags: list[_ProviderTag]
     covers: list[_ProviderCover]
     chineseCovers: list[_ProviderCover]
@@ -584,10 +593,10 @@ class _DetailData(_ProviderModel):
     likeCount: ProviderNumericString
     collect: bool
     collectCount: ProviderNumericString
-    webappId: ProviderNumericString
-    status: ProviderNonnegativeInt
+    webappId: ProviderNumericString | None
+    status: int
     workflowState: ProviderNonnegativeInt
-    webappState: ProviderNonnegativeInt
+    webappState: ProviderNonnegativeInt | None
     publishAccess: _ProviderPublishAccess
     canModifyPublishType: bool
     canModifyPublishScope: bool
@@ -1170,7 +1179,7 @@ def _candidate(
         endpoint,
         f"{field}.name",
     )
-    description = _plain_text(value.desc)
+    description = _plain_text(value.desc) if value.desc is not None else ""
     published_at = _published_at(
         value.publishTime,
         endpoint,
@@ -1426,10 +1435,14 @@ class RunningHubExecutor(Executor):
             "data.usedModels",
             sanitize_urls=True,
         )
-        preview = _cover(
-            data.preview,
-            DETAIL_ENDPOINT,
-            "data.preview",
+        preview = (
+            _cover(
+                data.preview,
+                DETAIL_ENDPOINT,
+                "data.preview",
+            )
+            if data.preview is not None
+            else None
         )
         candidate = _candidate(
             data,
